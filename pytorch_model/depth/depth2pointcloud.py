@@ -3,7 +3,7 @@ from torch import nn
 
 
 class DepthToPointCloud(nn.Module):
-    def __init__(self, scale, width, height, cx, cy, fx, fy) -> None:
+    def __init__(self, scale: float, width: int, height: int, cx: float, cy: float, fx: float, fy: float) -> None:
         super().__init__()
         self.scale = float(scale)
         u = torch.zeros([height, width, 1], dtype=torch.float32)
@@ -20,5 +20,5 @@ class DepthToPointCloud(nn.Module):
         self.uv = torch.concatenate([u, v, ones], dim=2)
         self.uv *= self.scale
 
-    def forward(self, depth):
+    def forward(self, depth: torch.Tensor):
         return depth * self.uv

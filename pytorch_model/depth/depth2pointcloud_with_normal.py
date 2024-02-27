@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 class DepthToPointCloudWithNormal(nn.Module):
-    def __init__(self, scale, width, height, cx, cy, fx, fy) -> None:
+    def __init__(self, scale: float, width: int, height: int, cx: float, cy: float, fx: float, fy: float) -> None:
         super().__init__()
         self.base_model = DepthToPointCloud(
             scale, width, height, cx, cy, fx, fy)
@@ -20,7 +20,7 @@ class DepthToPointCloudWithNormal(nn.Module):
 
         self.ones = torch.full([1, 1, height, width], -1.0, dtype=torch.float32)
 
-    def forward(self, depth):
+    def forward(self, depth: torch.Tensor):
         pcd = self.base_model.forward(depth)  # hwc HxWx3
         pcd_nchw = pcd.permute(2, 0, 1).unsqueeze(0)  # nchw 1x3xHxW
         dx = F.conv2d(pcd_nchw, self.sobel_v, padding=1)  # 1x1xHxW
