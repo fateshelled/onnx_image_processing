@@ -33,6 +33,7 @@ class OtsuThreshold(nn.Module):
         mean_w = sum_w / num_w
 
         var_hist = num_b * num_w * ((mean_b - mean_w) ** 2)
+        var_hist = torch.where(torch.isnan(var_hist), 0, var_hist)
         thresh = torch.argmax(var_hist).to(self.dtype)
 
         bin_img = torch.where(
