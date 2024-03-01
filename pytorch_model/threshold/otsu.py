@@ -3,38 +3,43 @@ from torch import nn
 
 
 class OtsuThreshold(nn.Module):
-    def __init__(self, width: int, height: int, min_val: int, max_val: int, dtype=torch.int32, device="cpu") -> None:
+    def __init__(self, min_val: int, max_val: int, dtype=torch.int32, device="cpu") -> None:
         super().__init__()
-        self.width = width
-        self.height = height
         self.min_val = min_val
         self.max_val = max_val
-        self.d = max_val - min_val - 1
+        self.BINS = max_val - min_val + 1
         self.dtype = dtype
-        self.zero = torch.tensor(0, dtype=self.dtype)
-        self.index = torch.zeros([height, width, self.d], dtype=dtype, device=device)
-        for i in range(min_val, max_val - 1, 1):
-            self.index[:, :, i] = i
+        self.device = device
+
+        self.mask_bk = torch.tril(torch.ones([self.BINS, self.BINS], dtype=torch.int32, device=self.device))
+        self.mask_wh = torch.ones_like(self.mask_bk, device=self.device) - self.mask_bk
 
     def forward(self, img_HxW: torch.Tensor):
-        stacked = torch.concat([img_HxW.unsqueeze(2)] * self.d, dim=2)
-        class_b = (stacked <= self.index) # class black HxWx(max_val-min_val-1)
-        class_w = ~class_b                # class white HxWx(max_val-min_val-1)
+        # calc histgram
+        indices = img_HxW.view(-1).to(torch.int64)
+        hist = torch.zeros(self.BINS, device=self.device, dtype=torch.int64)
+        hist = hist.scatter_add(0, indices, torch.ones_like(indices))
 
-        hw = self.width * self.height
-        masked_b = torch.where(class_b, stacked, self.zero)
-        masked_w = torch.where(class_w, stacked, self.zero)
-        sum_b = torch.sum(masked_b.reshape(hw, self.d), dim=0, dtype=torch.float32)
-        sum_w = torch.sum(masked_w.reshape(hw, self.d), dim=0, dtype=torch.float32)
-        num_b = torch.sum(class_b.reshape(hw, self.d), dim=0, dtype=torch.float32)
-        num_w = hw - num_b
+        hist_class = hist * torch.arange(self.min_val, self.max_val + 1, 1, dtype=torch.int64, device=self.device)
 
-        mean_b = sum_b / num_b
-        mean_w = sum_w / num_w
+        # black class
+        fc_bk = hist_class * self.mask_bk
+        hist_bk = hist * self.mask_bk
+        fc_bk_sum = torch.sum(fc_bk, dim=1)
+        num_bk = torch.sum(hist_bk, dim=1)
+        mean_bk = fc_bk_sum / num_bk
 
-        var_hist = num_b * num_w * ((mean_b - mean_w) ** 2)
-        var_hist = torch.where(torch.isnan(var_hist), 0, var_hist)
-        thresh = torch.argmax(var_hist).to(self.dtype)
+        # white class
+        fc_wh = hist_class * self.mask_wh
+        hist_wh = hist * self.mask_wh
+        fc_wh_sum = torch.sum(fc_wh, dim=1)
+        num_wh = torch.sum(hist_wh, dim=1)
+        mean_wh = fc_wh_sum / num_wh
+
+        # betweeb class variance
+        var_hist = num_bk * num_wh * ((mean_bk - mean_wh) ** 2)
+        var_hist = torch.where(torch.isnan(var_hist), torch.tensor(0, dtype=torch.float32), var_hist)
+        thresh = torch.argmax(var_hist)
 
         bin_img = torch.where(
             img_HxW <= thresh,
