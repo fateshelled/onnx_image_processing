@@ -20,6 +20,7 @@ from pathlib import Path
 # Each entry: (script_name, output_name, extra_args)
 EXPORT_CONFIGS = [
     ("export_shi_tomasi.py", "shi_tomasi.onnx", ["--height", "480", "--width", "640"]),
+    ("export_bad.py", "bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
 ]
 
 
