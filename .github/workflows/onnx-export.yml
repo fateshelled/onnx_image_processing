@@ -1,0 +1,79 @@
+name: ONNX Export
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  export-onnx:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Export ONNX models
+        run: |
+          python onnx_export/export_all.py --output-dir ./onnx_models
+
+      - name: Verify ONNX models
+        run: |
+          python -c "
+          import onnx
+          from pathlib import Path
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              model = onnx.load(str(model_path))
+              onnx.checker.check_model(model)
+              print(f'{model_path.name}: IR={model.ir_version}, Opset={model.opset_import[0].version}')
+          "
+
+      - name: Test ONNX model inference
+        run: |
+          python -c "
+          import numpy as np
+          import onnxruntime as ort
+          from pathlib import Path
+
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              print(f'Testing: {model_path.name}')
+              session = ort.InferenceSession(str(model_path))
+              input_info = session.get_inputs()[0]
+              output_info = session.get_outputs()[0]
+
+              # Build input shape (use fixed size for dynamic dims)
+              input_shape = []
+              for dim in input_info.shape:
+                  if isinstance(dim, str):
+                      input_shape.append(480 if 'height' in dim else 640 if 'width' in dim else 1)
+                  else:
+                      input_shape.append(dim)
+
+              dummy_input = np.random.randn(*input_shape).astype(np.float32)
+              result = session.run([output_info.name], {input_info.name: dummy_input})
+
+              print(f'  Input: {dummy_input.shape} -> Output: {result[0].shape}')
+          print('All inference tests passed')
+          "
+
+      - name: Upload ONNX models as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-models-py${{ matrix.python-version }}
+          path: ./onnx_models/*.onnx
+          retention-days: 7
