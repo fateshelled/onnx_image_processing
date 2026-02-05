@@ -50,24 +50,45 @@ jobs:
           import onnxruntime as ort
           from pathlib import Path
 
+          def resolve_shape(shape, name=''):
+              \"\"\"Resolve dynamic dimensions to concrete values.\"\"\"
+              result = []
+              for dim in shape:
+                  if isinstance(dim, str):
+                      # Handle common dynamic dimension names
+                      if 'height' in dim.lower():
+                          result.append(480)
+                      elif 'width' in dim.lower():
+                          result.append(640)
+                      elif 'batch' in dim.lower():
+                          result.append(1)
+                      elif 'points' in dim.lower() or 'num' in dim.lower():
+                          result.append(100)
+                      else:
+                          result.append(1)
+                  else:
+                      result.append(dim)
+              return result
+
           for model_path in Path('./onnx_models').glob('*.onnx'):
               print(f'Testing: {model_path.name}')
               session = ort.InferenceSession(str(model_path))
-              input_info = session.get_inputs()[0]
-              output_info = session.get_outputs()[0]
 
-              # Build input shape (use fixed size for dynamic dims)
-              input_shape = []
-              for dim in input_info.shape:
-                  if isinstance(dim, str):
-                      input_shape.append(480 if 'height' in dim else 640 if 'width' in dim else 1)
-                  else:
-                      input_shape.append(dim)
+              # Build inputs for all model inputs (supports multi-input models)
+              inputs = {}
+              input_shapes = []
+              for input_info in session.get_inputs():
+                  input_shape = resolve_shape(input_info.shape, input_info.name)
+                  dummy_input = np.random.randn(*input_shape).astype(np.float32)
+                  inputs[input_info.name] = dummy_input
+                  input_shapes.append(f'{input_info.name}: {input_shape}')
 
-              dummy_input = np.random.randn(*input_shape).astype(np.float32)
-              result = session.run([output_info.name], {input_info.name: dummy_input})
+              output_names = [out.name for out in session.get_outputs()]
+              results = session.run(output_names, inputs)
 
-              print(f'  Input: {dummy_input.shape} -> Output: {result[0].shape}')
+              print(f'  Inputs: {input_shapes}')
+              for out_name, result in zip(output_names, results):
+                  print(f'  Output {out_name}: {result.shape}')
           print('All inference tests passed')
           "
 
