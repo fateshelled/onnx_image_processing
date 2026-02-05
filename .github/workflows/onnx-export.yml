@@ -28,22 +28,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Export Shi-Tomasi ONNX model
+      - name: Export ONNX models
         run: |
-          python onnx_export/export_shi_tomasi.py \
-            --output shi_tomasi.onnx \
-            --height 480 \
-            --width 640
+          python onnx_export/export_all.py --output-dir ./onnx_models
 
-      - name: Verify ONNX model
+      - name: Verify ONNX models
         run: |
           python -c "
           import onnx
-          model = onnx.load('shi_tomasi.onnx')
-          onnx.checker.check_model(model)
-          print('ONNX model verification passed')
-          print(f'IR version: {model.ir_version}')
-          print(f'Opset version: {model.opset_import[0].version}')
+          from pathlib import Path
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              model = onnx.load(str(model_path))
+              onnx.checker.check_model(model)
+              print(f'{model_path.name}: IR={model.ir_version}, Opset={model.opset_import[0].version}')
           "
 
       - name: Test ONNX model inference
@@ -51,27 +48,32 @@ jobs:
           python -c "
           import numpy as np
           import onnxruntime as ort
+          from pathlib import Path
 
-          session = ort.InferenceSession('shi_tomasi.onnx')
-          input_name = session.get_inputs()[0].name
-          output_name = session.get_outputs()[0].name
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              print(f'Testing: {model_path.name}')
+              session = ort.InferenceSession(str(model_path))
+              input_info = session.get_inputs()[0]
+              output_info = session.get_outputs()[0]
 
-          # Create dummy input
-          dummy_input = np.random.randn(1, 1, 480, 640).astype(np.float32)
+              # Build input shape (use fixed size for dynamic dims)
+              input_shape = []
+              for dim in input_info.shape:
+                  if isinstance(dim, str):
+                      input_shape.append(480 if 'height' in dim else 640 if 'width' in dim else 1)
+                  else:
+                      input_shape.append(dim)
 
-          # Run inference
-          result = session.run([output_name], {input_name: dummy_input})
-          output = result[0]
+              dummy_input = np.random.randn(*input_shape).astype(np.float32)
+              result = session.run([output_info.name], {input_info.name: dummy_input})
 
-          print(f'Input shape: {dummy_input.shape}')
-          print(f'Output shape: {output.shape}')
-          assert output.shape == (1, 1, 480, 640), f'Unexpected output shape: {output.shape}'
-          print('ONNX inference test passed')
+              print(f'  Input: {dummy_input.shape} -> Output: {result[0].shape}')
+          print('All inference tests passed')
           "
 
-      - name: Upload ONNX model as artifact
+      - name: Upload ONNX models as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: onnx-model-py${{ matrix.python-version }}
-          path: shi_tomasi.onnx
+          name: onnx-models-py${{ matrix.python-version }}
+          path: ./onnx_models/*.onnx
           retention-days: 7

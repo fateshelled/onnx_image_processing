@@ -29,28 +29,28 @@ jobs:
 
       - name: Export ONNX models
         run: |
-          # Shi-Tomasi corner detection (default settings)
-          python onnx_export/export_shi_tomasi.py \
-            --output shi_tomasi.onnx \
-            --height 480 \
-            --width 640
-
-          # Shi-Tomasi with dynamic axes
-          python onnx_export/export_shi_tomasi.py \
-            --output shi_tomasi_dynamic.onnx \
-            --height 480 \
-            --width 640 \
-            --dynamic-axes
+          python onnx_export/export_all.py --output-dir ./onnx_models --dynamic-axes
 
       - name: Verify ONNX models
         run: |
           python -c "
           import onnx
-          for model_path in ['shi_tomasi.onnx', 'shi_tomasi_dynamic.onnx']:
-              model = onnx.load(model_path)
+          from pathlib import Path
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              model = onnx.load(str(model_path))
               onnx.checker.check_model(model)
-              print(f'{model_path}: OK')
+              print(f'{model_path.name}: OK')
           "
+
+      - name: Generate model list
+        id: models
+        run: |
+          echo "## Models" > model_list.md
+          for f in ./onnx_models/*.onnx; do
+            name=$(basename "$f")
+            echo "- \`$name\`" >> model_list.md
+          done
+          cat model_list.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -60,11 +60,7 @@ jobs:
           body: |
             Automatically generated ONNX models from the latest main branch.
 
-            ## Models
-            - `shi_tomasi.onnx` - Fixed input size (1, 1, 480, 640)
-            - `shi_tomasi_dynamic.onnx` - Dynamic input size support
-          files: |
-            shi_tomasi.onnx
-            shi_tomasi_dynamic.onnx
+            See `onnx_export/export_all.py` for the full list of exported models.
+          files: ./onnx_models/*.onnx
           prerelease: true
           make_latest: true
