@@ -1,0 +1,77 @@
+name: ONNX Export
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  export-onnx:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Export Shi-Tomasi ONNX model
+        run: |
+          python onnx_export/export_shi_tomasi.py \
+            --output shi_tomasi.onnx \
+            --height 480 \
+            --width 640
+
+      - name: Verify ONNX model
+        run: |
+          python -c "
+          import onnx
+          model = onnx.load('shi_tomasi.onnx')
+          onnx.checker.check_model(model)
+          print('ONNX model verification passed')
+          print(f'IR version: {model.ir_version}')
+          print(f'Opset version: {model.opset_import[0].version}')
+          "
+
+      - name: Test ONNX model inference
+        run: |
+          python -c "
+          import numpy as np
+          import onnxruntime as ort
+
+          session = ort.InferenceSession('shi_tomasi.onnx')
+          input_name = session.get_inputs()[0].name
+          output_name = session.get_outputs()[0].name
+
+          # Create dummy input
+          dummy_input = np.random.randn(1, 1, 480, 640).astype(np.float32)
+
+          # Run inference
+          result = session.run([output_name], {input_name: dummy_input})
+          output = result[0]
+
+          print(f'Input shape: {dummy_input.shape}')
+          print(f'Output shape: {output.shape}')
+          assert output.shape == (1, 1, 480, 640), f'Unexpected output shape: {output.shape}'
+          print('ONNX inference test passed')
+          "
+
+      - name: Upload ONNX model as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-model-py${{ matrix.python-version }}
+          path: shi_tomasi.onnx
+          retention-days: 7
