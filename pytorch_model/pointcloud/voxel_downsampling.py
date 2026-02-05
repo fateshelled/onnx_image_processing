@@ -3,14 +3,35 @@ from torch import nn
 
 
 class VoxelDownsampling(nn.Module):
+    """Voxel downsampling for point cloud data.
+
+    Downsamples a point cloud by averaging points within each voxel grid cell.
+    """
+
     DTYPE = torch.float32
 
     def __init__(self) -> None:
         super().__init__()
 
     def forward(self, points: torch.Tensor, leaf_size: torch.Tensor):
-        # points: (N, 3), leaf_size: scalar
+        """Perform voxel downsampling on the input point cloud.
+
+        Args:
+            points: (N, D) point cloud coordinates, typically D=3.
+            leaf_size: Scalar tensor specifying the voxel grid cell size.
+
+        Returns:
+            output_points: (N, D) downsampled points. First M entries contain
+                valid voxel centroids, remaining entries are zero-padded.
+            mask: (N,) boolean mask indicating valid entries (True for first M).
+        """
         N = points.shape[0]
+        D = points.shape[1]
+        device = points.device
+
+        # Handle empty input
+        if N == 0:
+            return points.clone(), torch.ones(0, dtype=torch.bool, device=device)
 
         # 1. Compute voxel indices by dividing coordinates by leaf size
         voxel_coords = torch.floor(points / leaf_size).to(torch.int64)
@@ -32,18 +53,18 @@ class VoxelDownsampling(nn.Module):
 
         # 3. Compute group boundaries and group IDs using prefix sum
         is_new_group = torch.cat([
-            torch.tensor([True]),
+            torch.tensor([True], device=device),
             sorted_keys[1:] != sorted_keys[:-1]
         ])
         is_group_end = torch.cat([
             sorted_keys[:-1] != sorted_keys[1:],
-            torch.tensor([True])
+            torch.tensor([True], device=device)
         ])
         group_ids = torch.cumsum(is_new_group.to(torch.int64), dim=0) - 1
 
         # 4. Prefix sums of sorted coordinates and counts
         prefix_sum = torch.cumsum(sorted_points, dim=0)
-        prefix_count = torch.cumsum(torch.ones(N, 1, dtype=self.DTYPE), dim=0)
+        prefix_count = torch.cumsum(torch.ones(N, 1, dtype=self.DTYPE, device=device), dim=0)
 
         # Shifted prefix sums (cumsum[i-1], with 0 at position 0)
         shifted_prefix_sum = torch.zeros_like(prefix_sum)
@@ -73,11 +94,11 @@ class VoxelDownsampling(nn.Module):
 
         # 8. Build output: means at [0..M-1], zeros at [M..N-1]
         M = group_means.shape[0]
-        padding_pts = torch.zeros(N - M, 3, dtype=self.DTYPE)
+        padding_pts = torch.zeros(N - M, D, dtype=self.DTYPE, device=device)
         output_points = torch.cat([group_means, padding_pts], dim=0)
 
-        mask_valid = torch.ones(M, dtype=torch.bool)
-        mask_pad = torch.zeros(N - M, dtype=torch.bool)
+        mask_valid = torch.ones(M, dtype=torch.bool, device=device)
+        mask_pad = torch.zeros(N - M, dtype=torch.bool, device=device)
         mask = torch.cat([mask_valid, mask_pad], dim=0)
 
         return output_points, mask
