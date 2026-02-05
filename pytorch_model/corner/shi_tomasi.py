@@ -37,6 +37,8 @@ class ShiTomasiScore(nn.Module):
         if sobel_size != 3:
             raise ValueError(f"sobel_size must be 3, got {sobel_size}")
 
+        if block_size <= 0 or block_size % 2 == 0:
+            raise ValueError(f"block_size must be a positive odd integer, got {block_size}")
         self.block_size = block_size
         self.sobel_size = sobel_size
 
