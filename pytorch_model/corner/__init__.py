@@ -1,1 +1,1 @@
-from shi_tomasi import ShiTomasiScore
+from .shi_tomasi import ShiTomasiScore
