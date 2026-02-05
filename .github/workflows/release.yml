@@ -2,8 +2,9 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+      - master
 
 jobs:
   release:
@@ -54,7 +55,16 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: latest
+          name: Latest ONNX Models
+          body: |
+            Automatically generated ONNX models from the latest main branch.
+
+            ## Models
+            - `shi_tomasi.onnx` - Fixed input size (1, 1, 480, 640)
+            - `shi_tomasi_dynamic.onnx` - Dynamic input size support
           files: |
             shi_tomasi.onnx
             shi_tomasi_dynamic.onnx
-          generate_release_notes: true
+          prerelease: true
+          make_latest: true
