@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Export ONNX models
+        run: |
+          # Shi-Tomasi corner detection (default settings)
+          python onnx_export/export_shi_tomasi.py \
+            --output shi_tomasi.onnx \
+            --height 480 \
+            --width 640
+
+          # Shi-Tomasi with dynamic axes
+          python onnx_export/export_shi_tomasi.py \
+            --output shi_tomasi_dynamic.onnx \
+            --height 480 \
+            --width 640 \
+            --dynamic-axes
+
+      - name: Verify ONNX models
+        run: |
+          python -c "
+          import onnx
+          for model_path in ['shi_tomasi.onnx', 'shi_tomasi_dynamic.onnx']:
+              model = onnx.load(model_path)
+              onnx.checker.check_model(model)
+              print(f'{model_path}: OK')
+          "
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            shi_tomasi.onnx
+            shi_tomasi_dynamic.onnx
+          generate_release_notes: true
