@@ -49,8 +49,8 @@ def parse_args():
     parser.add_argument(
         "--opset-version",
         type=int,
-        default=11,
-        help="ONNX opset version (default: 11)"
+        default=18,
+        help="ONNX opset version (default: 18)"
     )
     parser.add_argument(
         "--dynamic-axes",
