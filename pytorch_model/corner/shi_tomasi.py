@@ -78,8 +78,9 @@ class ShiTomasiScore(nn.Module):
 
         # Compute gradients using Sobel filters with replicate padding
         sobel_pad = self.sobel_size // 2
-        Ix = F.conv2d(img, self.sobel_x, padding=sobel_pad, padding_mode='replicate')
-        Iy = F.conv2d(img, self.sobel_y, padding=sobel_pad, padding_mode='replicate')
+        img_padded = F.pad(img, (sobel_pad, sobel_pad, sobel_pad, sobel_pad), mode='replicate')
+        Ix = F.conv2d(img_padded, self.sobel_x)
+        Iy = F.conv2d(img_padded, self.sobel_y)
 
         # Compute products of gradients
         Ixx = Ix * Ix
@@ -88,9 +89,12 @@ class ShiTomasiScore(nn.Module):
 
         # Sum over block neighborhood
         block_pad = self.block_size // 2
-        sum_Ixx = F.conv2d(Ixx, self.sum_kernel, padding=block_pad, padding_mode='replicate')
-        sum_Iyy = F.conv2d(Iyy, self.sum_kernel, padding=block_pad, padding_mode='replicate')
-        sum_Ixy = F.conv2d(Ixy, self.sum_kernel, padding=block_pad, padding_mode='replicate')
+        Ixx_padded = F.pad(Ixx, (block_pad, block_pad, block_pad, block_pad), mode='replicate')
+        Iyy_padded = F.pad(Iyy, (block_pad, block_pad, block_pad, block_pad), mode='replicate')
+        Ixy_padded = F.pad(Ixy, (block_pad, block_pad, block_pad, block_pad), mode='replicate')
+        sum_Ixx = F.conv2d(Ixx_padded, self.sum_kernel)
+        sum_Iyy = F.conv2d(Iyy_padded, self.sum_kernel)
+        sum_Ixy = F.conv2d(Ixy_padded, self.sum_kernel)
 
         # Compute minimum eigenvalue of structure tensor
         # For 2x2 matrix [[a, b], [b, c]], eigenvalues are:
