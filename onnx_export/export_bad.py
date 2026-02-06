@@ -65,14 +65,11 @@ def parse_args():
         help="Random seed for sampling pattern (default: 42)"
     )
     parser.add_argument(
-        "--binarize",
-        action="store_true",
-        help="Enable binarization of output descriptors"
-    )
-    parser.add_argument(
-        "--hard-binarize",
-        action="store_true",
-        help="Use hard (sign) instead of soft (sigmoid) binarization"
+        "--binarization",
+        type=str,
+        choices=["none", "soft", "hard"],
+        default="none",
+        help="Binarization mode: none (raw diff), soft (sigmoid), hard (sign) (default: none)"
     )
     parser.add_argument(
         "--temperature",
@@ -98,13 +95,15 @@ def main():
     args = parse_args()
 
     # Create model
+    binarize = args.binarization != "none"
+    soft_binarize = args.binarization != "hard"
     model = BADDescriptor(
         num_pairs=args.num_pairs,
         box_size=args.box_size,
         pattern_scale=args.pattern_scale,
         seed=args.seed,
-        binarize=args.binarize,
-        soft_binarize=not args.hard_binarize,
+        binarize=binarize,
+        soft_binarize=soft_binarize,
         temperature=args.temperature,
     )
     model.eval()
@@ -139,7 +138,7 @@ def main():
     print(f"  Number of pairs: {args.num_pairs}")
     print(f"  Box size: {args.box_size}")
     print(f"  Pattern scale: {args.pattern_scale}")
-    print(f"  Binarize: {args.binarize}")
+    print(f"  Binarization: {args.binarization}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
 

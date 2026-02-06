@@ -154,17 +154,14 @@ class BADDescriptor(nn.Module):
         # Step 3: Prepare tensors for batched grid_sample
         # We need to sample box_avg[b] with grid[p] for all (b, p) combinations
         # Reshape to [B * num_pairs, ...] for efficient grid_sample
-        # Use expand() instead of repeat() for memory efficiency (creates view without copying)
+        # Use expand() for memory efficiency - reshape() handles non-contiguous tensors
 
-        # Expand box_avg: [B, 1, H, W] -> [B, num_pairs, 1, H, W] -> [B*num_pairs, 1, H, W]
-        box_avg_batched = box_avg.unsqueeze(1).expand(B, num_pairs, 1, H, W).contiguous()
-        box_avg_batched = box_avg_batched.reshape(B * num_pairs, 1, H, W)
+        # Expand box_avg: [B, 1, H, W] -> [B*num_pairs, 1, H, W]
+        box_avg_batched = box_avg.unsqueeze(1).expand(B, num_pairs, 1, H, W).reshape(B * num_pairs, 1, H, W)
 
-        # Expand grids: [num_pairs, H, W, 2] -> [B, num_pairs, H, W, 2] -> [B*num_pairs, H, W, 2]
-        grid1_batched = grid1.unsqueeze(0).expand(B, num_pairs, H, W, 2).contiguous()
-        grid1_batched = grid1_batched.reshape(B * num_pairs, H, W, 2)
-        grid2_batched = grid2.unsqueeze(0).expand(B, num_pairs, H, W, 2).contiguous()
-        grid2_batched = grid2_batched.reshape(B * num_pairs, H, W, 2)
+        # Expand grids: [num_pairs, H, W, 2] -> [B*num_pairs, H, W, 2]
+        grid1_batched = grid1.unsqueeze(0).expand(B, num_pairs, H, W, 2).reshape(B * num_pairs, H, W, 2)
+        grid2_batched = grid2.unsqueeze(0).expand(B, num_pairs, H, W, 2).reshape(B * num_pairs, H, W, 2)
 
         # Step 4: Sample using bilinear interpolation
         sample1 = F.grid_sample(
