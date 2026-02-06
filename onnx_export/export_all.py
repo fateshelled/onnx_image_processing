@@ -40,6 +40,11 @@ def parse_args():
         action="store_true",
         help="Enable dynamic input shape for all models that support it"
     )
+    parser.add_argument(
+        "--disable-dynamo",
+        action="store_true",
+        help="Disable dynamo for all exports"
+    )
     return parser.parse_args()
 
 
@@ -71,6 +76,8 @@ def main():
             "--output", str(output_path),
             *extra_args
         ]
+        if args.disable_dynamo:
+            cmd.append("--disable_dynamo")
 
         print(f"Exporting: {output_name}")
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -92,7 +99,8 @@ def main():
                 str(script_path),
                 "--output", str(dynamic_output_path),
                 *extra_args,
-                "--dynamic-axes"
+                "--dynamic-axes",
+                "--disable_dynamo",
             ]
 
             print(f"Exporting: {dynamic_output_name}")

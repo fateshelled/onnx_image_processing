@@ -83,6 +83,11 @@ def parse_args():
         action="store_true",
         help="Enable dynamic input shape (batch, num_points)"
     )
+    parser.add_argument(
+        "--disable_dynamo",
+        action="store_true",
+        help="Disable dynamo"
+    )
     return parser.parse_args()
 
 
@@ -121,7 +126,8 @@ def main():
         do_constant_folding=True,
         input_names=["desc1", "desc2"],
         output_names=["matching_probs"],
-        dynamic_axes=dynamic_axes
+        dynamic_axes=dynamic_axes,
+        dynamo=not args.disable_dynamo,
     )
 
     print(f"Exported ONNX model to: {args.output}")
