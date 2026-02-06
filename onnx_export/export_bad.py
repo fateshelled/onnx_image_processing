@@ -96,7 +96,7 @@ def main():
 
     # Create model
     binarize = args.binarization != "none"
-    soft_binarize = args.binarization != "hard"
+    soft_binarize = args.binarization == "soft"
     model = BADDescriptor(
         num_pairs=args.num_pairs,
         box_size=args.box_size,

@@ -153,15 +153,16 @@ class BADDescriptor(nn.Module):
 
         # Step 3: Prepare tensors for batched grid_sample
         # We need to sample box_avg[b] with grid[p] for all (b, p) combinations
-        # Reshape to [B * num_pairs, ...] for efficient grid_sample
-        # Use expand() for memory efficiency - reshape() handles non-contiguous tensors
+        # Use repeat_interleave/repeat for clarity and efficiency
 
-        # Expand box_avg: [B, 1, H, W] -> [B*num_pairs, 1, H, W]
-        box_avg_batched = box_avg.unsqueeze(1).expand(B, num_pairs, 1, H, W).reshape(B * num_pairs, 1, H, W)
+        # Repeat box_avg for each pair: [B, 1, H, W] -> [B*num_pairs, 1, H, W]
+        # Each batch element is repeated num_pairs times consecutively
+        box_avg_batched = box_avg.repeat_interleave(num_pairs, dim=0)
 
-        # Expand grids: [num_pairs, H, W, 2] -> [B*num_pairs, H, W, 2]
-        grid1_batched = grid1.unsqueeze(0).expand(B, num_pairs, H, W, 2).reshape(B * num_pairs, H, W, 2)
-        grid2_batched = grid2.unsqueeze(0).expand(B, num_pairs, H, W, 2).reshape(B * num_pairs, H, W, 2)
+        # Repeat grids for each batch: [num_pairs, H, W, 2] -> [B*num_pairs, H, W, 2]
+        # The entire grid sequence is repeated B times
+        grid1_batched = grid1.repeat(B, 1, 1, 1)
+        grid2_batched = grid2.repeat(B, 1, 1, 1)
 
         # Step 4: Sample using bilinear interpolation
         sample1 = F.grid_sample(
