@@ -196,8 +196,8 @@ class BADDescriptor(nn.Module):
             # Soft binarization using sigmoid for differentiable output
             return torch.sigmoid(diff * self.temperature)
         else:
-            # Hard binarization: (sign(diff) + 1) / 2 maps to {0, 0.5, 1}
-            return (torch.sign(diff) + 1.0) * 0.5
+            # Hard binarization: maps to {0, 1}
+            return (diff > 0).to(diff.dtype)
 
 
 def extract_descriptors_at_keypoints(
