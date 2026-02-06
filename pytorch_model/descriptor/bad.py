@@ -154,15 +154,16 @@ class BADDescriptor(nn.Module):
         # Step 3: Prepare tensors for batched grid_sample
         # We need to sample box_avg[b] with grid[p] for all (b, p) combinations
         # Reshape to [B * num_pairs, ...] for efficient grid_sample
+        # Use expand() instead of repeat() for memory efficiency (creates view without copying)
 
         # Expand box_avg: [B, 1, H, W] -> [B, num_pairs, 1, H, W] -> [B*num_pairs, 1, H, W]
-        box_avg_batched = box_avg.unsqueeze(1).repeat(1, num_pairs, 1, 1, 1)
+        box_avg_batched = box_avg.unsqueeze(1).expand(B, num_pairs, 1, H, W).contiguous()
         box_avg_batched = box_avg_batched.reshape(B * num_pairs, 1, H, W)
 
         # Expand grids: [num_pairs, H, W, 2] -> [B, num_pairs, H, W, 2] -> [B*num_pairs, H, W, 2]
-        grid1_batched = grid1.unsqueeze(0).repeat(B, 1, 1, 1, 1)
+        grid1_batched = grid1.unsqueeze(0).expand(B, num_pairs, H, W, 2).contiguous()
         grid1_batched = grid1_batched.reshape(B * num_pairs, H, W, 2)
-        grid2_batched = grid2.unsqueeze(0).repeat(B, 1, 1, 1, 1)
+        grid2_batched = grid2.unsqueeze(0).expand(B, num_pairs, H, W, 2).contiguous()
         grid2_batched = grid2_batched.reshape(B * num_pairs, H, W, 2)
 
         # Step 4: Sample using bilinear interpolation
@@ -190,23 +191,15 @@ class BADDescriptor(nn.Module):
         diff = sample1 - sample2  # [B, num_pairs, H, W]
 
         # Step 6: Optional binarization
-        # For ONNX compatibility, avoid if-statements by using arithmetic
-        # binarize=False: return diff
-        # binarize=True, soft_binarize=True: return sigmoid(diff * temperature)
-        # binarize=True, soft_binarize=False: return (sign(diff) + 1) / 2
-
-        # Compute all variants and select via multiplication
-        # This avoids control flow for better ONNX compatibility
-        soft_binary = torch.sigmoid(diff * self.temperature)
-        hard_binary = (torch.sign(diff) + 1.0) * 0.5
-
-        # Select output based on flags (computed at graph construction time)
+        # Python if/elif/else is fine for ONNX since conditions resolve at trace time
         if not self.binarize:
             return diff
         elif self.soft_binarize:
-            return soft_binary
+            # Soft binarization using sigmoid for differentiable output
+            return torch.sigmoid(diff * self.temperature)
         else:
-            return hard_binary
+            # Hard binarization: (sign(diff) + 1) / 2 maps to {0, 0.5, 1}
+            return (torch.sign(diff) + 1.0) * 0.5
 
 
 def extract_descriptors_at_keypoints(
