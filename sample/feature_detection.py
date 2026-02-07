@@ -23,19 +23,25 @@ import onnxruntime as ort
 from PIL import Image, ImageDraw
 
 
-def load_image(image_path: str) -> np.ndarray:
+def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Image.Image]:
     """
-    Load an image file as a grayscale float32 array.
+    Load an image file as a grayscale float32 array, resized to the model input size.
 
     Args:
         image_path: Path to the input image.
+        height: Target height to resize.
+        width: Target width to resize.
 
     Returns:
-        Grayscale image array of shape (1, 1, H, W) with values in [0, 255].
+        Tuple of:
+            - Grayscale image array of shape (1, 1, H, W) with values in [0, 255].
+            - Resized PIL Image in RGB mode (for visualization).
     """
     img = Image.open(image_path).convert("L")
-    arr = np.array(img, dtype=np.float32)
-    return arr[np.newaxis, np.newaxis, :, :]  # (1, 1, H, W)
+    img_resized = img.resize((width, height), Image.BILINEAR)
+    arr = np.array(img_resized, dtype=np.float32)
+    rgb = img_resized.convert("RGB")
+    return arr[np.newaxis, np.newaxis, :, :], rgb  # (1, 1, H, W)
 
 
 def nms_keypoints(scores: np.ndarray, nms_radius: int = 3) -> np.ndarray:
@@ -117,7 +123,7 @@ def select_keypoints(
 
 
 def visualize_keypoints(
-    image_path: str,
+    image: Image.Image,
     keypoints: np.ndarray,
     output_path: str,
     circle_radius: int = 3,
@@ -127,14 +133,14 @@ def visualize_keypoints(
     Draw detected keypoints on the image and save the result.
 
     Args:
-        image_path: Path to the original input image.
+        image: RGB PIL Image to draw on.
         keypoints: Keypoint array of shape (N, 3) where each row
                    is (y, x, score).
         output_path: Path to save the output visualization image.
         circle_radius: Radius of the keypoint circles. Default is 3.
         color: RGB color tuple for drawing keypoints. Default is green.
     """
-    img = Image.open(image_path).convert("RGB")
+    img = image.copy()
     draw = ImageDraw.Draw(img)
 
     for i in range(keypoints.shape[0]):
@@ -204,15 +210,19 @@ def main():
 
     # Create ONNX Runtime session
     session = ort.InferenceSession(args.model)
-    input_name = session.get_inputs()[0].name
+    input_info = session.get_inputs()[0]
+    input_name = input_info.name
+    input_shape = input_info.shape  # [N, C, H, W]
     output_names = [o.name for o in session.get_outputs()]
+    model_height = input_shape[2]
+    model_width = input_shape[3]
     print(f"ONNX model: {args.model}")
-    print(f"  Input:   {input_name} {session.get_inputs()[0].shape}")
+    print(f"  Input:   {input_name} {input_shape}")
     print(f"  Outputs: {output_names}")
 
-    # Load image
-    image = load_image(args.input)
-    print(f"Input image: {args.input} ({image.shape[2]}x{image.shape[3]})")
+    # Load and resize image to model input size
+    image, image_rgb = load_image(args.input, model_height, model_width)
+    print(f"Input image: {args.input} (resized to {model_height}x{model_width})")
 
     # Run inference
     results = session.run(output_names, {input_name: image})
@@ -237,7 +247,7 @@ def main():
 
     # Visualize
     visualize_keypoints(
-        args.input,
+        image_rgb,
         keypoints,
         args.output,
         circle_radius=args.circle_radius,
