@@ -102,14 +102,26 @@ def parse_args():
     parser.add_argument(
         "--epsilon", "-e",
         type=float,
-        default=1.0,
-        help="Entropy regularization parameter for Sinkhorn (default: 1.0)"
+        default=0.1,
+        help="Entropy regularization parameter for Sinkhorn (default: 0.1)"
     )
     parser.add_argument(
         "--unused-score",
         type=float,
-        default=1.0,
-        help="Score for dustbin entries in Sinkhorn (default: 1.0)"
+        default=1.5,
+        help="Score for dustbin entries in Sinkhorn (default: 1.5)"
+    )
+    parser.add_argument(
+        "--normalize-descriptors",
+        action="store_true",
+        default=True,
+        help="L2-normalize descriptors before matching (default: True, strongly recommended)"
+    )
+    parser.add_argument(
+        "--no-normalize-descriptors",
+        dest="normalize_descriptors",
+        action="store_false",
+        help="Disable descriptor normalization (not recommended)"
     )
     parser.add_argument(
         "--distance-type",
@@ -158,6 +170,7 @@ def main():
         epsilon=args.epsilon,
         unused_score=args.unused_score,
         distance_type=args.distance_type,
+        normalize_descriptors=args.normalize_descriptors,
     )
     model.eval()
 
@@ -205,7 +218,9 @@ def main():
     print(f"  Binarization: {args.binarization}")
     print(f"  Sinkhorn iterations: {args.sinkhorn_iterations}")
     print(f"  Epsilon: {args.epsilon}")
+    print(f"  Unused score: {args.unused_score}")
     print(f"  Distance type: {args.distance_type}")
+    print(f"  Normalize descriptors: {args.normalize_descriptors}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
 

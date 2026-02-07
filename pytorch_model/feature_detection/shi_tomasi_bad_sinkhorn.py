@@ -64,6 +64,9 @@ class ShiTomasiBADSinkhornMatcher(nn.Module):
         score_threshold: Minimum corner score threshold for keypoint selection.
                         Keypoints with scores below this are discarded.
                         Default is 0.0 (no filtering).
+        normalize_descriptors: If True, L2-normalize descriptors before matching.
+                              This is strongly recommended when using raw (non-binary)
+                              descriptors to ensure stable matching. Default is True.
 
     Example:
         >>> model = ShiTomasiBADSinkhornMatcher(max_keypoints=512)
@@ -93,12 +96,14 @@ class ShiTomasiBADSinkhornMatcher(nn.Module):
         distance_type: str = "l2",
         nms_radius: int = 3,
         score_threshold: float = 0.0,
+        normalize_descriptors: bool = True,
     ) -> None:
         super().__init__()
 
         self.max_keypoints = max_keypoints
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
+        self.normalize_descriptors = normalize_descriptors
 
         # Feature detector: Shi-Tomasi + BAD
         self.detector = ShiTomasiBADDetector(
@@ -321,7 +326,12 @@ class ShiTomasiBADSinkhornMatcher(nn.Module):
         desc1 = self._extract_descriptors_at_keypoints_batched(desc_map1, keypoints1)
         desc2 = self._extract_descriptors_at_keypoints_batched(desc_map2, keypoints2)
 
-        # 5. Perform Sinkhorn matching
+        # 5. Normalize descriptors if enabled (recommended for raw descriptors)
+        if self.normalize_descriptors:
+            desc1 = F.normalize(desc1, p=2, dim=-1)
+            desc2 = F.normalize(desc2, p=2, dim=-1)
+
+        # 6. Perform Sinkhorn matching
         matching_probs = self.matcher(desc1, desc2)  # (B, K+1, K+1)
 
         return keypoints1, keypoints2, matching_probs
