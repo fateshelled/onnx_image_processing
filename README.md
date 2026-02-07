@@ -14,6 +14,8 @@ ONNX exportable pytorch model for image processing.
   - Depth image to Point cloud
   - Depth image to Point cloud with Normal
   - Align depth image to rgb image
+- Point Cloud
+  - Voxel Downsampling
 
 ## Sample: Feature Detection (Shi-Tomasi + BAD)
 
