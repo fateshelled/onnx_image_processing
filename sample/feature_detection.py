@@ -23,6 +23,8 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image, ImageDraw
 
+from pytorch_model.corner.shi_tomasi import refine_keypoints_subpixel
+
 
 def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Image.Image]:
     """
@@ -82,27 +84,31 @@ def select_keypoints(
     threshold: float = 0.01,
     max_keypoints: int = 1000,
     nms_radius: int = 3,
+    subpixel: bool = True,
 ) -> np.ndarray:
     """
     Select keypoints from corner score map.
 
     Applies NMS and threshold filtering, then returns the top-k keypoints
-    sorted by score in descending order.
+    sorted by score in descending order. When ``subpixel`` is True, keypoint
+    positions are refined to sub-pixel accuracy via parabola fitting on the
+    original (pre-NMS) score map.
 
     Args:
         scores: Corner score map of shape (1, 1, H, W).
         threshold: Minimum score threshold. Default is 0.01.
         max_keypoints: Maximum number of keypoints to return. Default is 1000.
         nms_radius: Radius of the NMS window. Default is 3.
+        subpixel: If True, refine keypoint positions to sub-pixel accuracy
+                  using parabola fitting. Default is True.
 
     Returns:
         Keypoint array of shape (N, 3) where each row is (y, x, score).
+        When subpixel is True, y and x are floating-point sub-pixel coordinates.
         Returns empty array of shape (0, 3) if no keypoints are found.
     """
-    score_map = scores[0, 0]  # (H, W)
-
-    # Apply NMS
-    score_map = nms_keypoints(score_map, nms_radius=nms_radius)
+    raw_score_map = scores[0, 0]  # (H, W) — keep original for sub-pixel fitting
+    score_map = nms_keypoints(raw_score_map, nms_radius=nms_radius)
 
     # Threshold
     ys, xs = np.where(score_map > threshold)
@@ -120,6 +126,11 @@ def select_keypoints(
         xs[indices].astype(np.float32),
         vals[indices],
     ], axis=-1)  # (N, 3)
+
+    # Sub-pixel refinement on the original (pre-NMS) score map
+    if subpixel:
+        keypoints = refine_keypoints_subpixel(raw_score_map, keypoints)
+
     return keypoints
 
 
@@ -260,6 +271,11 @@ def parse_args():
         action="store_true",
         help="Colorize keypoint circles by score (blue=low, red=high)"
     )
+    parser.add_argument(
+        "--no-subpixel",
+        action="store_true",
+        help="Disable sub-pixel refinement of keypoint positions"
+    )
     return parser.parse_args()
 
 
@@ -296,6 +312,7 @@ def main():
         threshold=args.threshold,
         max_keypoints=args.max_keypoints,
         nms_radius=args.nms_radius,
+        subpixel=not args.no_subpixel,
     )
     print(f"Detected keypoints: {keypoints.shape[0]}")
 
