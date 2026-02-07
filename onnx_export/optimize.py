@@ -7,6 +7,16 @@ with a fallback to onnxoptimizer.
 
 import onnx
 
+try:
+    import onnxsim
+except ImportError:
+    onnxsim = None
+
+try:
+    import onnxoptimizer
+except ImportError:
+    onnxoptimizer = None
+
 
 def optimize_onnx_model(model_path: str) -> str:
     """Optimize an ONNX model file in-place.
@@ -26,26 +36,28 @@ def optimize_onnx_model(model_path: str) -> str:
     model = onnx.load(model_path)
 
     # Try onnx-simplifier first
-    try:
-        import onnxsim
-
-        model_simplified, check = onnxsim.simplify(model)
-        if check:
-            onnx.save(model_simplified, model_path)
-            return "onnxsim"
-        else:
-            raise RuntimeError("onnxsim simplify check failed")
-    except Exception as e:
-        print(f"  onnxsim failed ({e}), trying onnxoptimizer...")
+    if onnxsim is not None:
+        try:
+            model_simplified, check = onnxsim.simplify(model)
+            if check:
+                onnx.save(model_simplified, model_path)
+                return "onnxsim"
+            else:
+                raise RuntimeError("onnxsim simplify check failed")
+        except Exception as e:
+            print(f"  onnxsim failed ({e}), trying onnxoptimizer...")
+    else:
+        print("  onnxsim not installed, trying onnxoptimizer...")
 
     # Fallback to onnxoptimizer
-    try:
-        import onnxoptimizer
-
-        model_optimized = onnxoptimizer.optimize(model)
-        onnx.save(model_optimized, model_path)
-        return "onnxoptimizer"
-    except Exception as e:
-        print(f"  onnxoptimizer failed ({e}), saving unoptimized model.")
+    if onnxoptimizer is not None:
+        try:
+            model_optimized = onnxoptimizer.optimize(model)
+            onnx.save(model_optimized, model_path)
+            return "onnxoptimizer"
+        except Exception as e:
+            print(f"  onnxoptimizer failed ({e}), saving unoptimized model.")
+    else:
+        print("  onnxoptimizer not installed, saving unoptimized model.")
 
     return "none"
