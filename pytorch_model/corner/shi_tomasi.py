@@ -61,21 +61,25 @@ def refine_keypoints_subpixel(
 
     # Parabola fitting along y-axis
     denom_y = 2.0 * (fy_neg - 2.0 * fy_ctr + fy_pos)
-    dy = np.where(denom_y < -1e-6, (fy_neg - fy_pos) / denom_y, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dy = np.where(denom_y < -1e-6, (fy_neg - fy_pos) / denom_y, 0.0)
     dy = np.where(np.abs(dy) < 1.0, dy, 0.0)
 
     # Parabola fitting along x-axis
     denom_x = 2.0 * (fx_neg - 2.0 * fx_ctr + fx_pos)
-    dx = np.where(denom_x < -1e-6, (fx_neg - fx_pos) / denom_x, 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dx = np.where(denom_x < -1e-6, (fx_neg - fx_pos) / denom_x, 0.0)
     dx = np.where(np.abs(dx) < 1.0, dx, 0.0)
 
     # Update coordinates
     refined[interior, 0] = yi + dy
     refined[interior, 1] = xi + dx
 
-    # Interpolate score at refined position
-    score_y = fy_ctr + 0.5 * dy * (fy_neg - fy_pos)
-    score_x = fx_ctr + 0.5 * dx * (fx_neg - fx_pos)
+    # Interpolate score at refined position using quadratic peak value:
+    #   f(delta) = f(0) + (b/2) * delta  where b = (f(1) - f(-1)) / 2
+    # which simplifies to: f(0) + 0.25 * delta * (f(1) - f(-1))
+    score_y = fy_ctr + 0.25 * dy * (fy_pos - fy_neg)
+    score_x = fx_ctr + 0.25 * dx * (fx_pos - fx_neg)
     refined[interior, 2] = ((score_y + score_x) / 2.0).astype(np.float32)
 
     return refined
