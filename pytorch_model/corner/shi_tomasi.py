@@ -1,6 +1,83 @@
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+
+def refine_keypoints_subpixel(
+    score_map: np.ndarray,
+    keypoints: np.ndarray,
+) -> np.ndarray:
+    """
+    Refine keypoint positions to sub-pixel accuracy using parabola fitting.
+
+    For each keypoint, fits a 1D parabola independently along the y and x
+    axes using the 3 neighboring score values, then computes the sub-pixel
+    offset of the peak.
+
+    Given three consecutive values f(-1), f(0), f(1) along one axis, the
+    parabola peak offset is:
+        delta = (f(-1) - f(1)) / (2 * (f(-1) - 2*f(0) + f(1)))
+
+    The offset is applied only when the fitted parabola is concave
+    (negative second derivative) and the shift is less than 1 pixel, i.e.
+    the refinement is numerically stable. Keypoints on image borders where
+    a full 3-point neighborhood is unavailable are left unchanged.
+
+    Args:
+        score_map: Corner score map of shape (H, W).
+        keypoints: Keypoint array of shape (N, 3) where each row is
+                   (y, x, score) with integer pixel coordinates.
+
+    Returns:
+        Refined keypoint array of shape (N, 3) with sub-pixel (y, x) and
+        interpolated score. A copy is returned; the input is not modified.
+    """
+    if keypoints.shape[0] == 0:
+        return keypoints.copy()
+
+    H, W = score_map.shape
+    refined = keypoints.copy()
+
+    for i in range(keypoints.shape[0]):
+        y = int(keypoints[i, 0])
+        x = int(keypoints[i, 1])
+
+        # Skip border pixels where a 3x3 patch is unavailable
+        if y < 1 or y >= H - 1 or x < 1 or x >= W - 1:
+            continue
+
+        # Parabola fitting along y-axis
+        fy_neg = float(score_map[y - 1, x])
+        fy_ctr = float(score_map[y, x])
+        fy_pos = float(score_map[y + 1, x])
+        denom_y = 2.0 * (fy_neg - 2.0 * fy_ctr + fy_pos)
+        if denom_y < -1e-6:  # concave parabola only
+            dy = (fy_neg - fy_pos) / denom_y
+            if abs(dy) < 1.0:
+                refined[i, 0] = y + dy
+
+        # Parabola fitting along x-axis
+        fx_neg = float(score_map[y, x - 1])
+        fx_ctr = float(score_map[y, x])
+        fx_pos = float(score_map[y, x + 1])
+        denom_x = 2.0 * (fx_neg - 2.0 * fx_ctr + fx_pos)
+        if denom_x < -1e-6:  # concave parabola only
+            dx = (fx_neg - fx_pos) / denom_x
+            if abs(dx) < 1.0:
+                refined[i, 1] = x + dx
+
+        # Interpolate score at refined position using the fitted parabola values
+        # score ≈ f(0) + 0.5 * delta * (f(-1) - f(1)) for each axis
+        refined_y = refined[i, 0]
+        refined_x = refined[i, 1]
+        dy_off = refined_y - y
+        dx_off = refined_x - x
+        score_y = fy_ctr + 0.5 * dy_off * (fy_neg - fy_pos)
+        score_x = fx_ctr + 0.5 * dx_off * (fx_neg - fx_pos)
+        refined[i, 2] = (score_y + score_x) / 2.0
+
+    return refined
 
 
 class ShiTomasiScore(nn.Module):
