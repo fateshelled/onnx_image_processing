@@ -47,6 +47,11 @@ def parse_args():
         action="store_true",
         help="Disable dynamo for all exports"
     )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Disable ONNX model optimization (onnxsim/onnxoptimizer) for all exports"
+    )
     return parser.parse_args()
 
 
@@ -80,6 +85,8 @@ def main():
         ]
         if args.disable_dynamo:
             cmd.append("--disable_dynamo")
+        if args.no_optimize:
+            cmd.append("--no-optimize")
 
         print(f"Exporting: {output_name}")
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -104,6 +111,8 @@ def main():
                 "--dynamic-axes",
                 "--disable_dynamo",
             ]
+            if args.no_optimize:
+                cmd_dynamic.append("--no-optimize")
 
             print(f"Exporting: {dynamic_output_name}")
             result = subprocess.run(cmd_dynamic, capture_output=True, text=True)

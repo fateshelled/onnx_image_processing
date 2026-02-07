@@ -2,3 +2,5 @@ torch>=2.0.0,<3.0.0
 onnx>=1.14.0,<2.0.0
 onnxruntime>=1.15.0,<2.0.0
 onnxscript>=0.1.0,<1.0.0
+onnxsim>=0.4.33
+onnxoptimizer>=0.3.13

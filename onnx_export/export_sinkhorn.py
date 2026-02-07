@@ -17,6 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
+from onnx_export.optimize import optimize_onnx_model
 
 
 def parse_args():
@@ -88,6 +89,11 @@ def parse_args():
         action="store_true",
         help="Disable dynamo"
     )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Disable ONNX model optimization (onnxsim/onnxoptimizer)"
+    )
     return parser.parse_args()
 
 
@@ -130,6 +136,11 @@ def main():
         dynamo=not args.disable_dynamo,
     )
 
+    # Optimize ONNX model
+    optimization = "skipped"
+    if not args.no_optimize:
+        optimization = optimize_onnx_model(args.output)
+
     print(f"Exported ONNX model to: {args.output}")
     print(f"  Input desc1 shape: (B, {args.num_points1}, {args.desc_dim})")
     print(f"  Input desc2 shape: (B, {args.num_points2}, {args.desc_dim})")
@@ -140,6 +151,7 @@ def main():
     print(f"  Distance type: {args.distance_type}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
+    print(f"  Optimization: {optimization}")
 
 
 if __name__ == "__main__":
