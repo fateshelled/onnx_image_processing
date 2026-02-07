@@ -16,6 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pytorch_model.pointcloud.voxel_downsampling import VoxelDownsampling
+from onnx_export.optimize import optimize_onnx_model
 
 
 def parse_args():
@@ -50,6 +51,11 @@ def parse_args():
         "--dynamic-axes",
         action="store_true",
         help="Enable dynamic input shape (num_points)"
+    )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Disable ONNX model optimization (onnxsim/onnxoptimizer)"
     )
     return parser.parse_args()
 
@@ -87,11 +93,17 @@ def main():
         dynamic_axes=dynamic_axes
     )
 
+    # Optimize ONNX model
+    optimization = "skipped"
+    if not args.no_optimize:
+        optimization = optimize_onnx_model(args.output)
+
     print(f"Exported ONNX model to: {args.output}")
     print(f"  Input points shape: (N, 3), dummy N={args.num_points}")
     print(f"  Leaf size: {args.leaf_size}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
+    print(f"  Optimization: {optimization}")
 
 
 if __name__ == "__main__":
