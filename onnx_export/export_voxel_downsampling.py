@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ONNX export script for Shi-Tomasi corner detection score calculator.
+ONNX export script for Voxel Downsampling.
 
 Usage:
-    python export_shi_tomasi.py --output shi_tomasi.onnx --height 480 --width 640
+    python export_voxel_downsampling.py --output voxel_downsampling.onnx --num-points 1000
 """
 
 import argparse
@@ -15,37 +15,31 @@ import torch
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.corner.shi_tomasi import ShiTomasiScore
+from pytorch_model.pointcloud.voxel_downsampling import VoxelDownsampling
 from onnx_export.optimize import optimize_onnx_model
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export Shi-Tomasi corner detection model to ONNX format"
+        description="Export Voxel Downsampling model to ONNX format"
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="shi_tomasi.onnx",
-        help="Output ONNX file path (default: shi_tomasi.onnx)"
+        default="voxel_downsampling.onnx",
+        help="Output ONNX file path (default: voxel_downsampling.onnx)"
     )
     parser.add_argument(
-        "--height", "-H",
+        "--num-points", "-n",
         type=int,
-        default=480,
-        help="Input image height (default: 480)"
+        default=1000,
+        help="Number of points for dummy input (default: 1000)"
     )
     parser.add_argument(
-        "--width", "-W",
-        type=int,
-        default=640,
-        help="Input image width (default: 640)"
-    )
-    parser.add_argument(
-        "--block-size", "-b",
-        type=int,
-        default=3,
-        help="Block size for structure tensor computation (default: 3)"
+        "--leaf-size", "-l",
+        type=float,
+        default=0.05,
+        help="Voxel leaf size for dummy input (default: 0.05)"
     )
     parser.add_argument(
         "--opset-version",
@@ -56,12 +50,7 @@ def parse_args():
     parser.add_argument(
         "--dynamic-axes",
         action="store_true",
-        help="Enable dynamic input shape (batch, height, width)"
-    )
-    parser.add_argument(
-        "--disable_dynamo",
-        action="store_true",
-        help="Disable dynamo"
+        help="Enable dynamic input shape (num_points)"
     )
     parser.add_argument(
         "--no-optimize",
@@ -75,32 +64,33 @@ def main():
     args = parse_args()
 
     # Create model
-    model = ShiTomasiScore(block_size=args.block_size, sobel_size=3)
+    model = VoxelDownsampling()
     model.eval()
 
-    # Create dummy input (N, 1, H, W)
-    dummy_input = torch.randn(1, 1, args.height, args.width)
+    # Create dummy input
+    dummy_points = torch.randn(args.num_points, 3, dtype=torch.float32)
+    dummy_leaf_size = torch.tensor(args.leaf_size, dtype=torch.float32)
 
     # Configure dynamic axes if requested
     dynamic_axes = None
     if args.dynamic_axes:
         dynamic_axes = {
-            "input": {0: "batch", 2: "height", 3: "width"},
-            "output": {0: "batch", 2: "height", 3: "width"}
+            "points": {0: "N"},
+            "output_points": {0: "N"},
+            "mask": {0: "N"}
         }
 
     # Export to ONNX
     torch.onnx.export(
         model,
-        dummy_input,
+        (dummy_points, dummy_leaf_size),
         args.output,
         export_params=True,
         opset_version=args.opset_version,
         do_constant_folding=True,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes=dynamic_axes,
-        dynamo=not args.disable_dynamo,
+        input_names=["points", "leaf_size"],
+        output_names=["output_points", "mask"],
+        dynamic_axes=dynamic_axes
     )
 
     # Optimize ONNX model
@@ -109,8 +99,8 @@ def main():
         optimization = optimize_onnx_model(args.output)
 
     print(f"Exported ONNX model to: {args.output}")
-    print(f"  Input shape: (N, 1, {args.height}, {args.width})")
-    print(f"  Block size: {args.block_size}")
+    print(f"  Input points shape: (N, 3), dummy N={args.num_points}")
+    print(f"  Leaf size: {args.leaf_size}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
     print(f"  Optimization: {optimization}")

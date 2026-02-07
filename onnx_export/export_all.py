@@ -23,6 +23,7 @@ EXPORT_CONFIGS = [
     ("export_bad.py", "bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
     ("export_sinkhorn.py", "sinkhorn_matcher.onnx", ["--num-points1", "100", "--num-points2", "100", "--desc-dim", "256"]),
     ("export_shi_tomasi_bad.py", "shi_tomasi_bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
+    ("export_shi_tomasi_bad_sinkhorn.py", "shi_tomasi_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "512"]),
 ]
 
 
@@ -45,6 +46,11 @@ def parse_args():
         "--disable-dynamo",
         action="store_true",
         help="Disable dynamo for all exports"
+    )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Disable ONNX model optimization (onnxsim/onnxoptimizer) for all exports"
     )
     return parser.parse_args()
 
@@ -79,6 +85,8 @@ def main():
         ]
         if args.disable_dynamo:
             cmd.append("--disable_dynamo")
+        if args.no_optimize:
+            cmd.append("--no-optimize")
 
         print(f"Exporting: {output_name}")
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -103,6 +111,8 @@ def main():
                 "--dynamic-axes",
                 "--disable_dynamo",
             ]
+            if args.no_optimize:
+                cmd_dynamic.append("--no-optimize")
 
             print(f"Exporting: {dynamic_output_name}")
             result = subprocess.run(cmd_dynamic, capture_output=True, text=True)

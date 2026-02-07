@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-ONNX export script for Shi-Tomasi + BAD feature detection model.
+ONNX export script for Shi-Tomasi + BAD + Sinkhorn image matching model.
 
-Exports the unified ShiTomasiBADDetector model that computes corner scores
-and dense descriptors in a single forward pass.
+Exports the unified ShiTomasiBADSinkhornMatcher model that detects keypoints,
+computes descriptors, and performs Sinkhorn matching in a single forward pass.
 
 Usage:
-    python export_shi_tomasi_bad.py --output shi_tomasi_bad.onnx --height 480 --width 640
+    python export_shi_tomasi_bad_sinkhorn.py --output shi_tomasi_bad_sinkhorn.onnx --height 480 --width 640
+    python export_shi_tomasi_bad_sinkhorn.py --output shi_tomasi_bad_sinkhorn.onnx --max-keypoints 256
 """
 
 import argparse
@@ -18,19 +19,19 @@ import torch
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.feature_detection.shi_tomasi_bad import ShiTomasiBADDetector
+from pytorch_model.feature_detection.shi_tomasi_bad_sinkhorn import ShiTomasiBADSinkhornMatcher
 from onnx_export.optimize import optimize_onnx_model
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export Shi-Tomasi + BAD feature detection model to ONNX format"
+        description="Export Shi-Tomasi + BAD + Sinkhorn image matching model to ONNX format"
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="shi_tomasi_bad.onnx",
-        help="Output ONNX file path (default: shi_tomasi_bad.onnx)"
+        default="shi_tomasi_bad_sinkhorn.onnx",
+        help="Output ONNX file path (default: shi_tomasi_bad_sinkhorn.onnx)"
     )
     parser.add_argument(
         "--height", "-H",
@@ -43,6 +44,12 @@ def parse_args():
         type=int,
         default=640,
         help="Input image width (default: 640)"
+    )
+    parser.add_argument(
+        "--max-keypoints", "-k",
+        type=int,
+        default=512,
+        help="Maximum number of keypoints per image (default: 512)"
     )
     parser.add_argument(
         "--block-size",
@@ -88,6 +95,43 @@ def parse_args():
         help="Temperature for soft sigmoid binarization (default: 10.0)"
     )
     parser.add_argument(
+        "--sinkhorn-iterations", "-i",
+        type=int,
+        default=20,
+        help="Number of Sinkhorn iterations (default: 20)"
+    )
+    parser.add_argument(
+        "--epsilon", "-e",
+        type=float,
+        default=0.1,
+        help="Entropy regularization parameter for Sinkhorn (default: 0.1)"
+    )
+    parser.add_argument(
+        "--unused-score",
+        type=float,
+        default=1.5,
+        help="Score for dustbin entries in Sinkhorn (default: 1.5)"
+    )
+    parser.add_argument(
+        "--normalize-descriptors",
+        action="store_true",
+        default=True,
+        help="L2-normalize descriptors before matching (default: True, strongly recommended)"
+    )
+    parser.add_argument(
+        "--no-normalize-descriptors",
+        dest="normalize_descriptors",
+        action="store_false",
+        help="Disable descriptor normalization (not recommended)"
+    )
+    parser.add_argument(
+        "--distance-type",
+        type=str,
+        choices=["l1", "l2"],
+        default="l2",
+        help="Distance metric for Sinkhorn cost matrix (default: l2)"
+    )
+    parser.add_argument(
         "--opset-version",
         type=int,
         default=18,
@@ -117,7 +161,8 @@ def main():
     # Create model
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
-    model = ShiTomasiBADDetector(
+    model = ShiTomasiBADSinkhornMatcher(
+        max_keypoints=args.max_keypoints,
         block_size=args.block_size,
         sobel_size=3,
         num_pairs=args.num_pairs,
@@ -127,31 +172,39 @@ def main():
         binarize=binarize,
         soft_binarize=soft_binarize,
         temperature=args.temperature,
+        sinkhorn_iterations=args.sinkhorn_iterations,
+        epsilon=args.epsilon,
+        unused_score=args.unused_score,
+        distance_type=args.distance_type,
+        normalize_descriptors=args.normalize_descriptors,
     )
     model.eval()
 
-    # Create dummy input (N, 1, H, W)
-    dummy_input = torch.randn(1, 1, args.height, args.width)
+    # Create dummy inputs (B, 1, H, W)
+    dummy_image1 = torch.randn(1, 1, args.height, args.width)
+    dummy_image2 = torch.randn(1, 1, args.height, args.width)
 
     # Configure dynamic axes if requested
     dynamic_axes = None
     if args.dynamic_axes:
         dynamic_axes = {
-            "input": {0: "batch", 2: "height", 3: "width"},
-            "scores": {0: "batch", 2: "height", 3: "width"},
-            "descriptors": {0: "batch", 2: "height", 3: "width"},
+            "image1": {0: "batch", 2: "height", 3: "width"},
+            "image2": {0: "batch", 2: "height", 3: "width"},
+            "keypoints1": {0: "batch"},
+            "keypoints2": {0: "batch"},
+            "matching_probs": {0: "batch"},
         }
 
     # Export to ONNX
     torch.onnx.export(
         model,
-        dummy_input,
+        (dummy_image1, dummy_image2),
         args.output,
         export_params=True,
         opset_version=args.opset_version,
         do_constant_folding=True,
-        input_names=["input"],
-        output_names=["scores", "descriptors"],
+        input_names=["image1", "image2"],
+        output_names=["keypoints1", "keypoints2", "matching_probs"],
         dynamic_axes=dynamic_axes,
         dynamo=not args.disable_dynamo,
     )
@@ -161,15 +214,24 @@ def main():
     if not args.no_optimize:
         optimization = optimize_onnx_model(args.output)
 
+    K = args.max_keypoints
     print(f"Exported ONNX model to: {args.output}")
-    print(f"  Input shape:  (N, 1, {args.height}, {args.width})")
-    print(f"  Scores shape: (N, 1, {args.height}, {args.width})")
-    print(f"  Descriptors shape: (N, {args.num_pairs}, {args.height}, {args.width})")
+    print(f"  Input image1 shape: (B, 1, {args.height}, {args.width})")
+    print(f"  Input image2 shape: (B, 1, {args.height}, {args.width})")
+    print(f"  Output keypoints1 shape: (B, {K}, 2)")
+    print(f"  Output keypoints2 shape: (B, {K}, 2)")
+    print(f"  Output matching_probs shape: (B, {K + 1}, {K + 1})")
+    print(f"  Max keypoints: {K}")
     print(f"  Block size: {args.block_size}")
     print(f"  Number of pairs: {args.num_pairs}")
     print(f"  Box size: {args.box_size}")
     print(f"  Pattern scale: {args.pattern_scale}")
     print(f"  Binarization: {args.binarization}")
+    print(f"  Sinkhorn iterations: {args.sinkhorn_iterations}")
+    print(f"  Epsilon: {args.epsilon}")
+    print(f"  Unused score: {args.unused_score}")
+    print(f"  Distance type: {args.distance_type}")
+    print(f"  Normalize descriptors: {args.normalize_descriptors}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
     print(f"  Optimization: {optimization}")
