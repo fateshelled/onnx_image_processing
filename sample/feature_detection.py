@@ -14,6 +14,7 @@ Usage:
     python sample/feature_detection.py --model shi_tomasi_bad.onnx --input image.png --output result.png
     python sample/feature_detection.py --model shi_tomasi_bad.onnx --input image.png --max-keypoints 500
     python sample/feature_detection.py --model shi_tomasi_bad.onnx --input image.png --threshold 0.01
+    python sample/feature_detection.py --model shi_tomasi_bad.onnx --input image.png --colorize
 """
 
 import argparse
@@ -122,12 +123,47 @@ def select_keypoints(
     return keypoints
 
 
+def score_to_color(normalized_score: float) -> tuple[int, int, int]:
+    """
+    Map a normalized score in [0, 1] to an RGB color using a jet-like colormap.
+
+    The mapping goes: blue (0.0) -> cyan (0.25) -> green (0.5) ->
+    yellow (0.75) -> red (1.0).
+
+    Args:
+        normalized_score: Score value in [0, 1].
+
+    Returns:
+        RGB tuple with values in [0, 255].
+    """
+    t = max(0.0, min(1.0, normalized_score))
+    # Jet-like colormap: blue -> cyan -> green -> yellow -> red
+    if t < 0.25:
+        r = 0
+        g = int(255 * (t / 0.25))
+        b = 255
+    elif t < 0.5:
+        r = 0
+        g = 255
+        b = int(255 * (1.0 - (t - 0.25) / 0.25))
+    elif t < 0.75:
+        r = int(255 * ((t - 0.5) / 0.25))
+        g = 255
+        b = 0
+    else:
+        r = 255
+        g = int(255 * (1.0 - (t - 0.75) / 0.25))
+        b = 0
+    return (r, g, b)
+
+
 def visualize_keypoints(
     image: Image.Image,
     keypoints: np.ndarray,
     output_path: str,
     circle_radius: int = 3,
     color: tuple = (0, 255, 0),
+    colorize_by_score: bool = False,
 ) -> None:
     """
     Draw detected keypoints on the image and save the result.
@@ -139,17 +175,34 @@ def visualize_keypoints(
         output_path: Path to save the output visualization image.
         circle_radius: Radius of the keypoint circles. Default is 3.
         color: RGB color tuple for drawing keypoints. Default is green.
+        colorize_by_score: If True, color each keypoint circle according
+                          to its score using a jet-like colormap (blue=low,
+                          red=high). Overrides the ``color`` parameter.
     """
     img = image.copy()
     draw = ImageDraw.Draw(img)
+
+    # Precompute normalized scores for colorization
+    if colorize_by_score and keypoints.shape[0] > 0:
+        scores = keypoints[:, 2]
+        score_min = scores.min()
+        score_max = scores.max()
+        if score_max > score_min:
+            normalized = (scores - score_min) / (score_max - score_min)
+        else:
+            normalized = np.ones_like(scores)
 
     for i in range(keypoints.shape[0]):
         y = int(keypoints[i, 0])
         x = int(keypoints[i, 1])
         r = circle_radius
+        if colorize_by_score:
+            c = score_to_color(normalized[i])
+        else:
+            c = color
         draw.ellipse(
             [x - r, y - r, x + r, y + r],
-            outline=color,
+            outline=c,
             width=1,
         )
 
@@ -202,6 +255,11 @@ def parse_args():
         default=3,
         help="Radius of keypoint circles in visualization (default: 3)"
     )
+    parser.add_argument(
+        "--colorize",
+        action="store_true",
+        help="Colorize keypoint circles by score (blue=low, red=high)"
+    )
     return parser.parse_args()
 
 
@@ -251,6 +309,7 @@ def main():
         keypoints,
         args.output,
         circle_radius=args.circle_radius,
+        colorize_by_score=args.colorize,
     )
     print(f"Saved visualization to: {args.output}")
 
