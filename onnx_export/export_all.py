@@ -22,6 +22,7 @@ EXPORT_CONFIGS = [
     ("export_shi_tomasi.py", "shi_tomasi.onnx", ["--height", "480", "--width", "640"]),
     ("export_bad.py", "bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
     ("export_sinkhorn.py", "sinkhorn_matcher.onnx", ["--num-points1", "100", "--num-points2", "100", "--desc-dim", "256"]),
+    ("export_shi_tomasi_bad.py", "shi_tomasi_bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
 ]
 
 
