@@ -39,43 +39,44 @@ def refine_keypoints_subpixel(
     H, W = score_map.shape
     refined = keypoints.copy()
 
-    for i in range(keypoints.shape[0]):
-        y = int(keypoints[i, 0])
-        x = int(keypoints[i, 1])
+    ys = keypoints[:, 0].astype(np.intp)
+    xs = keypoints[:, 1].astype(np.intp)
 
-        # Skip border pixels where a 3x3 patch is unavailable
-        if y < 1 or y >= H - 1 or x < 1 or x >= W - 1:
-            continue
+    # Mask for interior keypoints where a 3-point neighborhood is available
+    interior = (ys >= 1) & (ys < H - 1) & (xs >= 1) & (xs < W - 1)
+    if not np.any(interior):
+        return refined
 
-        # Parabola fitting along y-axis
-        fy_neg = float(score_map[y - 1, x])
-        fy_ctr = float(score_map[y, x])
-        fy_pos = float(score_map[y + 1, x])
-        denom_y = 2.0 * (fy_neg - 2.0 * fy_ctr + fy_pos)
-        if denom_y < -1e-6:  # concave parabola only
-            dy = (fy_neg - fy_pos) / denom_y
-            if abs(dy) < 1.0:
-                refined[i, 0] = y + dy
+    yi = ys[interior]
+    xi = xs[interior]
 
-        # Parabola fitting along x-axis
-        fx_neg = float(score_map[y, x - 1])
-        fx_ctr = float(score_map[y, x])
-        fx_pos = float(score_map[y, x + 1])
-        denom_x = 2.0 * (fx_neg - 2.0 * fx_ctr + fx_pos)
-        if denom_x < -1e-6:  # concave parabola only
-            dx = (fx_neg - fx_pos) / denom_x
-            if abs(dx) < 1.0:
-                refined[i, 1] = x + dx
+    # Gather 3-point neighborhoods along y-axis and x-axis
+    fy_neg = score_map[yi - 1, xi].astype(np.float64)
+    fy_ctr = score_map[yi, xi].astype(np.float64)
+    fy_pos = score_map[yi + 1, xi].astype(np.float64)
 
-        # Interpolate score at refined position using the fitted parabola values
-        # score ≈ f(0) + 0.5 * delta * (f(-1) - f(1)) for each axis
-        refined_y = refined[i, 0]
-        refined_x = refined[i, 1]
-        dy_off = refined_y - y
-        dx_off = refined_x - x
-        score_y = fy_ctr + 0.5 * dy_off * (fy_neg - fy_pos)
-        score_x = fx_ctr + 0.5 * dx_off * (fx_neg - fx_pos)
-        refined[i, 2] = (score_y + score_x) / 2.0
+    fx_neg = score_map[yi, xi - 1].astype(np.float64)
+    fx_ctr = fy_ctr  # same center value
+    fx_pos = score_map[yi, xi + 1].astype(np.float64)
+
+    # Parabola fitting along y-axis
+    denom_y = 2.0 * (fy_neg - 2.0 * fy_ctr + fy_pos)
+    dy = np.where(denom_y < -1e-6, (fy_neg - fy_pos) / denom_y, 0.0)
+    dy = np.where(np.abs(dy) < 1.0, dy, 0.0)
+
+    # Parabola fitting along x-axis
+    denom_x = 2.0 * (fx_neg - 2.0 * fx_ctr + fx_pos)
+    dx = np.where(denom_x < -1e-6, (fx_neg - fx_pos) / denom_x, 0.0)
+    dx = np.where(np.abs(dx) < 1.0, dx, 0.0)
+
+    # Update coordinates
+    refined[interior, 0] = yi + dy
+    refined[interior, 1] = xi + dx
+
+    # Interpolate score at refined position
+    score_y = fy_ctr + 0.5 * dy * (fy_neg - fy_pos)
+    score_x = fx_ctr + 0.5 * dx * (fx_neg - fx_pos)
+    refined[interior, 2] = ((score_y + score_x) / 2.0).astype(np.float32)
 
     return refined
 

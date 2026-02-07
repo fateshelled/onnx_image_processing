@@ -23,6 +23,8 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image, ImageDraw
 
+from pytorch_model.corner.shi_tomasi import refine_keypoints_subpixel
+
 
 def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Image.Image]:
     """
@@ -105,8 +107,6 @@ def select_keypoints(
         When subpixel is True, y and x are floating-point sub-pixel coordinates.
         Returns empty array of shape (0, 3) if no keypoints are found.
     """
-    from pytorch_model.corner.shi_tomasi import refine_keypoints_subpixel
-
     raw_score_map = scores[0, 0]  # (H, W) — keep original for sub-pixel fitting
     score_map = nms_keypoints(raw_score_map, nms_radius=nms_radius)
 
