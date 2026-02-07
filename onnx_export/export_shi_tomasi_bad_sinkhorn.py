@@ -48,8 +48,8 @@ def parse_args():
     parser.add_argument(
         "--max-keypoints", "-k",
         type=int,
-        default=512,
-        help="Maximum number of keypoints per image (default: 512)"
+        default=2048,
+        help="Maximum number of keypoints per image (default: 2048)"
     )
     parser.add_argument(
         "--block-size",
@@ -103,13 +103,13 @@ def parse_args():
     parser.add_argument(
         "--epsilon", "-e",
         type=float,
-        default=0.1,
-        help="Entropy regularization parameter for Sinkhorn (default: 0.1)"
+        default=0.05,
+        help="Entropy regularization parameter for Sinkhorn (default: 0.05)"
     )
     parser.add_argument(
         "--unused-score",
         type=float,
-        default=1.5,
+        default=1.0,
         help="Score for dustbin entries in Sinkhorn (default: 1.5)"
     )
     parser.add_argument(
@@ -130,6 +130,18 @@ def parse_args():
         choices=["l1", "l2"],
         default="l2",
         help="Distance metric for Sinkhorn cost matrix (default: l2)"
+    )
+    parser.add_argument(
+        "--nms-radius",
+        type=int,
+        default=3,
+        help="Radius for non-maximum suppression (default: 3)"
+    )
+    parser.add_argument(
+        "--score-threshold",
+        type=float,
+        default=0.0,
+        help="Minimum corner score threshold for keypoint selection (default: 0.0)"
     )
     parser.add_argument(
         "--opset-version",
@@ -176,6 +188,8 @@ def main():
         epsilon=args.epsilon,
         unused_score=args.unused_score,
         distance_type=args.distance_type,
+        nms_radius=args.nms_radius,
+        score_threshold=args.score_threshold,
         normalize_descriptors=args.normalize_descriptors,
     )
     model.eval()
