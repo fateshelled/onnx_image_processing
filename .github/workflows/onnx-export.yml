@@ -1,0 +1,99 @@
+name: ONNX Export
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  export-onnx:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    container:
+      image: ghcr.io/${{ github.repository }}:py${{ matrix.python-version }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user 0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Export ONNX models
+        run: |
+          python onnx_export/export_all.py --output-dir ./onnx_models
+
+      - name: Verify ONNX models
+        run: |
+          python -c "
+          import onnx
+          from pathlib import Path
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              model = onnx.load(str(model_path))
+              onnx.checker.check_model(model)
+              print(f'{model_path.name}: IR={model.ir_version}, Opset={model.opset_import[0].version}')
+          "
+
+      - name: Test ONNX model inference
+        run: |
+          python -c "
+          import numpy as np
+          import onnxruntime as ort
+          from pathlib import Path
+
+          def resolve_shape(shape, name=''):
+              \"\"\"Resolve dynamic dimensions to concrete values.\"\"\"
+              result = []
+              for dim in shape:
+                  if isinstance(dim, str):
+                      # Handle common dynamic dimension names
+                      if 'height' in dim.lower():
+                          result.append(480)
+                      elif 'width' in dim.lower():
+                          result.append(640)
+                      elif 'batch' in dim.lower():
+                          result.append(1)
+                      elif 'points' in dim.lower() or 'num' in dim.lower():
+                          result.append(100)
+                      else:
+                          result.append(1)
+                  else:
+                      result.append(dim)
+              return result
+
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              print(f'Testing: {model_path.name}')
+              session = ort.InferenceSession(str(model_path))
+
+              # Build inputs for all model inputs (supports multi-input models)
+              inputs = {}
+              input_shapes = []
+              for input_info in session.get_inputs():
+                  input_shape = resolve_shape(input_info.shape, input_info.name)
+                  dummy_input = np.random.randn(*input_shape).astype(np.float32)
+                  inputs[input_info.name] = dummy_input
+                  input_shapes.append(f'{input_info.name}: {input_shape}')
+
+              output_names = [out.name for out in session.get_outputs()]
+              results = session.run(output_names, inputs)
+
+              print(f'  Inputs: {input_shapes}')
+              for out_name, result in zip(output_names, results):
+                  print(f'  Output {out_name}: {result.shape}')
+          print('All inference tests passed')
+          "
+
+      - name: Upload ONNX models as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: onnx-models-py${{ matrix.python-version }}
+          path: ./onnx_models/*.onnx
+          retention-days: 7

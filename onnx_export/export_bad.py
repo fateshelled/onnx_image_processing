@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ONNX export script for Shi-Tomasi corner detection score calculator.
+ONNX export script for BAD (Box Average Difference) descriptor.
 
 Usage:
-    python export_shi_tomasi.py --output shi_tomasi.onnx --height 480 --width 640
+    python export_bad.py --output bad.onnx --height 480 --width 640
 """
 
 import argparse
@@ -15,18 +15,18 @@ import torch
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.corner.shi_tomasi import ShiTomasiScore
+from pytorch_model.descriptor.bad import BADDescriptor
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export Shi-Tomasi corner detection model to ONNX format"
+        description="Export BAD descriptor model to ONNX format"
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="shi_tomasi.onnx",
-        help="Output ONNX file path (default: shi_tomasi.onnx)"
+        default="bad.onnx",
+        help="Output ONNX file path (default: bad.onnx)"
     )
     parser.add_argument(
         "--height", "-H",
@@ -41,10 +41,41 @@ def parse_args():
         help="Input image width (default: 640)"
     )
     parser.add_argument(
-        "--block-size", "-b",
+        "--num-pairs", "-n",
         type=int,
-        default=3,
-        help="Block size for structure tensor computation (default: 3)"
+        default=256,
+        help="Number of descriptor pairs/bits (default: 256)"
+    )
+    parser.add_argument(
+        "--box-size", "-b",
+        type=int,
+        default=5,
+        help="Box size for averaging (default: 5)"
+    )
+    parser.add_argument(
+        "--pattern-scale", "-s",
+        type=float,
+        default=16.0,
+        help="Pattern scale for sampling offsets (default: 16.0)"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for sampling pattern (default: 42)"
+    )
+    parser.add_argument(
+        "--binarization",
+        type=str,
+        choices=["none", "soft", "hard"],
+        default="none",
+        help="Binarization mode: none (raw diff), soft (sigmoid), hard (sign) (default: none)"
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=10.0,
+        help="Temperature for soft sigmoid binarization (default: 10.0)"
     )
     parser.add_argument(
         "--opset-version",
@@ -69,7 +100,17 @@ def main():
     args = parse_args()
 
     # Create model
-    model = ShiTomasiScore(block_size=args.block_size, sobel_size=3)
+    binarize = args.binarization != "none"
+    soft_binarize = args.binarization == "soft"
+    model = BADDescriptor(
+        num_pairs=args.num_pairs,
+        box_size=args.box_size,
+        pattern_scale=args.pattern_scale,
+        seed=args.seed,
+        binarize=binarize,
+        soft_binarize=soft_binarize,
+        temperature=args.temperature,
+    )
     model.eval()
 
     # Create dummy input (N, 1, H, W)
@@ -80,7 +121,7 @@ def main():
     if args.dynamic_axes:
         dynamic_axes = {
             "input": {0: "batch", 2: "height", 3: "width"},
-            "output": {0: "batch", 2: "height", 3: "width"}
+            "output": {0: "batch", 1: "num_pairs", 2: "height", 3: "width"}
         }
 
     # Export to ONNX
@@ -99,7 +140,11 @@ def main():
 
     print(f"Exported ONNX model to: {args.output}")
     print(f"  Input shape: (N, 1, {args.height}, {args.width})")
-    print(f"  Block size: {args.block_size}")
+    print(f"  Output shape: (N, {args.num_pairs}, {args.height}, {args.width})")
+    print(f"  Number of pairs: {args.num_pairs}")
+    print(f"  Box size: {args.box_size}")
+    print(f"  Pattern scale: {args.pattern_scale}")
+    print(f"  Binarization: {args.binarization}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
 

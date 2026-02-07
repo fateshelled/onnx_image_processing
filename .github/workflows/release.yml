@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    container:
+      image: ghcr.io/${{ github.repository }}:py3.11
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user 0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Export ONNX models
+        run: |
+          python onnx_export/export_all.py --output-dir ./onnx_models --dynamic-axes
+
+      - name: Verify ONNX models
+        run: |
+          python -c "
+          import onnx
+          from pathlib import Path
+          for model_path in Path('./onnx_models').glob('*.onnx'):
+              model = onnx.load(str(model_path))
+              onnx.checker.check_model(model)
+              print(f'{model_path.name}: OK')
+          "
+
+      - name: Generate model list
+        id: models
+        run: |
+          echo "## Models" > model_list.md
+          for f in ./onnx_models/*.onnx; do
+            name=$(basename "$f")
+            echo "- \`$name\`" >> model_list.md
+          done
+          cat model_list.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest ONNX Models
+          body: |
+            Automatically generated ONNX models from the latest main branch.
+
+            See `onnx_export/export_all.py` for the full list of exported models.
+          files: ./onnx_models/*.onnx
+          prerelease: true
+          make_latest: true
