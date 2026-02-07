@@ -23,6 +23,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+
       - name: Export ONNX models
         run: |
           python onnx_export/export_all.py --output-dir ./onnx_models --dynamic-axes
