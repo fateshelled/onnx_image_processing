@@ -7,6 +7,7 @@ ONNX exportable pytorch model for image processing.
   - Shi-Tomasi + BAD unified feature detection
 - Feature Matching
   - Sinkhorn matcher
+  - Shi-Tomasi + BAD + Sinkhorn unified feature matcher (end-to-end)
 - Threshold
   - Otsu threshold
   - Multi-Otsu threshold
@@ -50,3 +51,34 @@ python sample/feature_detection.py --model shi_tomasi_bad.onnx --input image.png
 | `--max-keypoints`, `-k` | `1000` | Maximum number of keypoints to detect |
 | `--nms-radius` | `3` | Non-maximum suppression radius |
 | `--circle-radius` | `3` | Radius of keypoint circles in visualization |
+| `--colorize` | (flag) | Colorize keypoint circles by score (blue=low, red=high) |
+
+---
+
+## Sample: Image Matching (Shi-Tomasi + BAD + Sinkhorn)
+
+Match feature points between two images using the end-to-end Shi-Tomasi + BAD + Sinkhorn ONNX model and visualize the matched pairs.
+
+### 1. Export ONNX model
+
+```bash
+python onnx_export/export_shi_tomasi_bad_sinkhorn.py -o shi_tomasi_bad_sinkhorn.onnx -H 480 -W 640 --max-keypoints 512
+```
+
+### 2. Run image matching sample
+
+```bash
+python sample/image_matching.py --model shi_tomasi_bad_sinkhorn.onnx --input1 image1.png --input2 image2.png --output result.png
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--model`, `-m` | (required) | Path to the exported ONNX model file |
+| `--input1` | (required) | First input image path |
+| `--input2` | (required) | Second input image path |
+| `--output`, `-o` | `image_matching_result.png` | Output visualization image path |
+| `--threshold`, `-t` | `0.1` | Minimum match probability threshold |
+| `--max-matches` | `100` | Maximum number of matches to visualize |
+| `--colorize` | (flag) | Colorize match lines by confidence (blue=low, red=high) |
