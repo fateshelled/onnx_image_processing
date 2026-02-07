@@ -160,4 +160,6 @@ cython_debug/
 #.idea/
 
 .vscode/
-onnx_export/*.onnx
+*.onnx
+*.onnx.data
+result.png
