@@ -7,6 +7,12 @@ set -euo pipefail
 
 GH_VERSION="${GH_VERSION:-2.67.0}"
 
+# Validate version format to prevent path traversal or injection
+if [[ ! "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: Invalid GH_VERSION format: $GH_VERSION (expected: X.Y.Z)" >&2
+    exit 1
+fi
+
 if command -v gh &>/dev/null; then
     echo "gh is already installed: $(gh --version | head -1)"
     exit 0
@@ -33,18 +39,35 @@ case "$ARCH" in
 esac
 
 TARBALL="gh_${GH_VERSION}_${OS}_${ARCH}.tar.gz"
-URL="https://github.com/cli/cli/releases/download/v${GH_VERSION}/${TARBALL}"
+RELEASE_BASE="https://github.com/cli/cli/releases/download/v${GH_VERSION}"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
-echo "Downloading ${URL}..."
-curl -fsSL "$URL" -o "${TMPDIR}/${TARBALL}"
+echo "Downloading ${RELEASE_BASE}/${TARBALL}..."
+curl -fsSL "${RELEASE_BASE}/${TARBALL}" -o "${TMPDIR}/${TARBALL}"
+curl -fsSL "${RELEASE_BASE}/gh_${GH_VERSION}_checksums.txt" -o "${TMPDIR}/checksums.txt"
 
-tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
+# Verify checksum
+EXPECTED_SHA="$(grep "${TARBALL}" "${TMPDIR}/checksums.txt" | awk '{print $1}')"
+if [[ -z "$EXPECTED_SHA" ]]; then
+    echo "Error: Checksum not found for ${TARBALL}" >&2
+    exit 1
+fi
+ACTUAL_SHA="$(sha256sum "${TMPDIR}/${TARBALL}" | awk '{print $1}')"
+if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+    echo "Error: Checksum mismatch!" >&2
+    echo "  Expected: $EXPECTED_SHA" >&2
+    echo "  Actual:   $ACTUAL_SHA" >&2
+    exit 1
+fi
+echo "Checksum verified."
 
-# Install binary to /usr/local/bin
-cp "${TMPDIR}/gh_${GH_VERSION}_${OS}_${ARCH}/bin/gh" /usr/local/bin/gh
-chmod +x /usr/local/bin/gh
+# Extract and install binary
+EXTRACT_DIR="${TMPDIR}/gh"
+mkdir -p "$EXTRACT_DIR"
+tar -xzf "${TMPDIR}/${TARBALL}" -C "$EXTRACT_DIR" --strip-components=1
+
+install -m 755 "${EXTRACT_DIR}/bin/gh" /usr/local/bin/gh
 
 echo "gh installed successfully: $(gh --version | head -1)"
