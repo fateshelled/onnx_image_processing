@@ -7,7 +7,8 @@ ONNX exportable pytorch model for image processing.
   - Shi-Tomasi + BAD unified feature detection
 - Feature Matching
   - Sinkhorn matcher
-  - Shi-Tomasi + BAD + Sinkhorn unified feature matcher (end-to-end)
+  - Shi-Tomasi + BAD + Sinkhorn unified feature matcher (end-to-end, dense BAD)
+  - Shi-Tomasi + Sparse BAD + Sinkhorn unified feature matcher (end-to-end, sparse BAD at keypoints only)
 - Threshold
   - Otsu threshold
   - Multi-Otsu threshold
@@ -62,13 +63,21 @@ Match feature points between two images using the end-to-end Shi-Tomasi + BAD + 
 ### 1. Export ONNX model
 
 ```bash
+# Dense model
 python onnx_export/export_shi_tomasi_bad_sinkhorn.py -o shi_tomasi_bad_sinkhorn.onnx -H 480 -W 640 --max-keypoints 512
+
+# Sparse Model
+python onnx_export/export_shi_tomasi_sparse_bad_sinkhorn.py -o shi_tomasi_sparse_bad_sinkhorn.onnx -H 480 -W 640 --max-keypoints 512
 ```
 
 ### 2. Run image matching sample
 
 ```bash
+# Dense model
 python sample/image_matching.py --model shi_tomasi_bad_sinkhorn.onnx --input1 image1.png --input2 image2.png --output result.png
+
+# Sparse Model
+python sample/image_matching.py --model shi_tomasi_sparse_bad_sinkhorn.onnx --input1 image1.png --input2 image2.png --output result.png
 ```
 
 #### Options
