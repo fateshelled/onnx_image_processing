@@ -17,7 +17,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-      options: --user 0
+      options: --user 0--shm-size=2gb
 
     steps:
       - name: Checkout repository
