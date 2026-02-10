@@ -131,12 +131,20 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
         self.register_buffer("radii", box_params[:, 4].to(torch.int64))
         self.register_buffer("thresholds", thresholds)
-        unique_radii = torch.unique(self.radii)
-        self.register_buffer("unique_radii", unique_radii)
-        self.radius_pair_indices = [
-            torch.nonzero(self.radii == radius, as_tuple=False).squeeze(1)
-            for radius in unique_radii
-        ]
+
+        # Precompute a bank of normalized box kernels for each radius so
+        # descriptor computation can run without Python-side loops.
+        max_radius = int(torch.max(self.radii).item())
+        self.max_radius = max_radius
+        coords = torch.arange(-max_radius, max_radius + 1, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+        radius_values = torch.arange(max_radius + 1, dtype=torch.float32).view(-1, 1, 1)
+        square_masks = ((grid_y.abs() <= radius_values) & (grid_x.abs() <= radius_values)).to(
+            torch.float32
+        )
+        denom = ((2.0 * radius_values + 1.0) ** 2).clamp_min(1.0)
+        kernel_bank = (square_masks / denom).unsqueeze(1)
+        self.register_buffer("box_kernel_bank", kernel_bank)
 
         # Feature matcher: Sinkhorn
         self.matcher = SinkhornMatcher(
@@ -270,56 +278,52 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         norm_scale_y = 2.0 / (H - 1 + 1e-8)
         norm_scale_x = 2.0 / (W - 1 + 1e-8)
 
-        diff = torch.empty(
-            (B, K, self.num_pairs),
-            device=image.device,
-            dtype=image.dtype,
+        kernels = self.box_kernel_bank.to(device=image.device, dtype=image.dtype)
+        padded = F.pad(
+            image,
+            (self.max_radius, self.max_radius, self.max_radius, self.max_radius),
+            mode="replicate",
+        )
+        box_avg_bank = F.conv2d(padded, kernels, stride=1)
+
+        oy1 = self.offset_y1.to(dtype=image.dtype).view(1, 1, -1)
+        ox1 = self.offset_x1.to(dtype=image.dtype).view(1, 1, -1)
+        oy2 = self.offset_y2.to(dtype=image.dtype).view(1, 1, -1)
+        ox2 = self.offset_x2.to(dtype=image.dtype).view(1, 1, -1)
+
+        pos1_y = kp_expanded[:, :, :, 0] + oy1
+        pos1_x = kp_expanded[:, :, :, 1] + ox1
+        pos2_y = kp_expanded[:, :, :, 0] + oy2
+        pos2_x = kp_expanded[:, :, :, 1] + ox2
+
+        grid1 = torch.stack(
+            [pos1_x * norm_scale_x - 1.0, pos1_y * norm_scale_y - 1.0],
+            dim=-1,
+        )
+        grid2 = torch.stack(
+            [pos2_x * norm_scale_x - 1.0, pos2_y * norm_scale_y - 1.0],
+            dim=-1,
         )
 
-        # Group by radius to reuse average-pooling maps.
-        for radius, pair_idx in zip(self.unique_radii.tolist(), self.radius_pair_indices):
-            pair_idx = pair_idx.to(device=image.device)
+        sampled1 = F.grid_sample(
+            box_avg_bank,
+            grid1,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        sampled2 = F.grid_sample(
+            box_avg_bank,
+            grid2,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
 
-            r = int(radius)
-            side = 2 * r + 1
-            img_padded = F.pad(image, (r, r, r, r), mode="replicate")
-            box_avg = F.avg_pool2d(img_padded, kernel_size=side, stride=1)
-
-            oy1 = self.offset_y1[pair_idx].to(dtype=image.dtype).view(1, 1, -1)
-            ox1 = self.offset_x1[pair_idx].to(dtype=image.dtype).view(1, 1, -1)
-            oy2 = self.offset_y2[pair_idx].to(dtype=image.dtype).view(1, 1, -1)
-            ox2 = self.offset_x2[pair_idx].to(dtype=image.dtype).view(1, 1, -1)
-
-            pos1_y = kp_expanded[:, :, :, 0] + oy1
-            pos1_x = kp_expanded[:, :, :, 1] + ox1
-            pos2_y = kp_expanded[:, :, :, 0] + oy2
-            pos2_x = kp_expanded[:, :, :, 1] + ox2
-
-            grid1 = torch.stack(
-                [pos1_x * norm_scale_x - 1.0, pos1_y * norm_scale_y - 1.0],
-                dim=-1,
-            )
-            grid2 = torch.stack(
-                [pos2_x * norm_scale_x - 1.0, pos2_y * norm_scale_y - 1.0],
-                dim=-1,
-            )
-
-            sample1 = F.grid_sample(
-                box_avg,
-                grid1,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=True,
-            ).squeeze(1)
-            sample2 = F.grid_sample(
-                box_avg,
-                grid2,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=True,
-            ).squeeze(1)
-
-            diff[:, :, pair_idx] = sample1 - sample2
+        radius_idx = self.radii.view(1, 1, 1, self.num_pairs).expand(B, 1, K, self.num_pairs)
+        sample1 = torch.gather(sampled1, dim=1, index=radius_idx).squeeze(1)
+        sample2 = torch.gather(sampled2, dim=1, index=radius_idx).squeeze(1)
+        diff = sample1 - sample2
 
         centered = diff - self.thresholds.view(1, 1, -1).to(diff.dtype)
 
