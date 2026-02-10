@@ -834,6 +834,10 @@ class BADDescriptor(nn.Module):
         self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
         self.register_buffer("radii", box_params[:, 4].to(torch.int64))
         self.register_buffer("thresholds", thresholds)
+        self._radius_groups = []
+        for radius in torch.unique(self.radii).tolist():
+            pair_idx = torch.nonzero(self.radii == int(radius), as_tuple=False).squeeze(1)
+            self._radius_groups.append((int(radius), pair_idx))
 
     def _compute_diff_map(self, x: torch.Tensor) -> torch.Tensor:
         """Compute BAD average differences using learned box radii and offsets."""
@@ -852,15 +856,14 @@ class BADDescriptor(nn.Module):
         diff = torch.empty((B, num_pairs, H, W), device=device, dtype=dtype)
 
         # Group by radius to reuse average-pooling maps.
-        for radius in torch.unique(self.radii).tolist():
-            pair_idx = torch.nonzero(self.radii == int(radius), as_tuple=False).squeeze(1)
+        for radius, pair_idx in self._radius_groups:
+            pair_idx = pair_idx.to(device=device)
             n_pairs = int(pair_idx.numel())
             if n_pairs == 0:
                 continue
 
-            r = int(radius)
-            side = 2 * r + 1
-            x_padded = F.pad(x, (r, r, r, r), mode="replicate")
+            side = 2 * radius + 1
+            x_padded = F.pad(x, (radius, radius, radius, radius), mode="replicate")
             box_avg = F.avg_pool2d(x_padded, kernel_size=side, stride=1)
 
             oy1 = self.offset_y1[pair_idx].to(device=device, dtype=dtype).view(-1, 1, 1)

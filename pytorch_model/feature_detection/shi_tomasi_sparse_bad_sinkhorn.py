@@ -131,6 +131,10 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
         self.register_buffer("radii", box_params[:, 4].to(torch.int64))
         self.register_buffer("thresholds", thresholds)
+        self._radius_groups = []
+        for radius in torch.unique(self.radii).tolist():
+            pair_idx = torch.nonzero(self.radii == int(radius), as_tuple=False).squeeze(1)
+            self._radius_groups.append((int(radius), pair_idx))
 
         # Feature matcher: Sinkhorn
         self.matcher = SinkhornMatcher(
@@ -271,14 +275,13 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         )
 
         # Group by radius to reuse average-pooling maps.
-        for radius in torch.unique(self.radii).tolist():
-            pair_idx = torch.nonzero(self.radii == int(radius), as_tuple=False).squeeze(1)
+        for radius, pair_idx in self._radius_groups:
+            pair_idx = pair_idx.to(device=image.device)
             if int(pair_idx.numel()) == 0:
                 continue
 
-            r = int(radius)
-            side = 2 * r + 1
-            img_padded = F.pad(image, (r, r, r, r), mode="replicate")
+            side = 2 * radius + 1
+            img_padded = F.pad(image, (radius, radius, radius, radius), mode="replicate")
             box_avg = F.avg_pool2d(img_padded, kernel_size=side, stride=1)
 
             oy1 = self.offset_y1[pair_idx].to(dtype=image.dtype).view(1, 1, -1)
