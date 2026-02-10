@@ -42,10 +42,6 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
                     Currently only supports 3. Default is 3.
         num_pairs: Number of BAD descriptor comparison pairs (descriptor
                    dimensionality). Default is 256.
-        box_size: Box size for BAD averaging window. Must be odd. Default is 5.
-        pattern_scale: Scale factor for BAD sampling pattern spread in pixels.
-                       Default is 16.0.
-        seed: Random seed for reproducible BAD sampling pattern. Default is 42.
         binarize: If True, output binarized BAD descriptors. Default is False.
         soft_binarize: If True and binarize=True, use sigmoid for soft
                        binarization. Default is True.
@@ -79,9 +75,6 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         block_size: int = 3,
         sobel_size: int = 3,
         num_pairs: int = 256,
-        box_size: int = 5,
-        pattern_scale: float = 16.0,
-        seed: int = 42,
         binarize: bool = False,
         soft_binarize: bool = True,
         temperature: float = 10.0,
@@ -95,9 +88,6 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
     ) -> None:
         super().__init__()
 
-        if box_size <= 0 or box_size % 2 == 0:
-            raise ValueError(f"box_size must be a positive odd integer, got {box_size}")
-
         self.max_keypoints = max_keypoints
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
@@ -108,7 +98,6 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             )
 
         self.num_pairs = num_pairs
-        self.box_size = box_size
         self.binarize = binarize
         self.soft_binarize = soft_binarize
         self.temperature = temperature
@@ -118,10 +107,6 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             block_size=block_size,
             sobel_size=sobel_size,
         )
-
-        # NOTE: pattern_scale/seed are kept for API compatibility but unused.
-        self.pattern_scale = pattern_scale
-        self.seed = seed
 
         # Use learned BAD pattern and learned thresholds.
         box_params, thresholds = _get_bad_learned_params(num_pairs)

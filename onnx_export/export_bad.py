@@ -49,24 +49,6 @@ def parse_args():
         help="Number of BAD descriptor bits (choices: 256 or 512, default: 256)"
     )
     parser.add_argument(
-        "--box-size", "-b",
-        type=int,
-        default=5,
-        help="Box size for averaging (default: 5)"
-    )
-    parser.add_argument(
-        "--pattern-scale", "-s",
-        type=float,
-        default=16.0,
-        help="Pattern scale for sampling offsets (default: 16.0)"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for sampling pattern (default: 42)"
-    )
-    parser.add_argument(
         "--binarization",
         type=str,
         choices=["none", "soft", "hard"],
@@ -107,16 +89,12 @@ def main():
     args = parse_args()
 
     # NOTE: Learned BAD patterns are fixed for 256/512 bits.
-    # pattern_scale/seed are accepted for backward-compatible CLI only.
 
     # Create model
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
     model = BADDescriptor(
         num_pairs=args.num_pairs,
-        box_size=args.box_size,
-        pattern_scale=args.pattern_scale,
-        seed=args.seed,
         binarize=binarize,
         soft_binarize=soft_binarize,
         temperature=args.temperature,
@@ -157,9 +135,6 @@ def main():
     print(f"  Input shape: (N, 1, {args.height}, {args.width})")
     print(f"  Output shape: (N, {args.num_pairs}, {args.height}, {args.width})")
     print(f"  Number of pairs: {args.num_pairs}")
-    print(f"  Box size: {args.box_size}")
-    print(f"  Pattern scale (unused with learned pattern): {args.pattern_scale}")
-    print(f"  Seed (unused with learned pattern): {args.seed}")
     print(f"  Binarization: {args.binarization}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")

@@ -71,18 +71,6 @@ def parse_args():
         help="Box size for BAD averaging (default: 5)"
     )
     parser.add_argument(
-        "--pattern-scale", "-s",
-        type=float,
-        default=16.0,
-        help="Pattern scale for BAD sampling offsets (default: 16.0)"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for BAD sampling pattern (default: 42)"
-    )
-    parser.add_argument(
         "--binarization",
         type=str,
         choices=["none", "soft", "hard"],
@@ -172,8 +160,6 @@ def main():
     args = parse_args()
 
     # NOTE: Learned BAD patterns are fixed for 256/512 bits.
-    # pattern_scale/seed are accepted for backward-compatible CLI only.
-
     # Create model
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
@@ -182,9 +168,6 @@ def main():
         block_size=args.block_size,
         sobel_size=3,
         num_pairs=args.num_pairs,
-        box_size=args.box_size,
-        pattern_scale=args.pattern_scale,
-        seed=args.seed,
         binarize=binarize,
         soft_binarize=soft_binarize,
         temperature=args.temperature,
@@ -242,9 +225,6 @@ def main():
     print(f"  Max keypoints: {K}")
     print(f"  Block size: {args.block_size}")
     print(f"  Number of pairs: {args.num_pairs}")
-    print(f"  Box size: {args.box_size}")
-    print(f"  Pattern scale (unused with learned pattern): {args.pattern_scale}")
-    print(f"  Seed (unused with learned pattern): {args.seed}")
     print(f"  Binarization: {args.binarization}")
     print(f"  Sinkhorn iterations: {args.sinkhorn_iterations}")
     print(f"  Epsilon: {args.epsilon}")

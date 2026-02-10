@@ -23,8 +23,8 @@ EXPORT_CONFIGS = [
     ("export_bad.py", "bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
     ("export_sinkhorn.py", "sinkhorn_matcher.onnx", ["--num-points1", "100", "--num-points2", "100", "--desc-dim", "256"]),
     ("export_shi_tomasi_bad.py", "shi_tomasi_bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
-    ("export_shi_tomasi_bad_sinkhorn.py", "shi_tomasi_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "512"]),
-    ("export_shi_tomasi_sparse_bad_sinkhorn.py", "shi_tomasi_sparse_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "512"]),
+    ("export_shi_tomasi_bad_sinkhorn.py", "shi_tomasi_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "2048"]),
+    ("export_shi_tomasi_sparse_bad_sinkhorn.py", "shi_tomasi_sparse_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "2048"]),
 ]
 
 

@@ -17,23 +17,13 @@ class BADDescriptor(nn.Module):
     def __init__(
         self,
         num_pairs: int = 256,
-        box_size: int = 5,
-        pattern_scale: float = 16.0,
-        seed: int = 42,
         binarize: bool = False,
         soft_binarize: bool = True,
         temperature: float = 10.0,
     ) -> None:
         super().__init__()
 
-        if box_size <= 0 or box_size % 2 == 0:
-            raise ValueError(f"box_size must be a positive odd integer, got {box_size}")
-
-        # NOTE: pattern_scale/seed are kept for API compatibility but unused.
         self.num_pairs = num_pairs
-        self.box_size = box_size
-        self.pattern_scale = pattern_scale
-        self.seed = seed
         self.binarize = binarize
         self.soft_binarize = soft_binarize
         self.temperature = temperature
