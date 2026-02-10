@@ -132,6 +132,13 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         self.register_buffer("radii", box_params[:, 4].to(torch.int64))
         self.register_buffer("thresholds", thresholds)
 
+        # Pre-reshape buffers for performance and ONNX graph clarity
+        self.register_buffer("offset_y1_v", self.offset_y1.view(1, 1, -1))
+        self.register_buffer("offset_x1_v", self.offset_x1.view(1, 1, -1))
+        self.register_buffer("offset_y2_v", self.offset_y2.view(1, 1, -1))
+        self.register_buffer("offset_x2_v", self.offset_x2.view(1, 1, -1))
+        self.register_buffer("thresholds_v", self.thresholds.view(1, 1, -1))
+
         # Precompute a bank of normalized box kernels for each radius so
         # descriptor computation can run without Python-side loops.
         max_radius = int(torch.max(self.radii).item())
@@ -286,15 +293,16 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         )
         box_avg_bank = F.conv2d(padded, kernels, stride=1)
 
-        oy1 = self.offset_y1.to(dtype=image.dtype).view(1, 1, -1)
-        ox1 = self.offset_x1.to(dtype=image.dtype).view(1, 1, -1)
-        oy2 = self.offset_y2.to(dtype=image.dtype).view(1, 1, -1)
-        ox2 = self.offset_x2.to(dtype=image.dtype).view(1, 1, -1)
+        # Use pre-reshaped buffers, casting to the correct dtype
+        offset_y1 = self.offset_y1_v.to(dtype=image.dtype)
+        offset_x1 = self.offset_x1_v.to(dtype=image.dtype)
+        offset_y2 = self.offset_y2_v.to(dtype=image.dtype)
+        offset_x2 = self.offset_x2_v.to(dtype=image.dtype)
 
-        pos1_y = kp_expanded[:, :, :, 0] + oy1
-        pos1_x = kp_expanded[:, :, :, 1] + ox1
-        pos2_y = kp_expanded[:, :, :, 0] + oy2
-        pos2_x = kp_expanded[:, :, :, 1] + ox2
+        pos1_y = kp_expanded[:, :, :, 0] + offset_y1
+        pos1_x = kp_expanded[:, :, :, 1] + offset_x1
+        pos2_y = kp_expanded[:, :, :, 0] + offset_y2
+        pos2_x = kp_expanded[:, :, :, 1] + offset_x2
 
         grid1 = torch.stack(
             [pos1_x * norm_scale_x - 1.0, pos1_y * norm_scale_y - 1.0],
@@ -325,7 +333,7 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         sample2 = torch.gather(sampled2, dim=1, index=radius_idx).squeeze(1)
         diff = sample1 - sample2
 
-        centered = diff - self.thresholds.view(1, 1, -1).to(diff.dtype)
+        centered = diff - self.thresholds_v.to(diff.dtype)
 
         # BAD bit is 1 when response <= threshold.
         if not self.binarize:

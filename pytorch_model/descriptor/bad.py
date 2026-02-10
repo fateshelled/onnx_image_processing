@@ -834,6 +834,10 @@ class BADDescriptor(nn.Module):
         self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
         self.register_buffer("radii", box_params[:, 4].to(torch.int64))
         self.register_buffer("thresholds", thresholds)
+        # Pre-compute area for normalization
+        area = (2.0 * self.radii.float() + 1.0) ** 2
+        self.register_buffer("area", area.view(-1, 1, 1))
+        # Pre-compute max_radius for padding
         self.max_radius = int(torch.max(self.radii).item())
 
     def _compute_diff_map(self, x: torch.Tensor) -> torch.Tensor:
@@ -852,7 +856,6 @@ class BADDescriptor(nn.Module):
         base_y = torch.arange(H, device=device, dtype=dtype).view(1, H, 1)
         base_x = torch.arange(W, device=device, dtype=dtype).view(1, 1, W)
 
-        radii = self.radii.to(device=device, dtype=dtype).view(-1, 1, 1)
         radii_i64 = self.radii.to(device=device).view(-1, 1, 1)
 
         def box_mean_for_offsets(offset_y: torch.Tensor, offset_x: torch.Tensor) -> torch.Tensor:
@@ -874,8 +877,7 @@ class BADDescriptor(nn.Module):
                 return flat[:, linear_idx].reshape(B, self.num_pairs, H, W)
 
             area_sum = gather(y1, x1) - gather(y0, x1) - gather(y1, x0) + gather(y0, x0)
-            area = (2.0 * radii + 1.0) ** 2
-            return area_sum / area.to(device=device, dtype=dtype)
+            return area_sum / self.area.to(device=device, dtype=dtype)
 
         sample1 = box_mean_for_offsets(
             self.offset_y1.to(device=device, dtype=dtype),
