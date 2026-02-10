@@ -835,73 +835,56 @@ class BADDescriptor(nn.Module):
         self.register_buffer("radii", box_params[:, 4].to(torch.int64))
         self.register_buffer("thresholds", thresholds)
 
-        unique_radii = torch.unique(self.radii)
-        self.register_buffer("unique_radii", unique_radii)
-        self.radius_pair_indices = [
-            torch.nonzero(self.radii == radius, as_tuple=False).squeeze(1)
-            for radius in unique_radii
-        ]
-
     def _compute_diff_map(self, x: torch.Tensor) -> torch.Tensor:
         """Compute BAD average differences using learned box radii and offsets."""
         B, _, H, W = x.shape
         device = x.device
         dtype = x.dtype
-        num_pairs = self.num_pairs
 
-        y_coords = torch.linspace(-1.0, 1.0, H, device=device, dtype=dtype)
-        x_coords = torch.linspace(-1.0, 1.0, W, device=device, dtype=dtype)
-        base_y, base_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
+        max_radius = int(torch.max(self.radii).item())
+        x_padded = F.pad(x, (max_radius, max_radius, max_radius, max_radius), mode="replicate")
+        integral = torch.cumsum(torch.cumsum(x_padded, dim=2), dim=3)
+        integral = F.pad(integral, (1, 0, 1, 0), mode="constant", value=0.0).squeeze(1)
+        _, Hp1, Wp1 = integral.shape
 
-        scale_y = 2.0 / (H - 1 + 1e-8)
-        scale_x = 2.0 / (W - 1 + 1e-8)
+        base_y = torch.arange(H, device=device, dtype=dtype).view(1, H, 1)
+        base_x = torch.arange(W, device=device, dtype=dtype).view(1, 1, W)
 
-        diff = torch.empty((B, num_pairs, H, W), device=device, dtype=dtype)
+        radii = self.radii.to(device=device, dtype=dtype).view(-1, 1, 1)
+        radii_i64 = self.radii.to(device=device).view(-1, 1, 1)
 
-        # Group by radius to reuse average-pooling maps.
-        for radius, pair_idx in zip(self.unique_radii.tolist(), self.radius_pair_indices):
-            pair_idx = pair_idx.to(device=device)
-            n_pairs = int(pair_idx.numel())
+        def box_mean_for_offsets(offset_y: torch.Tensor, offset_x: torch.Tensor) -> torch.Tensor:
+            center_y = torch.clamp(base_y + offset_y.view(-1, 1, 1), min=0.0, max=float(H - 1))
+            center_x = torch.clamp(base_x + offset_x.view(-1, 1, 1), min=0.0, max=float(W - 1))
 
-            r = int(radius)
-            side = 2 * r + 1
-            x_padded = F.pad(x, (r, r, r, r), mode="replicate")
-            box_avg = F.avg_pool2d(x_padded, kernel_size=side, stride=1)
+            center_y_i64 = center_y.to(torch.int64) + max_radius
+            center_x_i64 = center_x.to(torch.int64) + max_radius
 
-            oy1 = self.offset_y1[pair_idx].to(device=device, dtype=dtype).view(-1, 1, 1)
-            ox1 = self.offset_x1[pair_idx].to(device=device, dtype=dtype).view(-1, 1, 1)
-            oy2 = self.offset_y2[pair_idx].to(device=device, dtype=dtype).view(-1, 1, 1)
-            ox2 = self.offset_x2[pair_idx].to(device=device, dtype=dtype).view(-1, 1, 1)
+            y0 = center_y_i64 - radii_i64
+            x0 = center_x_i64 - radii_i64
+            y1 = center_y_i64 + radii_i64 + 1
+            x1 = center_x_i64 + radii_i64 + 1
 
-            grid1_y = base_y.unsqueeze(0) + oy1 * scale_y
-            grid1_x = base_x.unsqueeze(0) + ox1 * scale_x
-            grid2_y = base_y.unsqueeze(0) + oy2 * scale_y
-            grid2_x = base_x.unsqueeze(0) + ox2 * scale_x
-            grid1 = torch.stack([grid1_x, grid1_y], dim=-1)
-            grid2 = torch.stack([grid2_x, grid2_y], dim=-1)
+            flat = integral.reshape(B, -1)
 
-            box_avg_batched = box_avg.repeat_interleave(n_pairs, dim=0)
-            grid1_batched = grid1.repeat(B, 1, 1, 1)
-            grid2_batched = grid2.repeat(B, 1, 1, 1)
+            def gather(y_idx: torch.Tensor, x_idx: torch.Tensor) -> torch.Tensor:
+                linear_idx = (y_idx * Wp1 + x_idx).reshape(-1)
+                return flat[:, linear_idx].reshape(B, self.num_pairs, H, W)
 
-            sample1 = F.grid_sample(
-                box_avg_batched,
-                grid1_batched,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=True,
-            ).reshape(B, n_pairs, H, W)
-            sample2 = F.grid_sample(
-                box_avg_batched,
-                grid2_batched,
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=True,
-            ).reshape(B, n_pairs, H, W)
+            area_sum = gather(y1, x1) - gather(y0, x1) - gather(y1, x0) + gather(y0, x0)
+            area = (2.0 * radii + 1.0) ** 2
+            return area_sum / area.to(device=device, dtype=dtype)
 
-            diff[:, pair_idx, :, :] = sample1 - sample2
+        sample1 = box_mean_for_offsets(
+            self.offset_y1.to(device=device, dtype=dtype),
+            self.offset_x1.to(device=device, dtype=dtype),
+        )
+        sample2 = box_mean_for_offsets(
+            self.offset_y2.to(device=device, dtype=dtype),
+            self.offset_x2.to(device=device, dtype=dtype),
+        )
 
-        return diff
+        return sample1 - sample2
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Compute dense BAD descriptor map using learned thresholds."""
