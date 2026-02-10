@@ -834,6 +834,7 @@ class BADDescriptor(nn.Module):
         self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
         self.register_buffer("radii", box_params[:, 4].to(torch.int64))
         self.register_buffer("thresholds", thresholds)
+        self.max_radius = int(torch.max(self.radii).item())
 
     def _compute_diff_map(self, x: torch.Tensor) -> torch.Tensor:
         """Compute BAD average differences using learned box radii and offsets."""
@@ -841,7 +842,8 @@ class BADDescriptor(nn.Module):
         device = x.device
         dtype = x.dtype
 
-        max_radius = int(torch.max(self.radii).item())
+        # Use pre-computed max_radius for ONNX compatibility
+        max_radius = self.max_radius
         x_padded = F.pad(x, (max_radius, max_radius, max_radius, max_radius), mode="replicate")
         integral = torch.cumsum(torch.cumsum(x_padded, dim=2), dim=3)
         integral = F.pad(integral, (1, 0, 1, 0), mode="constant", value=0.0).squeeze(1)
