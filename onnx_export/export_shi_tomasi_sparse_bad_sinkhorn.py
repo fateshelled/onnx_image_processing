@@ -60,8 +60,9 @@ def parse_args():
     parser.add_argument(
         "--num-pairs", "-n",
         type=int,
+        choices=[256, 512],
         default=256,
-        help="Number of BAD descriptor pairs/bits (default: 256)"
+        help="Number of BAD descriptor bits (choices: 256 or 512, default: 256)"
     )
     parser.add_argument(
         "--box-size", "-b",
@@ -86,7 +87,7 @@ def parse_args():
         type=str,
         choices=["none", "soft", "hard"],
         default="none",
-        help="BAD binarization mode: none (raw diff), soft (sigmoid), hard (sign) (default: none)"
+        help="BAD binarization mode: none (threshold-centered response), soft (sigmoid), hard (binary) (default: none)"
     )
     parser.add_argument(
         "--temperature",
@@ -170,6 +171,9 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # NOTE: Learned BAD patterns are fixed for 256/512 bits.
+    # pattern_scale/seed are accepted for backward-compatible CLI only.
+
     # Create model
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
@@ -240,7 +244,8 @@ def main():
     print(f"  Block size: {args.block_size}")
     print(f"  Number of pairs: {args.num_pairs}")
     print(f"  Box size: {args.box_size}")
-    print(f"  Pattern scale: {args.pattern_scale}")
+    print(f"  Pattern scale (unused with learned pattern): {args.pattern_scale}")
+    print(f"  Seed (unused with learned pattern): {args.seed}")
     print(f"  Binarization: {args.binarization}")
     print(f"  Sinkhorn iterations: {args.sinkhorn_iterations}")
     print(f"  Epsilon: {args.epsilon}")
