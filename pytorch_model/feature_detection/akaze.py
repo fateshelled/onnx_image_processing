@@ -434,22 +434,20 @@ class AKAZE(nn.Module):
         max_scores, scale_indices = torch.max(all_scores, dim=0)
 
         # Select orientations from the scale with maximum response
-        # Expand scale_indices to match orientation dimensions
-        N, C, H, W = scale_indices.shape
+        # Using one-hot encoding for efficient selection (faster than gather)
 
-        # Reshape for gather operation
-        # all_orientations: (num_scales, N*C*H*W) -> gather -> (N*C*H*W) -> reshape
-        scale_indices_flat = scale_indices.view(-1)
-        all_orientations_transposed = all_orientations.permute(1, 2, 3, 4, 0).reshape(-1, self.num_scales)
+        # Convert scale indices to one-hot encoding
+        # scale_indices: (N, C, H, W), values in [0, num_scales)
+        # one_hot: (N, C, H, W, num_scales)
+        one_hot = F.one_hot(scale_indices.long(), num_classes=self.num_scales).float()
 
-        # Gather orientations from the corresponding scales
-        selected_orientations_flat = torch.gather(
-            all_orientations_transposed,
-            dim=1,
-            index=scale_indices_flat.unsqueeze(1)
-        ).squeeze(1)
+        # Permute one_hot to match all_orientations dimensions
+        # one_hot_permuted: (num_scales, N, C, H, W)
+        one_hot_permuted = one_hot.permute(4, 0, 1, 2, 3)
 
-        # Reshape back to (N, C, H, W)
-        selected_orientations = selected_orientations_flat.view(N, C, H, W)
+        # Element-wise multiply and sum over scale dimension
+        # This selects the orientation from the scale with max response
+        # all_orientations * one_hot: only the selected scale has non-zero values
+        selected_orientations = (all_orientations * one_hot_permuted).sum(dim=0)
 
         return max_scores, selected_orientations
