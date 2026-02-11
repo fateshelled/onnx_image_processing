@@ -344,11 +344,12 @@ class AKAZE(nn.Module):
         orientation_sigma: Gaussian sigma for orientation weighting.
 
     Example:
+        >>> # Compatible with Shi-Tomasi interface
         >>> model = AKAZE(num_scales=3, threshold=0.001)
         >>> img = torch.randn(1, 1, 480, 640)
         >>> scores, orientations = model(img)
-        >>> print(scores.shape)        # [1, 1, 480, 640]
-        >>> print(orientations.shape)  # [1, 1, 480, 640]
+        >>> print(scores.shape)        # [1, 1, 480, 640] - same as Shi-Tomasi
+        >>> print(orientations.shape)  # [1, 1, 480, 640] - extra angle info
     """
 
     def __init__(
@@ -391,17 +392,30 @@ class AKAZE(nn.Module):
         """
         Detect AKAZE features and compute orientations.
 
+        This method follows the same interface as Shi-Tomasi corner detector
+        but additionally provides orientation information. This makes it easy
+        to swap between different detectors or combine with other modules.
+
         Args:
             image: Input grayscale image tensor of shape (N, 1, H, W).
-                   Values should be normalized to [0, 1] or [0, 255].
+                   Values should be in range [0, 255] or [0, 1].
 
         Returns:
             Tuple of:
                 - scores: Feature point score map of shape (N, 1, H, W).
-                  Higher values indicate stronger features.
-                - orientations: Orientation map of shape (N, 1, H, W).
-                  Values in radians [-π, π]. Orientation corresponds to the
-                  scale where the maximum feature response was detected.
+                  Higher values indicate stronger feature responses.
+                  Compatible with Shi-Tomasi score output format.
+                - orientations: Dominant orientation map of shape (N, 1, H, W).
+                  Values in radians [-π, π]. Each pixel's orientation
+                  corresponds to the scale where maximum response was detected.
+                  This is the additional information not available in Shi-Tomasi.
+
+        Example:
+            >>> model = AKAZE()
+            >>> img = torch.randn(1, 1, 480, 640)
+            >>> scores, orientations = model(img)
+            >>> # scores can be used like Shi-Tomasi scores
+            >>> # orientations provide extra rotation information
         """
         # Lists to store scores and orientations at each scale
         scale_scores_list = []
@@ -430,8 +444,8 @@ class AKAZE(nn.Module):
         all_orientations = torch.stack(scale_orientations_list, dim=0)
 
         # Find the scale with maximum response at each pixel
-        # max_scores: (N, 1, H, W), scale_indices: (N, 1, H, W)
-        max_scores, scale_indices = torch.max(all_scores, dim=0)
+        # scores: (N, 1, H, W), scale_indices: (N, 1, H, W)
+        scores, scale_indices = torch.max(all_scores, dim=0)
 
         # Select orientations from the scale with maximum response
         # Using one-hot encoding for efficient selection (faster than gather)
@@ -448,6 +462,6 @@ class AKAZE(nn.Module):
         # Element-wise multiply and sum over scale dimension
         # This selects the orientation from the scale with max response
         # all_orientations * one_hot: only the selected scale has non-zero values
-        selected_orientations = (all_orientations * one_hot_permuted).sum(dim=0)
+        orientations = (all_orientations * one_hot_permuted).sum(dim=0)
 
-        return max_scores, selected_orientations
+        return scores, orientations
