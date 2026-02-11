@@ -348,8 +348,8 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             selected1 = torch.index_select(sampled1_at_radius, dim=2, index=pair_indices)
             selected2 = torch.index_select(sampled2_at_radius, dim=2, index=pair_indices)
 
-            sample1 = sample1.scatter(2, pair_indices_expanded, selected1)
-            sample2 = sample2.scatter(2, pair_indices_expanded, selected2)
+            sample1.scatter_(2, pair_indices_expanded, selected1)
+            sample2.scatter_(2, pair_indices_expanded, selected2)
         diff = sample1 - sample2
 
         centered = diff - self.thresholds_v.to(diff.dtype)
