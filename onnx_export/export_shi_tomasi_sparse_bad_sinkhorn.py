@@ -133,6 +133,13 @@ def parse_args():
         help="Minimum corner score threshold for keypoint selection (default: 0.0)"
     )
     parser.add_argument(
+        "--sampling-mode",
+        type=str,
+        choices=["nearest", "bilinear"],
+        default="nearest",
+        help="Sampling mode for sparse BAD descriptor extraction (default: nearest)"
+    )
+    parser.add_argument(
         "--opset-version",
         type=int,
         default=18,
@@ -179,6 +186,7 @@ def main():
         nms_radius=args.nms_radius,
         score_threshold=args.score_threshold,
         normalize_descriptors=args.normalize_descriptors,
+        sampling_mode=args.sampling_mode,
     )
     model.eval()
 
@@ -232,6 +240,7 @@ def main():
     print(f"  Epsilon: {args.epsilon}")
     print(f"  Unused score: {args.unused_score}")
     print(f"  Distance type: {args.distance_type}")
+    print(f"  Sampling mode: {args.sampling_mode}")
     print(f"  Normalize descriptors: {args.normalize_descriptors}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")

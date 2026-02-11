@@ -58,6 +58,9 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
                         Default is 0.0 (no filtering).
         normalize_descriptors: If True, L2-normalize descriptors before matching.
                               Default is True.
+        sampling_mode: Sampling mode for descriptor grid sampling.
+                       Choose 'nearest' for faster approximate sampling or
+                       'bilinear' for smoother interpolation. Default is 'nearest'.
 
     Example:
         >>> model = ShiTomasiSparseBADSinkhornMatcher(max_keypoints=512)
@@ -85,6 +88,7 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         nms_radius: int = 3,
         score_threshold: float = 0.0,
         normalize_descriptors: bool = True,
+        sampling_mode: str = "nearest",
     ) -> None:
         super().__init__()
 
@@ -92,9 +96,14 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
         self.normalize_descriptors = normalize_descriptors
+        self.sampling_mode = sampling_mode
         if num_pairs not in (256, 512):
             raise ValueError(
                 f"num_pairs must be 256 or 512 to use learned BAD patterns, got {num_pairs}"
+            )
+        if self.sampling_mode not in ("nearest", "bilinear"):
+            raise ValueError(
+                f"sampling_mode must be 'nearest' or 'bilinear', got {sampling_mode}"
             )
 
         self.num_pairs = num_pairs
@@ -123,6 +132,17 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         self.register_buffer("offset_y2_v", self.offset_y2.view(1, 1, -1))
         self.register_buffer("offset_x2_v", self.offset_x2.view(1, 1, -1))
         self.register_buffer("thresholds_v", self.thresholds.view(1, 1, -1))
+
+        # Group pair indices by radius to avoid runtime gather on the
+        # radius-channel dimension during descriptor sampling.
+        unique_radii = torch.unique(self.radii, sorted=True).to(torch.int64)
+        self.register_buffer("unique_radii", unique_radii)
+        self.radius_group_index_names: list[str] = []
+        for group_idx, radius in enumerate(unique_radii.tolist()):
+            pair_indices = torch.nonzero(self.radii == int(radius), as_tuple=False).squeeze(1)
+            name = f"radius_group_indices_{group_idx}"
+            self.register_buffer(name, pair_indices.to(torch.int64))
+            self.radius_group_index_names.append(name)
 
         # Precompute a bank of normalized box kernels for each radius so
         # descriptor computation can run without Python-side loops.
@@ -301,21 +321,35 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         sampled1 = F.grid_sample(
             box_avg_bank,
             grid1,
-            mode="bilinear",
+            mode=self.sampling_mode,
             padding_mode="border",
             align_corners=True,
         )
         sampled2 = F.grid_sample(
             box_avg_bank,
             grid2,
-            mode="bilinear",
+            mode=self.sampling_mode,
             padding_mode="border",
             align_corners=True,
         )
 
-        radius_idx = self.radii.view(1, 1, 1, self.num_pairs).expand(B, 1, K, self.num_pairs)
-        sample1 = torch.gather(sampled1, dim=1, index=radius_idx).squeeze(1)
-        sample2 = torch.gather(sampled2, dim=1, index=radius_idx).squeeze(1)
+        # Reconstruct pair-aligned samples by selecting each radius channel
+        # once and scattering grouped pair subsets back to original order.
+        sample1 = sampled1.new_zeros(B, K, self.num_pairs)
+        sample2 = sampled2.new_zeros(B, K, self.num_pairs)
+        for group_idx, radius in enumerate(self.unique_radii.tolist()):
+            pair_indices = getattr(self, self.radius_group_index_names[group_idx]).to(device=image.device)
+            pair_indices_expanded = pair_indices.view(1, 1, -1).expand(B, K, -1)
+
+            # sampled*: [B, R+1, K, num_pairs] -> [B, K, num_pairs] at radius channel
+            sampled1_at_radius = sampled1[:, int(radius), :, :]
+            sampled2_at_radius = sampled2[:, int(radius), :, :]
+
+            selected1 = torch.index_select(sampled1_at_radius, dim=2, index=pair_indices)
+            selected2 = torch.index_select(sampled2_at_radius, dim=2, index=pair_indices)
+
+            sample1.scatter_(2, pair_indices_expanded, selected1)
+            sample2.scatter_(2, pair_indices_expanded, selected2)
         diff = sample1 - sample2
 
         centered = diff - self.thresholds_v.to(diff.dtype)
