@@ -400,10 +400,12 @@ class AKAZE(nn.Module):
                 - scores: Feature point score map of shape (N, 1, H, W).
                   Higher values indicate stronger features.
                 - orientations: Orientation map of shape (N, 1, H, W).
-                  Values in radians [-π, π].
+                  Values in radians [-π, π]. Orientation corresponds to the
+                  scale where the maximum feature response was detected.
         """
-        # Build non-linear scale space and accumulate responses
-        accumulated_scores = None
+        # Lists to store scores and orientations at each scale
+        scale_scores_list = []
+        scale_orientations_list = []
 
         current_scale = image
 
@@ -415,13 +417,39 @@ class AKAZE(nn.Module):
             # Detect features at this scale
             scale_scores = self.detector(current_scale)
 
-            # Accumulate scores across scales (max pooling)
-            if accumulated_scores is None:
-                accumulated_scores = scale_scores
-            else:
-                accumulated_scores = torch.maximum(accumulated_scores, scale_scores)
+            # Compute orientations at this scale
+            scale_orientations = self.orientation_estimator(current_scale)
 
-        # Compute orientations on the final scale
-        orientations = self.orientation_estimator(current_scale)
+            # Store for later selection
+            scale_scores_list.append(scale_scores)
+            scale_orientations_list.append(scale_orientations)
 
-        return accumulated_scores, orientations
+        # Stack all scales along a new dimension
+        # Shape: (num_scales, N, 1, H, W)
+        all_scores = torch.stack(scale_scores_list, dim=0)
+        all_orientations = torch.stack(scale_orientations_list, dim=0)
+
+        # Find the scale with maximum response at each pixel
+        # max_scores: (N, 1, H, W), scale_indices: (N, 1, H, W)
+        max_scores, scale_indices = torch.max(all_scores, dim=0)
+
+        # Select orientations from the scale with maximum response
+        # Expand scale_indices to match orientation dimensions
+        N, C, H, W = scale_indices.shape
+
+        # Reshape for gather operation
+        # all_orientations: (num_scales, N*C*H*W) -> gather -> (N*C*H*W) -> reshape
+        scale_indices_flat = scale_indices.view(-1)
+        all_orientations_transposed = all_orientations.permute(1, 2, 3, 4, 0).reshape(-1, self.num_scales)
+
+        # Gather orientations from the corresponding scales
+        selected_orientations_flat = torch.gather(
+            all_orientations_transposed,
+            dim=1,
+            index=scale_indices_flat.unsqueeze(1)
+        ).squeeze(1)
+
+        # Reshape back to (N, C, H, W)
+        selected_orientations = selected_orientations_flat.view(N, C, H, W)
+
+        return max_scores, selected_orientations

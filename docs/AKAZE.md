@@ -55,6 +55,8 @@ Orientation is computed using Gaussian-weighted intensity centroid:
 
 where m10 and m01 are the first-order moments computed via convolution.
 
+**Important:** Orientations are computed at each scale level, and the orientation from the scale with the maximum feature response is selected for each pixel. This ensures that the orientation corresponds to the scale where the feature was actually detected, following the AKAZE specification.
+
 ## Usage
 
 ### Basic Usage
@@ -157,6 +159,23 @@ AKAZE Module
     ├── Gaussian-weighted coordinate grids
     └── Convolution-based moment computation
 ```
+
+### Multi-Scale Processing
+
+The forward pass processes multiple scales sequentially:
+
+1. **For each scale**:
+   - Apply non-linear diffusion to build the scale space
+   - Compute feature scores using Hessian detector
+   - Compute orientations using intensity centroid method
+   - Store both scores and orientations
+
+2. **Scale selection**:
+   - Stack all scale scores and orientations
+   - Find the scale with maximum response at each pixel using `torch.max()`
+   - Select the corresponding orientation from that scale using `torch.gather()`
+
+This ensures that the orientation at each pixel corresponds to the scale where the feature was most strongly detected, which is crucial for accurate feature description and matching.
 
 ## References
 
