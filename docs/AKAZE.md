@@ -173,7 +173,7 @@ The forward pass processes multiple scales sequentially:
 2. **Scale selection**:
    - Stack all scale scores and orientations
    - Find the scale with maximum response at each pixel using `torch.max()`
-   - Select the corresponding orientation from that scale using `torch.gather()`
+   - Select the corresponding orientation from that scale using one-hot encoding and tensor multiplication
 
 This ensures that the orientation at each pixel corresponds to the scale where the feature was most strongly detected, which is crucial for accurate feature description and matching.
 
