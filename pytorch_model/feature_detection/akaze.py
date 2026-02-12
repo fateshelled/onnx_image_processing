@@ -443,25 +443,18 @@ class AKAZE(nn.Module):
         all_scores = torch.stack(scale_scores_list, dim=0)
         all_orientations = torch.stack(scale_orientations_list, dim=0)
 
-        # Find the scale with maximum response at each pixel
-        # scores: (N, 1, H, W), scale_indices: (N, 1, H, W)
-        scores, scale_indices = torch.max(all_scores, dim=0)
+        # Find the maximum score at each pixel across scales.
+        # amax produces only ReduceMax (no ArgMax) in ONNX, which is
+        # fully supported by TensorRT.
+        scores = all_scores.amax(dim=0)  # (N, 1, H, W)
 
-        # Select orientations from the scale with maximum response
-        # Using one-hot encoding for efficient selection (faster than gather)
+        # Select orientations from the scale with maximum response.
+        # Build a selection mask by comparing each scale to the max,
+        # avoiding ArgMax + one_hot which TensorRT cannot parse.
+        mask = (all_scores == scores.unsqueeze(0)).float()  # (num_scales, N, 1, H, W)
+        # Normalize to handle ties (e.g. multiple scales at 0)
+        mask = mask / mask.sum(dim=0, keepdim=True).clamp(min=1.0)
 
-        # Convert scale indices to one-hot encoding
-        # scale_indices: (N, C, H, W), values in [0, num_scales)
-        # one_hot: (N, C, H, W, num_scales)
-        one_hot = F.one_hot(scale_indices.long(), num_classes=self.num_scales).float()
-
-        # Permute one_hot to match all_orientations dimensions
-        # one_hot_permuted: (num_scales, N, C, H, W)
-        one_hot_permuted = one_hot.permute(4, 0, 1, 2, 3)
-
-        # Element-wise multiply and sum over scale dimension
-        # This selects the orientation from the scale with max response
-        # all_orientations * one_hot: only the selected scale has non-zero values
-        orientations = (all_orientations * one_hot_permuted).sum(dim=0)
+        orientations = (all_orientations * mask).sum(dim=0)  # (N, 1, H, W)
 
         return scores, orientations
