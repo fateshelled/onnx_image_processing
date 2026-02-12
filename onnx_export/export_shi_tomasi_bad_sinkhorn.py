@@ -48,8 +48,8 @@ def parse_args():
     parser.add_argument(
         "--max-keypoints", "-k",
         type=int,
-        default=2048,
-        help="Maximum number of keypoints per image (default: 2048)"
+        default=1024,
+        help="Maximum number of keypoints per image (default: 1024)"
     )
     parser.add_argument(
         "--block-size",
