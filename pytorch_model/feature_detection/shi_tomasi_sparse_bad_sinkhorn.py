@@ -133,16 +133,14 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         self.register_buffer("offset_x2_v", self.offset_x2.view(1, 1, -1))
         self.register_buffer("thresholds_v", self.thresholds.view(1, 1, -1))
 
-        # Group pair indices by radius to avoid runtime gather on the
-        # radius-channel dimension during descriptor sampling.
-        unique_radii = torch.unique(self.radii, sorted=True).to(torch.int64)
-        self.register_buffer("unique_radii", unique_radii)
-        self.radius_group_index_names: list[str] = []
-        for group_idx, radius in enumerate(unique_radii.tolist()):
-            pair_indices = torch.nonzero(self.radii == int(radius), as_tuple=False).squeeze(1)
-            name = f"radius_group_indices_{group_idx}"
-            self.register_buffer(name, pair_indices.to(torch.int64))
-            self.radius_group_index_names.append(name)
+        # One-hot selection matrix mapping each pair to its radius channel.
+        # Shape: (max_radius+1, num_pairs). Used as a constant mask to
+        # select the correct box-averaged channel per pair via multiply+sum,
+        # avoiding data-dependent indexing that breaks torch.export/dynamo.
+        radius_select = torch.zeros(int(torch.max(self.radii).item()) + 1, num_pairs)
+        for i in range(num_pairs):
+            radius_select[int(self.radii[i].item()), i] = 1.0
+        self.register_buffer("radius_select", radius_select)
 
         # Precompute a bank of normalized box kernels for each radius so
         # descriptor computation can run without Python-side loops.
@@ -272,8 +270,7 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             Descriptors of shape (B, K, num_pairs) at keypoint locations.
             Invalid keypoints get zero descriptors.
         """
-        B, C, H, W = image.shape
-        K = keypoints.shape[1]
+        _B, _C, H, W = image.shape
 
         # Validity mask before clamping
         valid_mask = (keypoints[:, :, 0] >= 0).float()  # (B, K)
@@ -333,23 +330,11 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             align_corners=True,
         )
 
-        # Reconstruct pair-aligned samples by selecting each radius channel
-        # once and scattering grouped pair subsets back to original order.
-        sample1 = sampled1.new_zeros(B, K, self.num_pairs)
-        sample2 = sampled2.new_zeros(B, K, self.num_pairs)
-        for group_idx, radius in enumerate(self.unique_radii.tolist()):
-            pair_indices = getattr(self, self.radius_group_index_names[group_idx]).to(device=image.device)
-            pair_indices_expanded = pair_indices.view(1, 1, -1).expand(B, K, -1)
-
-            # sampled*: [B, R+1, K, num_pairs] -> [B, K, num_pairs] at radius channel
-            sampled1_at_radius = sampled1[:, int(radius), :, :]
-            sampled2_at_radius = sampled2[:, int(radius), :, :]
-
-            selected1 = torch.index_select(sampled1_at_radius, dim=2, index=pair_indices)
-            selected2 = torch.index_select(sampled2_at_radius, dim=2, index=pair_indices)
-
-            sample1.scatter_(2, pair_indices_expanded, selected1)
-            sample2.scatter_(2, pair_indices_expanded, selected2)
+        # Select the correct radius channel for each pair via multiply+sum.
+        # radius_select: (R+1, P) one-hot mask, sampled*: (B, R+1, K, P)
+        rs = self.radius_select.to(dtype=sampled1.dtype).view(1, -1, 1, self.num_pairs)
+        sample1 = (sampled1 * rs).sum(dim=1)  # (B, K, P)
+        sample2 = (sampled2 * rs).sum(dim=1)
         diff = sample1 - sample2
 
         centered = diff - self.thresholds_v.to(diff.dtype)
