@@ -20,6 +20,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from pytorch_model.corner.shi_tomasi import ShiTomasiScore
+from pytorch_model.descriptor.bad import _get_bad_learned_params
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
 
 
@@ -41,10 +42,6 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
                     Currently only supports 3. Default is 3.
         num_pairs: Number of BAD descriptor comparison pairs (descriptor
                    dimensionality). Default is 256.
-        box_size: Box size for BAD averaging window. Must be odd. Default is 5.
-        pattern_scale: Scale factor for BAD sampling pattern spread in pixels.
-                       Default is 16.0.
-        seed: Random seed for reproducible BAD sampling pattern. Default is 42.
         binarize: If True, output binarized BAD descriptors. Default is False.
         soft_binarize: If True and binarize=True, use sigmoid for soft
                        binarization. Default is True.
@@ -61,6 +58,9 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
                         Default is 0.0 (no filtering).
         normalize_descriptors: If True, L2-normalize descriptors before matching.
                               Default is True.
+        sampling_mode: Sampling mode for descriptor grid sampling.
+                       Choose 'nearest' for faster approximate sampling or
+                       'bilinear' for smoother interpolation. Default is 'nearest'.
 
     Example:
         >>> model = ShiTomasiSparseBADSinkhornMatcher(max_keypoints=512)
@@ -78,9 +78,6 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         block_size: int = 3,
         sobel_size: int = 3,
         num_pairs: int = 256,
-        box_size: int = 5,
-        pattern_scale: float = 16.0,
-        seed: int = 42,
         binarize: bool = False,
         soft_binarize: bool = True,
         temperature: float = 10.0,
@@ -91,18 +88,25 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         nms_radius: int = 3,
         score_threshold: float = 0.0,
         normalize_descriptors: bool = True,
+        sampling_mode: str = "nearest",
     ) -> None:
         super().__init__()
-
-        if box_size <= 0 or box_size % 2 == 0:
-            raise ValueError(f"box_size must be a positive odd integer, got {box_size}")
 
         self.max_keypoints = max_keypoints
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
         self.normalize_descriptors = normalize_descriptors
+        self.sampling_mode = sampling_mode
+        if num_pairs not in (256, 512):
+            raise ValueError(
+                f"num_pairs must be 256 or 512 to use learned BAD patterns, got {num_pairs}"
+            )
+        if self.sampling_mode not in ("nearest", "bilinear"):
+            raise ValueError(
+                f"sampling_mode must be 'nearest' or 'bilinear', got {sampling_mode}"
+            )
+
         self.num_pairs = num_pairs
-        self.box_size = box_size
         self.binarize = binarize
         self.soft_binarize = soft_binarize
         self.temperature = temperature
@@ -113,15 +117,44 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             sobel_size=sobel_size,
         )
 
-        # BAD sampling pattern (same generation as BADDescriptor for consistency)
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        pair_offsets = (
-            (torch.rand(num_pairs, 2, 2, generator=generator) - 0.5)
-            * 2
-            * pattern_scale
+        # Use learned BAD pattern and learned thresholds.
+        box_params, thresholds = _get_bad_learned_params(num_pairs)
+        self.register_buffer("offset_x1", box_params[:, 0] - 16.0)
+        self.register_buffer("offset_x2", box_params[:, 1] - 16.0)
+        self.register_buffer("offset_y1", box_params[:, 2] - 16.0)
+        self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
+        self.register_buffer("radii", box_params[:, 4].to(torch.int64))
+        self.register_buffer("thresholds", thresholds)
+
+        # Pre-reshape buffers for performance and ONNX graph clarity
+        self.register_buffer("offset_y1_v", self.offset_y1.view(1, 1, -1))
+        self.register_buffer("offset_x1_v", self.offset_x1.view(1, 1, -1))
+        self.register_buffer("offset_y2_v", self.offset_y2.view(1, 1, -1))
+        self.register_buffer("offset_x2_v", self.offset_x2.view(1, 1, -1))
+        self.register_buffer("thresholds_v", self.thresholds.view(1, 1, -1))
+
+        # One-hot selection matrix mapping each pair to its radius channel.
+        # Shape: (max_radius+1, num_pairs). Used as a constant mask to
+        # select the correct box-averaged channel per pair via multiply+sum,
+        # avoiding data-dependent indexing that breaks torch.export/dynamo.
+        radius_select = torch.zeros(int(torch.max(self.radii).item()) + 1, num_pairs)
+        for i in range(num_pairs):
+            radius_select[int(self.radii[i].item()), i] = 1.0
+        self.register_buffer("radius_select", radius_select)
+
+        # Precompute a bank of normalized box kernels for each radius so
+        # descriptor computation can run without Python-side loops.
+        max_radius = int(torch.max(self.radii).item())
+        self.max_radius = max_radius
+        coords = torch.arange(-max_radius, max_radius + 1, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+        radius_values = torch.arange(max_radius + 1, dtype=torch.float32).view(-1, 1, 1)
+        square_masks = ((grid_y.abs() <= radius_values) & (grid_x.abs() <= radius_values)).to(
+            torch.float32
         )
-        self.register_buffer("pair_offsets", pair_offsets)
+        denom = ((2.0 * radius_values + 1.0) ** 2).clamp_min(1.0)
+        kernel_bank = (square_masks / denom).unsqueeze(1)
+        self.register_buffer("box_kernel_bank", kernel_bank)
 
         # Feature matcher: Sinkhorn
         self.matcher = SinkhornMatcher(
@@ -237,8 +270,7 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             Descriptors of shape (B, K, num_pairs) at keypoint locations.
             Invalid keypoints get zero descriptors.
         """
-        B, C, H, W = image.shape
-        K = keypoints.shape[1]
+        _B, _C, H, W = image.shape
 
         # Validity mask before clamping
         valid_mask = (keypoints[:, :, 0] >= 0).float()  # (B, K)
@@ -248,57 +280,72 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         x_clamped = torch.clamp(keypoints[:, :, 1], min=0.0, max=float(W - 1))
         kp_clamped = torch.stack([y_clamped, x_clamped], dim=-1)  # (B, K, 2)
 
-        # Step 1: Compute box-averaged image
-        pad = self.box_size // 2
-        img_padded = F.pad(image, (pad, pad, pad, pad), mode="replicate")
-        box_avg = F.avg_pool2d(img_padded, kernel_size=self.box_size, stride=1)
-        # box_avg: (B, 1, H, W)
+        # Build sampling grids for keypoint-pair combinations.
+        kp_expanded = kp_clamped.unsqueeze(2)  # (B, K, 1, 2)
 
-        # Step 2: Build sampling grids for all keypoint-pair combinations
-        # pair_offsets: (num_pairs, 2, 2) where [:, 0, :] = (dy1, dx1), [:, 1, :] = (dy2, dx2)
-        offsets1 = self.pair_offsets[:, 0, :]  # (num_pairs, 2)
-        offsets2 = self.pair_offsets[:, 1, :]  # (num_pairs, 2)
-
-        # Compute absolute sampling positions in pixel space
-        # kp_clamped: (B, K, 1, 2) + offsets: (1, 1, num_pairs, 2) -> (B, K, num_pairs, 2)
-        kp_expanded = kp_clamped.unsqueeze(2)
-        pos1 = kp_expanded + offsets1.unsqueeze(0).unsqueeze(0)  # (B, K, num_pairs, 2)
-        pos2 = kp_expanded + offsets2.unsqueeze(0).unsqueeze(0)
-
-        # Convert pixel coordinates to normalized [-1, 1] for grid_sample (align_corners=True)
-        # norm = pixel / (dim - 1) * 2 - 1
+        # Convert pixel coordinates to normalized [-1, 1] for grid_sample.
         norm_scale_y = 2.0 / (H - 1 + 1e-8)
         norm_scale_x = 2.0 / (W - 1 + 1e-8)
 
-        grid1_y = pos1[:, :, :, 0] * norm_scale_y - 1.0
-        grid1_x = pos1[:, :, :, 1] * norm_scale_x - 1.0
-        grid2_y = pos2[:, :, :, 0] * norm_scale_y - 1.0
-        grid2_x = pos2[:, :, :, 1] * norm_scale_x - 1.0
-
-        # grid_sample expects (x, y) order: (B, K, num_pairs, 2)
-        grid1 = torch.stack([grid1_x, grid1_y], dim=-1)
-        grid2 = torch.stack([grid2_x, grid2_y], dim=-1)
-
-        # Step 3: Sample box_avg at offset positions
-        # input: (B, 1, H, W), grid: (B, K, num_pairs, 2)
-        # output: (B, 1, K, num_pairs)
-        sample1 = F.grid_sample(
-            box_avg, grid1, mode="bilinear", padding_mode="border", align_corners=True,
+        kernels = self.box_kernel_bank.to(device=image.device, dtype=image.dtype)
+        padded = F.pad(
+            image,
+            (self.max_radius, self.max_radius, self.max_radius, self.max_radius),
+            mode="replicate",
         )
-        sample2 = F.grid_sample(
-            box_avg, grid2, mode="bilinear", padding_mode="border", align_corners=True,
+        box_avg_bank = F.conv2d(padded, kernels, stride=1)
+
+        # Use pre-reshaped buffers, casting to the correct dtype
+        offset_y1 = self.offset_y1_v.to(dtype=image.dtype)
+        offset_x1 = self.offset_x1_v.to(dtype=image.dtype)
+        offset_y2 = self.offset_y2_v.to(dtype=image.dtype)
+        offset_x2 = self.offset_x2_v.to(dtype=image.dtype)
+
+        pos1_y = kp_expanded[:, :, :, 0] + offset_y1
+        pos1_x = kp_expanded[:, :, :, 1] + offset_x1
+        pos2_y = kp_expanded[:, :, :, 0] + offset_y2
+        pos2_x = kp_expanded[:, :, :, 1] + offset_x2
+
+        grid1 = torch.stack(
+            [pos1_x * norm_scale_x - 1.0, pos1_y * norm_scale_y - 1.0],
+            dim=-1,
+        )
+        grid2 = torch.stack(
+            [pos2_x * norm_scale_x - 1.0, pos2_y * norm_scale_y - 1.0],
+            dim=-1,
         )
 
-        # Step 4: Compute difference
-        diff = (sample1 - sample2).squeeze(1)  # (B, K, num_pairs)
+        sampled1 = F.grid_sample(
+            box_avg_bank,
+            grid1,
+            mode=self.sampling_mode,
+            padding_mode="border",
+            align_corners=True,
+        )
+        sampled2 = F.grid_sample(
+            box_avg_bank,
+            grid2,
+            mode=self.sampling_mode,
+            padding_mode="border",
+            align_corners=True,
+        )
 
-        # Step 5: Optional binarization
+        # Select the correct radius channel for each pair via multiply+sum.
+        # radius_select: (R+1, P) one-hot mask, sampled*: (B, R+1, K, P)
+        rs = self.radius_select.to(dtype=sampled1.dtype).view(1, -1, 1, self.num_pairs)
+        sample1 = (sampled1 * rs).sum(dim=1)  # (B, K, P)
+        sample2 = (sampled2 * rs).sum(dim=1)
+        diff = sample1 - sample2
+
+        centered = diff - self.thresholds_v.to(diff.dtype)
+
+        # BAD bit is 1 when response <= threshold.
         if not self.binarize:
-            desc = diff
+            desc = centered
         elif self.soft_binarize:
-            desc = torch.sigmoid(diff * self.temperature)
+            desc = torch.sigmoid(-centered * self.temperature)
         else:
-            desc = (diff > 0).to(diff.dtype)
+            desc = (centered <= 0).to(centered.dtype)
 
         # Zero out invalid keypoints' descriptors
         desc = desc * valid_mask.unsqueeze(-1)
