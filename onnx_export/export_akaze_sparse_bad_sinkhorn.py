@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+ONNX export script for AKAZE + Sparse BAD + Sinkhorn image matching model.
+
+Exports the AKAZESparseBADSinkhornMatcher model which uses AKAZE for feature
+detection with orientation-aware sparse BAD descriptors and Sinkhorn matching.
+
+Usage:
+    python export_akaze_sparse_bad_sinkhorn.py --output akaze_sparse_bad_sinkhorn.onnx --height 480 --width 640
+    python export_akaze_sparse_bad_sinkhorn.py --output akaze_sparse_bad_sinkhorn.onnx --max-keypoints 256
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import torch
+
+# Add parent directory to path for importing pytorch_model
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from pytorch_model.feature_detection.akaze_sparse_bad_sinkhorn import AKAZESparseBADSinkhornMatcher
+from onnx_export.optimize import optimize_onnx_model
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Export AKAZE + Sparse BAD + Sinkhorn image matching model to ONNX format"
+    )
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default="akaze_sparse_bad_sinkhorn.onnx",
+        help="Output ONNX file path (default: akaze_sparse_bad_sinkhorn.onnx)"
+    )
+    parser.add_argument(
+        "--height", "-H",
+        type=int,
+        default=480,
+        help="Input image height (default: 480)"
+    )
+    parser.add_argument(
+        "--width", "-W",
+        type=int,
+        default=640,
+        help="Input image width (default: 640)"
+    )
+    parser.add_argument(
+        "--max-keypoints", "-k",
+        type=int,
+        default=1024,
+        help="Maximum number of keypoints per image (default: 1024)"
+    )
+    # --- AKAZE detector parameters ---
+    parser.add_argument(
+        "--num-scales",
+        type=int,
+        default=3,
+        help="Number of AKAZE scale levels (default: 3)"
+    )
+    parser.add_argument(
+        "--diffusion-iterations",
+        type=int,
+        default=3,
+        help="Number of FED iterations per scale (default: 3)"
+    )
+    parser.add_argument(
+        "--kappa",
+        type=float,
+        default=0.05,
+        help="Contrast parameter for AKAZE diffusion (default: 0.05)"
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.001,
+        help="AKAZE feature detection threshold (default: 0.001)"
+    )
+    parser.add_argument(
+        "--akaze-nms-size",
+        type=int,
+        default=5,
+        help="NMS window size inside AKAZE detector (default: 5)"
+    )
+    parser.add_argument(
+        "--orientation-patch-size",
+        type=int,
+        default=15,
+        help="Patch size for AKAZE orientation estimation (default: 15)"
+    )
+    parser.add_argument(
+        "--orientation-sigma",
+        type=float,
+        default=2.5,
+        help="Gaussian sigma for AKAZE orientation weighting (default: 2.5)"
+    )
+    # --- BAD descriptor parameters ---
+    parser.add_argument(
+        "--num-pairs", "-n",
+        type=int,
+        choices=[256, 512],
+        default=256,
+        help="Number of BAD descriptor bits (choices: 256 or 512, default: 256)"
+    )
+    parser.add_argument(
+        "--binarization",
+        type=str,
+        choices=["none", "soft", "hard"],
+        default="none",
+        help="BAD binarization mode: none (threshold-centered response), soft (sigmoid), hard (binary) (default: none)"
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=10.0,
+        help="Temperature for soft sigmoid binarization (default: 10.0)"
+    )
+    # --- Sinkhorn parameters ---
+    parser.add_argument(
+        "--sinkhorn-iterations", "-i",
+        type=int,
+        default=20,
+        help="Number of Sinkhorn iterations (default: 20)"
+    )
+    parser.add_argument(
+        "--epsilon", "-e",
+        type=float,
+        default=0.05,
+        help="Entropy regularization parameter for Sinkhorn (default: 0.05)"
+    )
+    parser.add_argument(
+        "--unused-score",
+        type=float,
+        default=1.0,
+        help="Score for dustbin entries in Sinkhorn (default: 1.0)"
+    )
+    parser.add_argument(
+        "--normalize-descriptors",
+        action="store_true",
+        default=True,
+        help="L2-normalize descriptors before matching (default: True)"
+    )
+    parser.add_argument(
+        "--no-normalize-descriptors",
+        dest="normalize_descriptors",
+        action="store_false",
+        help="Disable descriptor normalization (not recommended)"
+    )
+    parser.add_argument(
+        "--distance-type",
+        type=str,
+        choices=["l1", "l2"],
+        default="l2",
+        help="Distance metric for Sinkhorn cost matrix (default: l2)"
+    )
+    # --- Pipeline parameters ---
+    parser.add_argument(
+        "--nms-radius",
+        type=int,
+        default=3,
+        help="Radius for pipeline-level non-maximum suppression (default: 3)"
+    )
+    parser.add_argument(
+        "--score-threshold",
+        type=float,
+        default=0.0,
+        help="Minimum score threshold for keypoint selection (default: 0.0)"
+    )
+    parser.add_argument(
+        "--sampling-mode",
+        type=str,
+        choices=["nearest", "bilinear"],
+        default="nearest",
+        help="Sampling mode for sparse BAD descriptor extraction (default: nearest)"
+    )
+    # --- ONNX export options ---
+    parser.add_argument(
+        "--opset-version",
+        type=int,
+        default=18,
+        help="ONNX opset version (default: 18)"
+    )
+    parser.add_argument(
+        "--dynamic-axes",
+        action="store_true",
+        help="Enable dynamic input shape (batch, height, width)"
+    )
+    parser.add_argument(
+        "--disable_dynamo",
+        action="store_true",
+        help="Disable dynamo"
+    )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Disable ONNX model optimization (onnxsim/onnxoptimizer)"
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Create model
+    binarize = args.binarization != "none"
+    soft_binarize = args.binarization == "soft"
+    model = AKAZESparseBADSinkhornMatcher(
+        max_keypoints=args.max_keypoints,
+        num_scales=args.num_scales,
+        diffusion_iterations=args.diffusion_iterations,
+        kappa=args.kappa,
+        threshold=args.threshold,
+        akaze_nms_size=args.akaze_nms_size,
+        orientation_patch_size=args.orientation_patch_size,
+        orientation_sigma=args.orientation_sigma,
+        num_pairs=args.num_pairs,
+        binarize=binarize,
+        soft_binarize=soft_binarize,
+        temperature=args.temperature,
+        sinkhorn_iterations=args.sinkhorn_iterations,
+        epsilon=args.epsilon,
+        unused_score=args.unused_score,
+        distance_type=args.distance_type,
+        nms_radius=args.nms_radius,
+        score_threshold=args.score_threshold,
+        normalize_descriptors=args.normalize_descriptors,
+        sampling_mode=args.sampling_mode,
+    )
+    model.eval()
+
+    # Create dummy inputs (B, 1, H, W)
+    dummy_image1 = torch.randn(1, 1, args.height, args.width)
+    dummy_image2 = torch.randn(1, 1, args.height, args.width)
+
+    # Configure dynamic axes if requested
+    dynamic_axes = None
+    if args.dynamic_axes:
+        dynamic_axes = {
+            "image1": {0: "batch", 2: "height", 3: "width"},
+            "image2": {0: "batch", 2: "height", 3: "width"},
+            "keypoints1": {0: "batch"},
+            "keypoints2": {0: "batch"},
+            "matching_probs": {0: "batch"},
+        }
+
+    # Export to ONNX
+    print(f"Exporting AKAZE + Sparse BAD + Sinkhorn model to ONNX format...")
+    print(f"  This may take a moment (AKAZE has {args.num_scales} scales x {args.diffusion_iterations} iterations)...")
+    torch.onnx.export(
+        model,
+        (dummy_image1, dummy_image2),
+        args.output,
+        export_params=True,
+        opset_version=args.opset_version,
+        do_constant_folding=True,
+        input_names=["image1", "image2"],
+        output_names=["keypoints1", "keypoints2", "matching_probs"],
+        dynamic_axes=dynamic_axes,
+        dynamo=not args.disable_dynamo,
+    )
+
+    # Optimize ONNX model
+    optimization = "skipped"
+    if not args.no_optimize:
+        print("Optimizing ONNX model...")
+        optimization = optimize_onnx_model(args.output)
+
+    K = args.max_keypoints
+    print(f"\nExported ONNX model to: {args.output}")
+    print(f"  Model type: AKAZE + Sparse BAD (orientation-aware)")
+    print(f"  Input image1 shape: (B, 1, {args.height}, {args.width})")
+    print(f"  Input image2 shape: (B, 1, {args.height}, {args.width})")
+    print(f"  Output keypoints1 shape: (B, {K}, 2)")
+    print(f"  Output keypoints2 shape: (B, {K}, 2)")
+    print(f"  Output matching_probs shape: (B, {K + 1}, {K + 1})")
+    print(f"  Max keypoints: {K}")
+    print(f"  AKAZE scales: {args.num_scales}")
+    print(f"  Diffusion iterations: {args.diffusion_iterations}")
+    print(f"  Kappa: {args.kappa}")
+    print(f"  Threshold: {args.threshold}")
+    print(f"  AKAZE NMS size: {args.akaze_nms_size}")
+    print(f"  Orientation patch size: {args.orientation_patch_size}")
+    print(f"  Orientation sigma: {args.orientation_sigma}")
+    print(f"  Number of pairs: {args.num_pairs}")
+    print(f"  Binarization: {args.binarization}")
+    print(f"  Sinkhorn iterations: {args.sinkhorn_iterations}")
+    print(f"  Epsilon: {args.epsilon}")
+    print(f"  Unused score: {args.unused_score}")
+    print(f"  Distance type: {args.distance_type}")
+    print(f"  Sampling mode: {args.sampling_mode}")
+    print(f"  Normalize descriptors: {args.normalize_descriptors}")
+    print(f"  NMS radius: {args.nms_radius}")
+    print(f"  Opset version: {args.opset_version}")
+    print(f"  Dynamic axes: {args.dynamic_axes}")
+    print(f"  Optimization: {optimization}")
+
+
+if __name__ == "__main__":
+    main()

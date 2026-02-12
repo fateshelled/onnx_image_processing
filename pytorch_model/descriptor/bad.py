@@ -42,6 +42,23 @@ class BADDescriptor(nn.Module):
         # Pre-compute max_radius for padding
         self.max_radius = int(torch.max(self.radii).item())
 
+        # --- Buffers for oriented mode (conv2d + grid_sample path) ---
+        max_radius = self.max_radius
+        radius_select = torch.zeros(max_radius + 1, num_pairs)
+        for i in range(num_pairs):
+            radius_select[int(self.radii[i].item()), i] = 1.0
+        self.register_buffer("radius_select", radius_select)
+
+        coords = torch.arange(-max_radius, max_radius + 1, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+        radius_values = torch.arange(max_radius + 1, dtype=torch.float32).view(-1, 1, 1)
+        square_masks = (
+            (grid_y.abs() <= radius_values) & (grid_x.abs() <= radius_values)
+        ).to(torch.float32)
+        denom = ((2.0 * radius_values + 1.0) ** 2).clamp_min(1.0)
+        kernel_bank = (square_masks / denom).unsqueeze(1)
+        self.register_buffer("box_kernel_bank", kernel_bank)
+
     def _compute_diff_map(self, x: torch.Tensor) -> torch.Tensor:
         """Compute BAD average differences using learned box radii and offsets."""
         B, _, H, W = x.shape
@@ -92,15 +109,111 @@ class BADDescriptor(nn.Module):
 
         return sample1 - sample2
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute dense BAD descriptor map using learned thresholds."""
-        diff = self._compute_diff_map(x)
+    def _compute_diff_map_oriented(
+        self, x: torch.Tensor, orientation: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute BAD average differences with per-pixel orientation rotation.
+
+        Uses conv2d box averaging + grid_sample with rotation-aware sampling
+        grids.  Each pair's offset is rotated by the local orientation angle
+        so that the descriptor becomes rotation-invariant.
+
+        Args:
+            x: Input image of shape (B, 1, H, W).
+            orientation: Per-pixel orientation map of shape (B, 1, H, W)
+                         in radians [-pi, pi], e.g. from AKAZE.
+
+        Returns:
+            Difference map of shape (B, num_pairs, H, W).
+        """
+        B, _, H, W = x.shape
+        P = self.num_pairs
+
+        # 1. Box averaging via conv2d kernel bank
+        mr = self.max_radius
+        padded = F.pad(x, (mr, mr, mr, mr), mode="replicate")
+        box_avg_bank = F.conv2d(
+            padded, self.box_kernel_bank.to(dtype=x.dtype)
+        )  # (B, R+1, H, W)
+
+        # 2. Select per-pair channels: (B, R+1, H, W) x (R+1, P) -> (B, P, H, W)
+        rs = self.radius_select.to(dtype=x.dtype)
+        per_pair_avg = torch.einsum("brhw,rp->bphw", box_avg_bank, rs)
+
+        # 3. Rotated offsets per pixel
+        cos_t = torch.cos(orientation)  # (B, 1, H, W)
+        sin_t = torch.sin(orientation)
+
+        oy1 = self.offset_y1.to(dtype=x.dtype).view(1, -1, 1, 1)  # (1, P, 1, 1)
+        ox1 = self.offset_x1.to(dtype=x.dtype).view(1, -1, 1, 1)
+        oy2 = self.offset_y2.to(dtype=x.dtype).view(1, -1, 1, 1)
+        ox2 = self.offset_x2.to(dtype=x.dtype).view(1, -1, 1, 1)
+
+        # 2-D rotation [cos -sin; sin cos] applied to (ox, oy)
+        rot_dy1 = ox1 * sin_t + oy1 * cos_t  # (B, P, H, W)
+        rot_dx1 = ox1 * cos_t - oy1 * sin_t
+        rot_dy2 = ox2 * sin_t + oy2 * cos_t
+        rot_dx2 = ox2 * cos_t - oy2 * sin_t
+
+        # 4. Absolute positions normalised to [-1, 1] for grid_sample
+        base_y = torch.arange(H, device=x.device, dtype=x.dtype).view(1, 1, H, 1)
+        base_x = torch.arange(W, device=x.device, dtype=x.dtype).view(1, 1, 1, W)
+        norm_y = 2.0 / (H - 1 + 1e-8)
+        norm_x = 2.0 / (W - 1 + 1e-8)
+
+        gy1 = (base_y + rot_dy1) * norm_y - 1.0
+        gx1 = (base_x + rot_dx1) * norm_x - 1.0
+        gy2 = (base_y + rot_dy2) * norm_y - 1.0
+        gx2 = (base_x + rot_dx2) * norm_x - 1.0
+
+        # 5. Sample per-pair averages at rotated positions
+        input_bp = per_pair_avg.reshape(B * P, 1, H, W)
+
+        grid1 = torch.stack([gx1, gy1], dim=-1).reshape(B * P, H, W, 2)
+        s1 = F.grid_sample(
+            input_bp, grid1, mode="bilinear",
+            padding_mode="border", align_corners=True,
+        )
+
+        grid2 = torch.stack([gx2, gy2], dim=-1).reshape(B * P, H, W, 2)
+        s2 = F.grid_sample(
+            input_bp, grid2, mode="bilinear",
+            padding_mode="border", align_corners=True,
+        )
+
+        sample1 = s1.reshape(B, P, H, W)
+        sample2 = s2.reshape(B, P, H, W)
+
+        return sample1 - sample2
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        orientation: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute dense BAD descriptor map.
+
+        Args:
+            x: Input image of shape (B, 1, H, W).
+            orientation: Optional per-pixel orientation map (B, 1, H, W)
+                         in radians from AKAZE. When provided, pair offsets
+                         are rotated per-pixel for rotation-invariant
+                         descriptors. When None, uses the fast integral-image
+                         path (Shi-Tomasi compatible).
+
+        Returns:
+            Descriptor map of shape (B, num_pairs, H, W).
+        """
+        if orientation is not None:
+            diff = self._compute_diff_map_oriented(x, orientation)
+        else:
+            diff = self._compute_diff_map(x)
+
         centered = diff - self.thresholds.view(1, -1, 1, 1).to(diff.dtype)
 
         if not self.binarize:
             return centered
         if self.soft_binarize:
-            # BAD bit is 1 when response <= threshold.
             return torch.sigmoid(-centered * self.temperature)
         return (centered <= 0).to(centered.dtype)
 
