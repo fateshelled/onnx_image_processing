@@ -22,6 +22,7 @@ References:
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class SinkhornMatcher(nn.Module):
@@ -181,11 +182,9 @@ class SinkhornMatcher(nn.Module):
         dustbin_score = -self.unused_score / self.epsilon
 
         # Create augmented score matrix [B, N+1, M+1]
-        # Initialize with dustbin scores
-        log_scores = log_scores_core.new_full((B, N + 1, M + 1), dustbin_score)
-
-        # Fill in the core scores
-        log_scores[:, :N, :M] = log_scores_core
+        # Pad core scores with dustbin_score on the right column and bottom row.
+        # F.pad avoids slice assignment which produces ScatterND in ONNX.
+        log_scores = F.pad(log_scores_core, (0, 1, 0, 1), value=dustbin_score)
 
         # Step 4: Define marginal distributions (row and column sums)
         # Each original point should have total probability 1
@@ -194,12 +193,11 @@ class SinkhornMatcher(nn.Module):
 
         # Row marginals: [1, 1, ..., 1, M] (N real points + dustbin absorbs M)
         # Column marginals: [1, 1, ..., 1, N] (M real points + dustbin absorbs N)
-        log_mu = desc1.new_zeros(B, N + 1)  # [B, N+1]
-        log_nu = desc2.new_zeros(B, M + 1)  # [B, M+1]
-
-        # Dustbin marginals in log space
-        log_mu[:, N] = torch.log(torch.tensor(float(M), device=desc1.device, dtype=desc1.dtype))
-        log_nu[:, M] = torch.log(torch.tensor(float(N), device=desc2.device, dtype=desc2.dtype))
+        # torch.cat avoids index assignment which produces ScatterND in ONNX.
+        log_M = torch.log(torch.tensor(float(M), device=desc1.device, dtype=desc1.dtype))
+        log_N = torch.log(torch.tensor(float(N), device=desc2.device, dtype=desc2.dtype))
+        log_mu = torch.cat([desc1.new_zeros(B, N), log_M.reshape(1, 1).expand(B, -1)], dim=1)
+        log_nu = torch.cat([desc2.new_zeros(B, M), log_N.reshape(1, 1).expand(B, -1)], dim=1)
 
         # Step 5: Sinkhorn iterations in log-space
         log_P = self._log_sinkhorn_iterations(log_scores, log_mu, log_nu)
