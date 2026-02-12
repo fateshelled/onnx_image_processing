@@ -46,7 +46,8 @@ class NonLinearDiffusion(nn.Module):
         self.num_iterations = num_iterations
         self.kappa = kappa
 
-        # Sobel kernels for gradient computation
+        # Fused Sobel kernels: 2-output-channel conv computes both gradients
+        # in a single kernel launch.
         sobel_x = torch.tensor([
             [-1, 0, 1],
             [-2, 0, 2],
@@ -59,25 +60,27 @@ class NonLinearDiffusion(nn.Module):
             [1, 2, 1]
         ], dtype=torch.float32).view(1, 1, 3, 3) / 8.0
 
-        self.register_buffer('sobel_x', sobel_x)
-        self.register_buffer('sobel_y', sobel_y)
+        # Gradient: (1ch input) -> (2ch output) via single conv
+        self.register_buffer('sobel_xy', torch.cat([sobel_x, sobel_y], dim=0))
+        # Divergence: (2ch input) -> (2ch output) via groups=2 conv,
+        # then sum channels to get scalar divergence.
+        self.register_buffer('sobel_xy_grouped', torch.cat([sobel_x, sobel_y], dim=0))
 
         # Time step for FED scheme (using fixed value for stability)
         self.dt = 0.25
 
-    def compute_gradient(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_gradient(self, image: torch.Tensor) -> torch.Tensor:
         """
-        Compute image gradients using Sobel operator.
+        Compute image gradients using fused Sobel convolution.
 
         Args:
             image: Input image tensor of shape (N, 1, H, W).
 
         Returns:
-            Tuple of (gradient_x, gradient_y), each of shape (N, 1, H, W).
+            Gradient tensor of shape (N, 2, H, W) where channel 0 is grad_x
+            and channel 1 is grad_y.
         """
-        grad_x = F.conv2d(image, self.sobel_x, padding=1)
-        grad_y = F.conv2d(image, self.sobel_y, padding=1)
-        return grad_x, grad_y
+        return F.conv2d(image, self.sobel_xy, padding=1)  # (N, 2, H, W)
 
     def conduction_function(self, gradient_magnitude: torch.Tensor) -> torch.Tensor:
         """
@@ -107,24 +110,21 @@ class NonLinearDiffusion(nn.Module):
 
         # Fixed number of iterations (unrolled for ONNX export)
         for _ in range(self.num_iterations):
-            # Compute gradients
-            grad_x, grad_y = self.compute_gradient(result)
+            # Compute gradients: single fused conv -> (N, 2, H, W)
+            grads = self.compute_gradient(result)
 
-            # Compute gradient magnitude
-            grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+            # Compute gradient magnitude from 2-channel gradient
+            grad_mag = torch.sqrt((grads * grads).sum(dim=1, keepdim=True) + 1e-8)
 
             # Compute conduction coefficients
-            c = self.conduction_function(grad_mag)
+            c = self.conduction_function(grad_mag)  # (N, 1, H, W)
 
-            # Compute diffusion flux: div(c * ∇L)
-            # First compute c * ∇L
-            flux_x = c * grad_x
-            flux_y = c * grad_y
+            # Compute diffusion flux: c * ∇L (broadcast c over 2 grad channels)
+            flux = c * grads  # (N, 2, H, W)
 
-            # Compute divergence of flux
-            div_x = F.conv2d(flux_x, self.sobel_x, padding=1)
-            div_y = F.conv2d(flux_y, self.sobel_y, padding=1)
-            divergence = div_x + div_y
+            # Compute divergence via groups=2 conv (fused) + channel sum
+            div_xy = F.conv2d(flux, self.sobel_xy_grouped, padding=1, groups=2)
+            divergence = div_xy.sum(dim=1, keepdim=True)  # (N, 1, H, W)
 
             # Update: L_new = L_old + dt * div(c * ∇L)
             result = result + self.dt * divergence
@@ -149,31 +149,27 @@ class HessianDetector(nn.Module):
         self.threshold = threshold
         self.nms_size = nms_size
 
-        # Second derivative kernels (Scharr-like for better accuracy)
-        # Lxx kernel
+        # Fused second derivative kernels: single 3-output-channel conv
+        # computes Lxx, Lyy, Lxy in one kernel launch.
         kernel_xx = torch.tensor([
             [1, -2, 1],
             [2, -4, 2],
             [1, -2, 1]
         ], dtype=torch.float32).view(1, 1, 3, 3) / 16.0
 
-        # Lyy kernel
         kernel_yy = torch.tensor([
             [1, 2, 1],
             [-2, -4, -2],
             [1, 2, 1]
         ], dtype=torch.float32).view(1, 1, 3, 3) / 16.0
 
-        # Lxy kernel
         kernel_xy = torch.tensor([
             [1, 0, -1],
             [0, 0, 0],
             [-1, 0, 1]
         ], dtype=torch.float32).view(1, 1, 3, 3) / 4.0
 
-        self.register_buffer('kernel_xx', kernel_xx)
-        self.register_buffer('kernel_yy', kernel_yy)
-        self.register_buffer('kernel_xy', kernel_xy)
+        self.register_buffer('hessian_kernels', torch.cat([kernel_xx, kernel_yy, kernel_xy], dim=0))
 
     def compute_hessian_response(self, image: torch.Tensor) -> torch.Tensor:
         """
@@ -191,10 +187,11 @@ class HessianDetector(nn.Module):
         Returns:
             Hessian response map of shape (N, 1, H, W).
         """
-        # Compute second derivatives
-        Lxx = F.conv2d(image, self.kernel_xx, padding=1)
-        Lyy = F.conv2d(image, self.kernel_yy, padding=1)
-        Lxy = F.conv2d(image, self.kernel_xy, padding=1)
+        # Single fused conv: (N, 1, H, W) -> (N, 3, H, W) [Lxx, Lyy, Lxy]
+        hessian = F.conv2d(image, self.hessian_kernels, padding=1)
+        Lxx = hessian[:, 0:1]
+        Lyy = hessian[:, 1:2]
+        Lxy = hessian[:, 2:3]
 
         # Compute determinant: det(H) = Lxx * Lyy - Lxy^2
         response = Lxx * Lyy - Lxy * Lxy
@@ -287,14 +284,12 @@ class OrientationEstimator(nn.Module):
         # Compute Gaussian weights
         gaussian = torch.exp(-(x**2 + y**2) / (2 * sigma**2))
 
-        # Weighted coordinate grids for moment computation
-        # m10 = sum(x * I * gaussian)
-        # m01 = sum(y * I * gaussian)
+        # Fused moment kernels: single 2-output-channel conv computes
+        # both m10 and m01 in one kernel launch.
         weight_x = (x * gaussian).view(1, 1, patch_size, patch_size)
         weight_y = (y * gaussian).view(1, 1, patch_size, patch_size)
 
-        self.register_buffer('weight_x', weight_x)
-        self.register_buffer('weight_y', weight_y)
+        self.register_buffer('moment_kernels', torch.cat([weight_x, weight_y], dim=0))
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
@@ -312,12 +307,11 @@ class OrientationEstimator(nn.Module):
         """
         padding = self.patch_size // 2
 
-        # Compute weighted moments using convolution
-        m10 = F.conv2d(image, self.weight_x, padding=padding)
-        m01 = F.conv2d(image, self.weight_y, padding=padding)
+        # Single fused conv: (N, 1, H, W) -> (N, 2, H, W) [m10, m01]
+        moments = F.conv2d(image, self.moment_kernels, padding=padding)
 
         # Compute orientation: θ = atan2(m01, m10)
-        orientation = torch.atan2(m01, m10)
+        orientation = torch.atan2(moments[:, 1:2], moments[:, 0:1])
 
         return orientation
 
@@ -443,25 +437,18 @@ class AKAZE(nn.Module):
         all_scores = torch.stack(scale_scores_list, dim=0)
         all_orientations = torch.stack(scale_orientations_list, dim=0)
 
-        # Find the scale with maximum response at each pixel
-        # scores: (N, 1, H, W), scale_indices: (N, 1, H, W)
-        scores, scale_indices = torch.max(all_scores, dim=0)
+        # Find the maximum score at each pixel across scales.
+        # amax produces only ReduceMax (no ArgMax) in ONNX, which is
+        # fully supported by TensorRT.
+        scores = all_scores.amax(dim=0)  # (N, 1, H, W)
 
-        # Select orientations from the scale with maximum response
-        # Using one-hot encoding for efficient selection (faster than gather)
+        # Select orientations from the scale with maximum response.
+        # Build a selection mask by comparing each scale to the max,
+        # avoiding ArgMax + one_hot which TensorRT cannot parse.
+        mask = (all_scores == scores.unsqueeze(0)).float()  # (num_scales, N, 1, H, W)
+        # Normalize to handle ties (e.g. multiple scales at 0)
+        mask = mask / mask.sum(dim=0, keepdim=True).clamp(min=1.0)
 
-        # Convert scale indices to one-hot encoding
-        # scale_indices: (N, C, H, W), values in [0, num_scales)
-        # one_hot: (N, C, H, W, num_scales)
-        one_hot = F.one_hot(scale_indices.long(), num_classes=self.num_scales).float()
-
-        # Permute one_hot to match all_orientations dimensions
-        # one_hot_permuted: (num_scales, N, C, H, W)
-        one_hot_permuted = one_hot.permute(4, 0, 1, 2, 3)
-
-        # Element-wise multiply and sum over scale dimension
-        # This selects the orientation from the scale with max response
-        # all_orientations * one_hot: only the selected scale has non-zero values
-        orientations = (all_orientations * one_hot_permuted).sum(dim=0)
+        orientations = (all_orientations * mask).sum(dim=0)  # (N, 1, H, W)
 
         return scores, orientations
