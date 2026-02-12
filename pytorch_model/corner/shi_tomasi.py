@@ -124,27 +124,26 @@ class ShiTomasiScore(nn.Module):
         self.block_size = block_size
         self.sobel_size = sobel_size
 
-        # Sobel kernels for gradient computation (3x3)
-        # Sobel kernel for horizontal gradient (dI/dx)
+        # Fused Sobel kernels: single 2-output-channel conv computes
+        # both Ix and Iy gradients in one kernel launch.
         sobel_x = torch.tensor([
             [-1., 0., 1.],
             [-2., 0., 2.],
             [-1., 0., 1.]
         ]).unsqueeze(0).unsqueeze(0)  # Shape: 1x1x3x3
 
-        # Sobel kernel for vertical gradient (dI/dy)
         sobel_y = torch.tensor([
             [-1., -2., -1.],
             [0., 0., 0.],
             [1., 2., 1.]
         ]).unsqueeze(0).unsqueeze(0)  # Shape: 1x1x3x3
 
-        self.register_buffer('sobel_x', sobel_x)
-        self.register_buffer('sobel_y', sobel_y)
+        self.register_buffer('sobel_xy', torch.cat([sobel_x, sobel_y], dim=0))  # (2,1,3,3)
 
-        # Sum kernel for block neighborhood
+        # Fused sum kernel: groups=3 conv computes sum_Ixx, sum_Iyy, sum_Ixy
+        # in one kernel launch over the 3-channel stacked input.
         sum_kernel = torch.ones(1, 1, block_size, block_size)
-        self.register_buffer('sum_kernel', sum_kernel)
+        self.register_buffer('sum_kernel_grouped', sum_kernel.repeat(3, 1, 1, 1))  # (3,1,bs,bs)
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """
@@ -160,25 +159,23 @@ class ShiTomasiScore(nn.Module):
         """
         img = image.float()
 
-        # Compute gradients using Sobel filters with replicate padding
+        # Compute gradients using fused Sobel conv: 1ch -> 2ch (Ix, Iy)
         sobel_pad = self.sobel_size // 2
         img_padded = F.pad(img, (sobel_pad, sobel_pad, sobel_pad, sobel_pad), mode='replicate')
-        Ix = F.conv2d(img_padded, self.sobel_x)
-        Iy = F.conv2d(img_padded, self.sobel_y)
+        grads = F.conv2d(img_padded, self.sobel_xy)  # (N, 2, H, W)
+        Ix = grads[:, 0:1]
+        Iy = grads[:, 1:2]
 
-        # Compute products of gradients
-        Ixx = Ix * Ix
-        Iyy = Iy * Iy
-        Ixy = Ix * Iy
+        # Compute products of gradients and stack into 3 channels
+        products = torch.cat([Ix * Ix, Iy * Iy, Ix * Iy], dim=1)  # (N, 3, H, W)
 
-        # Sum over block neighborhood
+        # Sum over block neighborhood using fused groups=3 conv
         block_pad = self.block_size // 2
-        Ixx_padded = F.pad(Ixx, (block_pad, block_pad, block_pad, block_pad), mode='replicate')
-        Iyy_padded = F.pad(Iyy, (block_pad, block_pad, block_pad, block_pad), mode='replicate')
-        Ixy_padded = F.pad(Ixy, (block_pad, block_pad, block_pad, block_pad), mode='replicate')
-        sum_Ixx = F.conv2d(Ixx_padded, self.sum_kernel)
-        sum_Iyy = F.conv2d(Iyy_padded, self.sum_kernel)
-        sum_Ixy = F.conv2d(Ixy_padded, self.sum_kernel)
+        products_padded = F.pad(products, (block_pad, block_pad, block_pad, block_pad), mode='replicate')
+        sums = F.conv2d(products_padded, self.sum_kernel_grouped, groups=3)  # (N, 3, H, W)
+        sum_Ixx = sums[:, 0:1]
+        sum_Iyy = sums[:, 1:2]
+        sum_Ixy = sums[:, 2:3]
 
         # Compute minimum eigenvalue of structure tensor
         # For 2x2 matrix [[a, b], [b, c]], eigenvalues are:
