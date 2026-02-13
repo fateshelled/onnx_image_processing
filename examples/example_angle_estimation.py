@@ -12,6 +12,7 @@ Run this script after installing dependencies:
 import torch
 import sys
 import os
+import tempfile
 
 # Add pytorch_model to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pytorch_model'))
@@ -179,7 +180,7 @@ def example_onnx_export():
     dummy_input = torch.randn(1, 1, 256, 256)
 
     # Export to ONNX
-    output_path = "/tmp/angle_estimator_example.onnx"
+    output_path = os.path.join(tempfile.gettempdir(), "angle_estimator_example.onnx")
 
     try:
         torch.onnx.export(

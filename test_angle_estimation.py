@@ -9,6 +9,7 @@ import torch
 import numpy as np
 import sys
 import os
+import tempfile
 
 # Add the pytorch_model directory to the path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'pytorch_model'))
@@ -171,7 +172,7 @@ def test_onnx_export():
         dummy_input = torch.randn(1, 1, 256, 256)
 
         # Export to ONNX
-        onnx_path = "/tmp/angle_estimator.onnx"
+        onnx_path = os.path.join(tempfile.gettempdir(), "angle_estimator.onnx")
         torch.onnx.export(
             model,
             dummy_input,
@@ -222,9 +223,9 @@ def test_onnx_export():
 
 
 def test_multi_scale():
-    """Test multi-scale angle estimator."""
+    """Test multi-scale angle estimator (experimental feature)."""
     print("=" * 60)
-    print("Test 6: Multi-Scale Angle Estimation")
+    print("Test 6: Multi-Scale Angle Estimation (Experimental)")
     print("=" * 60)
 
     image = torch.randn(1, 1, 480, 640)
@@ -235,12 +236,28 @@ def test_multi_scale():
         sigma=2.5
     )
 
-    angles, scale_indices = estimator(image)
+    print("⚠ Warning: AngleEstimatorMultiScale is experimental and incomplete.")
+    print("  Multi-scale selection logic is not yet implemented.")
+    print("  This test only validates basic functionality (shape/range).")
+    print()
+
+    # Suppress the runtime warning for testing
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        angles, scale_indices = estimator(image)
 
     print(f"✓ Input shape: {image.shape}")
     print(f"✓ Output angles shape: {angles.shape}")
     print(f"✓ Output scale_indices shape: {scale_indices.shape}")
     print(f"  Angle range: [{angles.min():.4f}, {angles.max():.4f}]")
+    print(f"  Scale indices (expected all zeros): unique values = {torch.unique(scale_indices).tolist()}")
+
+    # Verify scale indices are all zeros (since selection is not implemented)
+    assert torch.all(scale_indices == 0), "Expected all scale indices to be 0 (not implemented)"
+    print(f"✓ Confirmed: All scale indices are 0 (selection not implemented)")
+    print()
+    print("Note: For production use, please use the single-scale AngleEstimator.")
     print()
 
 

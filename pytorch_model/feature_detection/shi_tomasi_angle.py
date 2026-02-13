@@ -97,33 +97,42 @@ class ShiTomasiWithAngle(nn.Module):
 
 class ShiTomasiAngleSparseBAD(nn.Module):
     """
-    Complete pipeline: Shi-Tomasi + Angle + Sparse BAD descriptor.
+    **EXPERIMENTAL - INCOMPLETE IMPLEMENTATION**
 
-    This module implements the feature detection and description pipeline:
+    Placeholder for future Shi-Tomasi + Angle + Sparse BAD descriptor pipeline.
+
+    This module is intended to implement the complete feature detection and
+    description pipeline:
         1. Shi-Tomasi corner detection
         2. Angle estimation for rotation invariance
         3. Sparse BAD descriptor computation with rotation compensation
 
-    This is similar to AKAZESparseBADSinkhornMatcher but uses Shi-Tomasi
-    instead of AKAZE for feature detection.
+    **Current Status:**
+    - ✓ Feature detection (Shi-Tomasi) - implemented
+    - ✓ Angle estimation - implemented
+    - ✗ Sparse BAD descriptor - NOT IMPLEMENTED
+    - ✗ Descriptor rotation compensation - NOT IMPLEMENTED
+
+    This is intended to be similar to AKAZESparseBADSinkhornMatcher but using
+    Shi-Tomasi instead of AKAZE for feature detection.
 
     Args:
         block_size: Shi-Tomasi block size (default: 5).
         patch_size: Angle estimation patch size (default: 15).
         sigma: Angle estimation sigma (default: 2.5).
-        descriptor_mode: BAD descriptor output mode ('raw', 'hard', 'soft').
-        temperature: Temperature for soft binary encoding (default: 1.0).
+        descriptor_mode: BAD descriptor output mode (not used - not implemented).
+        temperature: Temperature for soft binary encoding (not used - not implemented).
+
+    Note:
+        For production use, manually combine ShiTomasiWithAngle with BAD descriptor.
+        See akaze_sparse_bad_sinkhorn.py for reference implementation.
 
     Example:
+        >>> # Currently only supports detect_and_orient()
         >>> model = ShiTomasiAngleSparseBAD()
-        >>> img1 = torch.randn(1, 1, 480, 640)
-        >>> img2 = torch.randn(1, 1, 480, 640)
-        >>>
-        >>> # Get keypoints first (using NMS or top-k)
-        >>> scores, angles = model.detect_and_orient(img1)
-        >>> # ... select top-k keypoints ...
-        >>> # Then compute rotation-aware descriptors
-        >>> descriptors = model.describe(img1, keypoints, angles)
+        >>> img = torch.randn(1, 1, 480, 640)
+        >>> scores, angles = model.detect_and_orient(img)
+        >>> # Descriptor computation not yet available
     """
 
     def __init__(
@@ -136,16 +145,22 @@ class ShiTomasiAngleSparseBAD(nn.Module):
     ):
         super().__init__()
 
-        # Feature detection + orientation
+        # Feature detection + orientation (implemented)
         self.detector = ShiTomasiWithAngle(
             block_size=block_size,
             patch_size=patch_size,
             sigma=sigma
         )
 
-        # TODO: Import and initialize BAD descriptor
-        # This would require creating a rotation-aware sparse BAD module
-        # similar to what's done in akaze_sparse_bad_sinkhorn.py
+        # Store parameters for future descriptor implementation
+        # NOTE: BAD descriptor integration is not yet implemented.
+        # TODO: Import and initialize rotation-aware sparse BAD descriptor
+        # This would require:
+        #   1. Import BADDescriptor from descriptor/bad.py
+        #   2. Create sparse sampling logic with keypoint coordinates
+        #   3. Implement rotation compensation using angle information
+        #   4. Follow pattern from akaze_sparse_bad_sinkhorn.py
+        # For now, these parameters are stored but unused.
         self.descriptor_mode = descriptor_mode
         self.temperature = temperature
 
@@ -166,12 +181,41 @@ class ShiTomasiAngleSparseBAD(nn.Module):
 
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass returns scores and angles.
+        Forward pass returns scores and angles only.
 
-        Full descriptor computation would require keypoint selection
-        and sparse descriptor extraction.
+        **Note:** This does NOT compute descriptors. Full descriptor computation
+        is not yet implemented and would require:
+        - Keypoint selection (NMS or top-k)
+        - Sparse descriptor extraction
+        - Rotation compensation using angle information
+
+        Returns:
+            Tuple of (scores, angles) both with shape (N, 1, H, W).
         """
         return self.detect_and_orient(image)
+
+    def describe(self, image: torch.Tensor, keypoints: torch.Tensor, angles: torch.Tensor):
+        """
+        Compute rotation-aware descriptors at keypoints.
+
+        **NOT IMPLEMENTED - This method will raise NotImplementedError.**
+
+        Args:
+            image: Input image (N, 1, H, W).
+            keypoints: Keypoint coordinates (N, K, 2) as (x, y).
+            angles: Orientation angles (N, K) in radians.
+
+        Raises:
+            NotImplementedError: This method is not yet implemented.
+        """
+        raise NotImplementedError(
+            "ShiTomasiAngleSparseBAD.describe() is not yet implemented. "
+            "This class currently only provides feature detection and angle estimation. "
+            "For descriptor computation, please manually combine:\n"
+            "  1. ShiTomasiWithAngle for detection and orientation\n"
+            "  2. BADDescriptor for descriptor computation\n"
+            "  3. Rotation compensation (see akaze_sparse_bad_sinkhorn.py for reference)"
+        )
 
 
 # Example usage and integration guide

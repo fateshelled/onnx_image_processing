@@ -176,8 +176,12 @@ class AngleEstimatorMultiScale(nn.Module):
     """
     Multi-scale angle estimation using Gaussian pyramid.
 
-    This variant computes orientations at multiple scales and selects
-    the orientation from the scale with the strongest response. This can
+    **WARNING: This is an experimental feature with incomplete implementation.**
+    The multi-scale score-based selection logic is not yet implemented.
+    Currently, this class always returns orientations from scale 0.
+
+    This variant is intended to compute orientations at multiple scales and select
+    the orientation from the scale with the strongest response. This could
     provide more robust orientation estimates for features at different scales.
 
     Args:
@@ -186,12 +190,17 @@ class AngleEstimatorMultiScale(nn.Module):
         sigma: Standard deviation of the Gaussian weighting.
         pooling_factor: Downsampling factor between scales (default: 2).
 
+    Note:
+        For production use, please use the single-scale `AngleEstimator` instead.
+        This multi-scale variant is provided for experimental purposes only.
+
     Example:
+        >>> # Note: This is experimental and incomplete
         >>> estimator = AngleEstimatorMultiScale(num_scales=3, patch_size=15)
         >>> img = torch.randn(1, 1, 480, 640)
         >>> angles, scales = estimator(img)
         >>> print(angles.shape)  # [1, 1, 480, 640]
-        >>> print(scales.shape)  # [1, 1, 480, 640] - which scale was selected
+        >>> print(scales.shape)  # [1, 1, 480, 640] - always 0 (not implemented)
     """
 
     def __init__(
@@ -221,16 +230,18 @@ class AngleEstimatorMultiScale(nn.Module):
         """
         Compute multi-scale orientation with optional score-based selection.
 
+        **WARNING: Score-based selection is not implemented yet.**
+        This method currently always returns orientations from scale 0.
+
         Args:
             image: Input image of shape (N, 1, H, W).
             scores: Optional feature scores of shape (N, 1, H, W).
-                   If provided, orientations are selected from the scale
-                   with maximum score. Otherwise, uses scale 0.
+                   **Currently ignored - not implemented.**
 
         Returns:
             Tuple of:
-                - orientations: Selected orientation map (N, 1, H, W).
-                - scale_indices: Which scale was selected at each pixel (N, 1, H, W).
+                - orientations: Orientation map from scale 0 (N, 1, H, W).
+                - scale_indices: All zeros (N, 1, H, W) - selection not implemented.
         """
         orientation_list = []
         current_image = image
@@ -261,14 +272,24 @@ class AngleEstimatorMultiScale(nn.Module):
         # Stack all orientations: (num_scales, N, 1, H, W)
         all_orientations = torch.stack(orientation_list, dim=0)
 
+        # NOTE: Multi-scale selection logic is not implemented yet.
+        # Currently always returns scale 0 regardless of scores parameter.
+        # TODO: Implement proper scale selection based on feature scores:
+        #   1. Compute or accept pre-computed scores at each scale
+        #   2. Find scale with maximum score at each pixel
+        #   3. Select orientation from that scale
+        # For reference, see AKAZE implementation in akaze.py lines 435-453
+
         if scores is not None:
-            # TODO: Implement multi-scale score computation and selection
-            # For now, just return scale 0
-            selected_orientations = all_orientations[0]
-            scale_indices = torch.zeros_like(scores)
-        else:
-            # Use first scale by default
-            selected_orientations = all_orientations[0]
-            scale_indices = torch.zeros_like(all_orientations[0])
+            import warnings
+            warnings.warn(
+                "AngleEstimatorMultiScale: score-based selection not implemented. "
+                "Returning scale 0 orientations. Use AngleEstimator for production.",
+                UserWarning
+            )
+
+        # Use first scale (not implemented multi-scale selection)
+        selected_orientations = all_orientations[0]
+        scale_indices = torch.zeros_like(all_orientations[0])
 
         return selected_orientations, scale_indices

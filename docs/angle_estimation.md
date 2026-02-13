@@ -33,9 +33,26 @@ pytorch_model/
 └── orientation/
     ├── __init__.py
     └── angle_estimation.py
-        ├── AngleEstimator           # 基本的な角度推定
-        └── AngleEstimatorMultiScale # マルチスケール版（実験的）
+        ├── AngleEstimator           # 基本的な角度推定（推奨）
+        └── AngleEstimatorMultiScale # マルチスケール版（⚠️ 実験的・未完成）
 ```
+
+### ⚠️ 実験的機能について
+
+以下のクラスは実験的であり、未完成の実装を含んでいます：
+
+1. **`AngleEstimatorMultiScale`** (pytorch_model/orientation/angle_estimation.py)
+   - ⚠️ マルチスケール選択ロジックが未実装
+   - 現在は常にスケール0の結果を返します
+   - **推奨**: 本番環境では`AngleEstimator`を使用してください
+
+2. **`ShiTomasiAngleSparseBAD`** (pytorch_model/feature_detection/shi_tomasi_angle.py)
+   - ⚠️ BAD記述子の統合が未実装
+   - `describe()`メソッドは`NotImplementedError`を発生させます
+   - 現在は特徴点検出と角度推定のみ提供
+   - **推奨**: `ShiTomasiWithAngle`を使用して、手動でBAD記述子と組み合わせてください
+
+これらの実験的機能は将来のバージョンで完全に実装される予定です。
 
 ## 使用方法
 
