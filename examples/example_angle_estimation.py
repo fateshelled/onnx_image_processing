@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pytorch_model'
 
 from corner.shi_tomasi import ShiTomasiScore
 from orientation.angle_estimation import AngleEstimator
-from feature_detection.shi_tomasi_angle import ShiTomasiWithAngle
+from feature_detection.shi_tomasi_angle import ShiTomasiWithAngle, ShiTomasiAngleSparseBAD
 
 
 def example_basic_usage():
@@ -216,6 +216,83 @@ def example_onnx_export():
     print()
 
 
+def example_sparse_bad_descriptors():
+    """Example 6: Complete pipeline with Sparse BAD descriptors."""
+    print("=" * 60)
+    print("Example 6: Sparse BAD Descriptor Computation")
+    print("=" * 60)
+
+    # Create two sample images
+    image1 = torch.randn(1, 1, 480, 640)
+    image2 = torch.randn(1, 1, 480, 640)
+
+    # Create model with Sparse BAD descriptors
+    model = ShiTomasiAngleSparseBAD(
+        block_size=5,
+        patch_size=15,
+        num_pairs=256,
+        binarize=True,
+        soft_binarize=True,
+        temperature=10.0,
+        normalize_descriptors=True
+    )
+
+    print("Processing first image:")
+    # 1. Detect and orient
+    scores1, angles1 = model.detect_and_orient(image1)
+    print(f"  Scores shape: {scores1.shape}")
+    print(f"  Angles shape: {angles1.shape}")
+
+    # 2. Select keypoints
+    k = 100
+    scores1_flat = scores1.view(1, -1)
+    _, indices1 = torch.topk(scores1_flat, k, dim=1)
+    h, w = scores1.shape[2], scores1.shape[3]
+    y1 = (indices1 // w).float()
+    x1 = (indices1 % w).float()
+    keypoints1 = torch.stack([y1, x1], dim=-1)  # (1, k, 2) in (y, x)
+
+    # 3. Compute rotation-aware descriptors
+    descriptors1 = model.describe(image1, keypoints1, angles1)
+    print(f"  Keypoints shape: {keypoints1.shape}")
+    print(f"  Descriptors shape: {descriptors1.shape}")
+    print(f"  Descriptor range: [{descriptors1.min():.4f}, {descriptors1.max():.4f}]")
+
+    print("\nProcessing second image:")
+    scores2, angles2 = model.detect_and_orient(image2)
+    scores2_flat = scores2.view(1, -1)
+    _, indices2 = torch.topk(scores2_flat, k, dim=1)
+    y2 = (indices2 // w).float()
+    x2 = (indices2 % w).float()
+    keypoints2 = torch.stack([y2, x2], dim=-1)
+    descriptors2 = model.describe(image2, keypoints2, angles2)
+    print(f"  Descriptors shape: {descriptors2.shape}")
+
+    # Compute descriptor distances (for matching)
+    # L2 distance between all pairs
+    desc1_expanded = descriptors1.unsqueeze(2)  # (1, k, 1, 256)
+    desc2_expanded = descriptors2.unsqueeze(1)  # (1, 1, k, 256)
+    distances = torch.norm(desc1_expanded - desc2_expanded, dim=-1)  # (1, k, k)
+
+    print(f"\n✓ Distance matrix shape: {distances.shape}")
+    print(f"  Distance range: [{distances.min():.4f}, {distances.max():.4f}]")
+    print(f"  Mean distance: {distances.mean():.4f}")
+
+    # Find nearest neighbors
+    min_distances, nearest_neighbors = distances.min(dim=2)
+    print(f"\n✓ Nearest neighbor distances:")
+    print(f"  Mean: {min_distances.mean():.4f}")
+    print(f"  Min: {min_distances.min():.4f}")
+    print(f"  Max: {min_distances.max():.4f}")
+
+    print("\nPipeline summary:")
+    print("  1. ✓ Shi-Tomasi feature detection")
+    print("  2. ✓ Angle estimation (rotation awareness)")
+    print("  3. ✓ Sparse BAD descriptor computation")
+    print("  4. → Ready for Sinkhorn matching")
+    print()
+
+
 def main():
     """Run all examples."""
     print("\n" + "=" * 60)
@@ -232,6 +309,7 @@ def main():
         example_unified_module()
         example_feature_matching_pipeline()
         example_onnx_export()
+        example_sparse_bad_descriptors()
 
         print("=" * 60)
         print("All examples completed successfully!")

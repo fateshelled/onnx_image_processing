@@ -46,13 +46,25 @@ pytorch_model/
    - 現在は常にスケール0の結果を返します
    - **推奨**: 本番環境では`AngleEstimator`を使用してください
 
-2. **`ShiTomasiAngleSparseBAD`** (pytorch_model/feature_detection/shi_tomasi_angle.py)
-   - ⚠️ BAD記述子の統合が未実装
-   - `describe()`メソッドは`NotImplementedError`を発生させます
-   - 現在は特徴点検出と角度推定のみ提供
-   - **推奨**: `ShiTomasiWithAngle`を使用して、手動でBAD記述子と組み合わせてください
+### ✅ 完全実装済みモジュール
 
-これらの実験的機能は将来のバージョンで完全に実装される予定です。
+以下のクラスは完全に実装されており、本番環境で使用可能です：
+
+1. **`AngleEstimator`** (pytorch_model/orientation/angle_estimation.py)
+   - ✅ 単一スケールの角度推定
+   - ✅ ONNX互換
+   - ✅ 推奨：本番環境での使用
+
+2. **`ShiTomasiWithAngle`** (pytorch_model/feature_detection/shi_tomasi_angle.py)
+   - ✅ Shi-Tomasi特徴点検出 + 角度推定の統合モジュール
+   - ✅ ONNX互換
+   - ✅ AKAZEと同じ出力形式 (scores, angles)
+
+3. **`ShiTomasiAngleSparseBAD`** (pytorch_model/feature_detection/shi_tomasi_angle.py)
+   - ✅ Shi-Tomasi + 角度 + Sparse BAD記述子の完全パイプライン
+   - ✅ 回転不変な記述子計算
+   - ✅ `describe()`メソッド実装済み
+   - ✅ ONNX互換
 
 ## 使用方法
 
@@ -109,6 +121,39 @@ detector = ShiTomasiWithAngle(
 
 # 一度の呼び出しでスコアと角度を取得
 scores, angles = detector(image)
+```
+
+### Sparse BAD記述子の使用
+
+```python
+from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiAngleSparseBAD
+
+# Shi-Tomasi + 角度 + Sparse BAD記述子
+model = ShiTomasiAngleSparseBAD(
+    block_size=5,
+    patch_size=15,
+    num_pairs=256,  # 記述子の次元数（256 or 512）
+    binarize=True,  # 二値化するか
+    soft_binarize=True,  # ソフト二値化（sigmoid）
+    temperature=10.0,  # sigmoid温度パラメータ
+    normalize_descriptors=True  # L2正規化
+)
+
+# 1. 特徴点検出と角度推定
+scores, angles = model.detect_and_orient(image)
+
+# 2. キーポイント選択（例：top-100）
+k = 100
+scores_flat = scores.view(1, -1)
+_, indices = torch.topk(scores_flat, k, dim=1)
+h, w = scores.shape[2], scores.shape[3]
+y = (indices // w).float()
+x = (indices % w).float()
+keypoints = torch.stack([y, x], dim=-1)  # (1, 100, 2) in (y, x)
+
+# 3. 回転不変記述子の計算
+descriptors = model.describe(image, keypoints, angles)
+# descriptors.shape = (1, 100, 256)
 ```
 
 ## パイプライン統合

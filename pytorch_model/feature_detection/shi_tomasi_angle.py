@@ -12,9 +12,11 @@ similar to how AKAZE uses orientations with BAD descriptors.
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from ..corner.shi_tomasi import ShiTomasiScore
 from ..orientation.angle_estimation import AngleEstimator
+from ..descriptor.bad import _get_bad_learned_params
 
 
 class ShiTomasiWithAngle(nn.Module):
@@ -97,42 +99,49 @@ class ShiTomasiWithAngle(nn.Module):
 
 class ShiTomasiAngleSparseBAD(nn.Module):
     """
-    **EXPERIMENTAL - INCOMPLETE IMPLEMENTATION**
+    Shi-Tomasi + Angle + Sparse BAD descriptor computation module.
 
-    Placeholder for future Shi-Tomasi + Angle + Sparse BAD descriptor pipeline.
-
-    This module is intended to implement the complete feature detection and
-    description pipeline:
+    This module implements the complete feature detection and description pipeline:
         1. Shi-Tomasi corner detection
         2. Angle estimation for rotation invariance
         3. Sparse BAD descriptor computation with rotation compensation
 
-    **Current Status:**
-    - ✓ Feature detection (Shi-Tomasi) - implemented
-    - ✓ Angle estimation - implemented
-    - ✗ Sparse BAD descriptor - NOT IMPLEMENTED
-    - ✗ Descriptor rotation compensation - NOT IMPLEMENTED
-
-    This is intended to be similar to AKAZESparseBADSinkhornMatcher but using
-    Shi-Tomasi instead of AKAZE for feature detection.
+    Similar to AKAZESparseBADSinkhornMatcher but uses Shi-Tomasi instead of
+    AKAZE for feature detection. The angle information is used to rotate BAD
+    pair offsets at each keypoint, making the descriptor rotation-invariant.
 
     Args:
         block_size: Shi-Tomasi block size (default: 5).
         patch_size: Angle estimation patch size (default: 15).
         sigma: Angle estimation sigma (default: 2.5).
-        descriptor_mode: BAD descriptor output mode (not used - not implemented).
-        temperature: Temperature for soft binary encoding (not used - not implemented).
-
-    Note:
-        For production use, manually combine ShiTomasiWithAngle with BAD descriptor.
-        See akaze_sparse_bad_sinkhorn.py for reference implementation.
+        num_pairs: Number of BAD descriptor comparison pairs (descriptor
+                   dimensionality). Must be 256 or 512 (default: 256).
+        binarize: If True, output binarized BAD descriptors (default: False).
+        soft_binarize: If True and binarize=True, use sigmoid for soft
+                       binarization (default: True).
+        temperature: Temperature for soft sigmoid binarization (default: 10.0).
+        normalize_descriptors: If True, L2-normalize descriptors (default: True).
+        sampling_mode: Sampling mode for descriptor grid sampling, 'nearest' or
+                       'bilinear' (default: 'nearest').
 
     Example:
-        >>> # Currently only supports detect_and_orient()
-        >>> model = ShiTomasiAngleSparseBAD()
+        >>> model = ShiTomasiAngleSparseBAD(num_pairs=256)
         >>> img = torch.randn(1, 1, 480, 640)
+        >>>
+        >>> # Detect features and compute orientations
         >>> scores, angles = model.detect_and_orient(img)
-        >>> # Descriptor computation not yet available
+        >>>
+        >>> # Select keypoints (example: top-100)
+        >>> scores_flat = scores.view(1, -1)
+        >>> _, indices = torch.topk(scores_flat, k=100, dim=1)
+        >>> h, w = scores.shape[2], scores.shape[3]
+        >>> y = (indices // w).float()
+        >>> x = (indices % w).float()
+        >>> keypoints = torch.stack([y, x], dim=-1)  # (1, 100, 2) in (y, x)
+        >>>
+        >>> # Compute rotation-aware descriptors
+        >>> descriptors = model.describe(img, keypoints, angles)
+        >>> print(descriptors.shape)  # (1, 100, 256)
     """
 
     def __init__(
@@ -140,29 +149,72 @@ class ShiTomasiAngleSparseBAD(nn.Module):
         block_size: int = 5,
         patch_size: int = 15,
         sigma: float = 2.5,
-        descriptor_mode: str = 'soft',
-        temperature: float = 1.0
+        num_pairs: int = 256,
+        binarize: bool = False,
+        soft_binarize: bool = True,
+        temperature: float = 10.0,
+        normalize_descriptors: bool = True,
+        sampling_mode: str = "nearest",
     ):
         super().__init__()
 
-        # Feature detection + orientation (implemented)
+        if num_pairs not in (256, 512):
+            raise ValueError(
+                f"num_pairs must be 256 or 512 to use learned BAD patterns, got {num_pairs}"
+            )
+        if sampling_mode not in ("nearest", "bilinear"):
+            raise ValueError(
+                f"sampling_mode must be 'nearest' or 'bilinear', got {sampling_mode}"
+            )
+
+        self.num_pairs = num_pairs
+        self.binarize = binarize
+        self.soft_binarize = soft_binarize
+        self.temperature = temperature
+        self.normalize_descriptors = normalize_descriptors
+        self.sampling_mode = sampling_mode
+
+        # Feature detection + orientation
         self.detector = ShiTomasiWithAngle(
             block_size=block_size,
             patch_size=patch_size,
             sigma=sigma
         )
 
-        # Store parameters for future descriptor implementation
-        # NOTE: BAD descriptor integration is not yet implemented.
-        # TODO: Import and initialize rotation-aware sparse BAD descriptor
-        # This would require:
-        #   1. Import BADDescriptor from descriptor/bad.py
-        #   2. Create sparse sampling logic with keypoint coordinates
-        #   3. Implement rotation compensation using angle information
-        #   4. Follow pattern from akaze_sparse_bad_sinkhorn.py
-        # For now, these parameters are stored but unused.
-        self.descriptor_mode = descriptor_mode
-        self.temperature = temperature
+        # BAD descriptor buffers (learned patterns)
+        box_params, thresholds = _get_bad_learned_params(num_pairs)
+        self.register_buffer("offset_x1", box_params[:, 0] - 16.0)
+        self.register_buffer("offset_x2", box_params[:, 1] - 16.0)
+        self.register_buffer("offset_y1", box_params[:, 2] - 16.0)
+        self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
+        self.register_buffer("radii", box_params[:, 4].to(torch.int64))
+        self.register_buffer("thresholds", thresholds)
+
+        # Pre-reshape buffers for performance and ONNX graph clarity
+        self.register_buffer("offset_y1_v", self.offset_y1.view(1, 1, -1))
+        self.register_buffer("offset_x1_v", self.offset_x1.view(1, 1, -1))
+        self.register_buffer("offset_y2_v", self.offset_y2.view(1, 1, -1))
+        self.register_buffer("offset_x2_v", self.offset_x2.view(1, 1, -1))
+        self.register_buffer("thresholds_v", self.thresholds.view(1, 1, -1))
+
+        # One-hot selection matrix mapping each pair to its radius channel
+        radius_select = torch.zeros(int(torch.max(self.radii).item()) + 1, num_pairs)
+        for i in range(num_pairs):
+            radius_select[int(self.radii[i].item()), i] = 1.0
+        self.register_buffer("radius_select", radius_select)
+
+        # Bank of normalized box kernels for each radius
+        max_radius = int(torch.max(self.radii).item())
+        self.max_radius = max_radius
+        coords = torch.arange(-max_radius, max_radius + 1, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+        radius_values = torch.arange(max_radius + 1, dtype=torch.float32).view(-1, 1, 1)
+        square_masks = (
+            (grid_y.abs() <= radius_values) & (grid_x.abs() <= radius_values)
+        ).to(torch.float32)
+        denom = ((2.0 * radius_values + 1.0) ** 2).clamp_min(1.0)
+        kernel_bank = (square_masks / denom).unsqueeze(1)
+        self.register_buffer("box_kernel_bank", kernel_bank)
 
     def detect_and_orient(
         self,
@@ -179,43 +231,140 @@ class ShiTomasiAngleSparseBAD(nn.Module):
         """
         return self.detector(image)
 
+    def describe(
+        self,
+        image: torch.Tensor,
+        keypoints: torch.Tensor,
+        orientation: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute rotation-aware BAD descriptors at keypoint locations.
+
+        Each pair's sampling offsets are rotated by the local orientation
+        at the keypoint, making the descriptor rotation-invariant.
+
+        Args:
+            image: Input grayscale image of shape (B, 1, H, W).
+            keypoints: Keypoint coordinates of shape (B, K, 2) in (y, x) format.
+                       Invalid keypoints at (-1, -1) are handled by clamping.
+            orientation: Orientation map of shape (B, 1, H, W) in radians.
+
+        Returns:
+            Descriptors of shape (B, K, num_pairs) at keypoint locations.
+            Invalid keypoints get zero descriptors.
+        """
+        _B, _C, H, W = image.shape
+
+        # Validity mask before clamping
+        valid_mask = (keypoints[:, :, 0] >= 0).float()  # (B, K)
+
+        # Clamp invalid keypoints to valid range for sampling
+        y_clamped = torch.clamp(keypoints[:, :, 0], min=0.0, max=float(H - 1))
+        x_clamped = torch.clamp(keypoints[:, :, 1], min=0.0, max=float(W - 1))
+        kp_clamped = torch.stack([y_clamped, x_clamped], dim=-1)  # (B, K, 2)
+
+        # Normalization scales for pixel -> [-1, 1] conversion
+        norm_scale_y = 2.0 / (H - 1 + 1e-8)
+        norm_scale_x = 2.0 / (W - 1 + 1e-8)
+
+        # --- Sample orientation at keypoint locations ---
+        ky_norm = y_clamped * norm_scale_y - 1.0  # (B, K)
+        kx_norm = x_clamped * norm_scale_x - 1.0
+        orient_grid = torch.stack([kx_norm, ky_norm], dim=-1).unsqueeze(2)  # (B, K, 1, 2)
+        theta = F.grid_sample(
+            orientation, orient_grid, mode="nearest",
+            padding_mode="border", align_corners=True,
+        ).squeeze(1).squeeze(-1)  # (B, K)
+
+        cos_t = torch.cos(theta).unsqueeze(-1)  # (B, K, 1)
+        sin_t = torch.sin(theta).unsqueeze(-1)
+
+        # --- Rotate pair offsets per keypoint ---
+        oy1 = self.offset_y1_v.to(dtype=image.dtype)  # (1, 1, P)
+        ox1 = self.offset_x1_v.to(dtype=image.dtype)
+        oy2 = self.offset_y2_v.to(dtype=image.dtype)
+        ox2 = self.offset_x2_v.to(dtype=image.dtype)
+
+        # 2-D rotation [cos -sin; sin cos] applied to (ox, oy) offsets
+        rot_dy1 = ox1 * sin_t + oy1 * cos_t  # (B, K, P)
+        rot_dx1 = ox1 * cos_t - oy1 * sin_t
+        rot_dy2 = ox2 * sin_t + oy2 * cos_t
+        rot_dx2 = ox2 * cos_t - oy2 * sin_t
+
+        # --- Absolute sample positions ---
+        kp_y = kp_clamped[:, :, 0:1]  # (B, K, 1)
+        kp_x = kp_clamped[:, :, 1:2]
+
+        pos1_y = kp_y + rot_dy1  # (B, K, P)
+        pos1_x = kp_x + rot_dx1
+        pos2_y = kp_y + rot_dy2
+        pos2_x = kp_x + rot_dx2
+
+        # --- Build normalized grids for grid_sample ---
+        grid1 = torch.stack(
+            [pos1_x * norm_scale_x - 1.0, pos1_y * norm_scale_y - 1.0],
+            dim=-1,
+        )  # (B, K, P, 2)
+        grid2 = torch.stack(
+            [pos2_x * norm_scale_x - 1.0, pos2_y * norm_scale_y - 1.0],
+            dim=-1,
+        )
+
+        # --- Box averaging + sampling ---
+        kernels = self.box_kernel_bank.to(device=image.device, dtype=image.dtype)
+        padded = F.pad(
+            image,
+            (self.max_radius, self.max_radius, self.max_radius, self.max_radius),
+            mode="replicate",
+        )
+        box_avg_bank = F.conv2d(padded, kernels, stride=1)  # (B, R+1, H, W)
+
+        sampled1 = F.grid_sample(
+            box_avg_bank, grid1, mode=self.sampling_mode,
+            padding_mode="border", align_corners=True,
+        )  # (B, R+1, K, P)
+        sampled2 = F.grid_sample(
+            box_avg_bank, grid2, mode=self.sampling_mode,
+            padding_mode="border", align_corners=True,
+        )
+
+        # --- Select correct radius channel per pair via multiply+sum ---
+        rs = self.radius_select.to(dtype=sampled1.dtype).view(1, -1, 1, self.num_pairs)
+        sample1 = (sampled1 * rs).sum(dim=1)  # (B, K, P)
+        sample2 = (sampled2 * rs).sum(dim=1)
+        diff = sample1 - sample2
+
+        centered = diff - self.thresholds_v.to(diff.dtype)
+
+        if not self.binarize:
+            desc = centered
+        elif self.soft_binarize:
+            desc = torch.sigmoid(-centered * self.temperature)
+        else:
+            desc = (centered <= 0).to(centered.dtype)
+
+        # Zero out invalid keypoints' descriptors
+        desc = desc * valid_mask.unsqueeze(-1)
+
+        # Normalize descriptors if enabled
+        if self.normalize_descriptors:
+            desc = F.normalize(desc, p=2, dim=-1)
+
+        return desc
+
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass returns scores and angles only.
+        Forward pass returns scores and angles.
 
-        **Note:** This does NOT compute descriptors. Full descriptor computation
-        is not yet implemented and would require:
-        - Keypoint selection (NMS or top-k)
-        - Sparse descriptor extraction
-        - Rotation compensation using angle information
+        For full pipeline including descriptor computation, use:
+        1. detect_and_orient() to get scores and angles
+        2. Select keypoints from scores
+        3. describe() to compute rotation-aware descriptors
 
         Returns:
             Tuple of (scores, angles) both with shape (N, 1, H, W).
         """
         return self.detect_and_orient(image)
-
-    def describe(self, image: torch.Tensor, keypoints: torch.Tensor, angles: torch.Tensor):
-        """
-        Compute rotation-aware descriptors at keypoints.
-
-        **NOT IMPLEMENTED - This method will raise NotImplementedError.**
-
-        Args:
-            image: Input image (N, 1, H, W).
-            keypoints: Keypoint coordinates (N, K, 2) as (x, y).
-            angles: Orientation angles (N, K) in radians.
-
-        Raises:
-            NotImplementedError: This method is not yet implemented.
-        """
-        raise NotImplementedError(
-            "ShiTomasiAngleSparseBAD.describe() is not yet implemented. "
-            "This class currently only provides feature detection and angle estimation. "
-            "For descriptor computation, please manually combine:\n"
-            "  1. ShiTomasiWithAngle for detection and orientation\n"
-            "  2. BADDescriptor for descriptor computation\n"
-            "  3. Rotation compensation (see akaze_sparse_bad_sinkhorn.py for reference)"
-        )
 
 
 # Example usage and integration guide
