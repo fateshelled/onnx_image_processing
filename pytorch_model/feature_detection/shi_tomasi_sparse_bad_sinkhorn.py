@@ -182,13 +182,18 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         B, H, W = scores.shape
         K = self.max_keypoints
 
-        # Create border mask to exclude keypoints near image boundaries
-        border_mask = torch.ones_like(scores)
+        # Create border mask to exclude keypoints near image boundaries.
+        # Use comparison + broadcasting instead of slice assignment to avoid
+        # ScatterND in ONNX (which causes warnings on CUDA with duplicate indices).
         if self.border_margin > 0:
-            border_mask[:, :self.border_margin, :] = 0  # top
-            border_mask[:, -self.border_margin:, :] = 0  # bottom
-            border_mask[:, :, :self.border_margin] = 0  # left
-            border_mask[:, :, -self.border_margin:] = 0  # right
+            m = self.border_margin
+            y_idx = torch.arange(H, device=scores.device)
+            x_idx = torch.arange(W, device=scores.device)
+            y_valid = ((y_idx >= m) & (y_idx < H - m)).float()
+            x_valid = ((x_idx >= m) & (x_idx < W - m)).float()
+            border_mask = y_valid.view(1, H, 1) * x_valid.view(1, 1, W)
+        else:
+            border_mask = torch.ones_like(scores)
 
         # Apply NMS mask, border mask, and score threshold
         scores_masked = scores * nms_mask * border_mask
