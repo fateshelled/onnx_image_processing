@@ -257,3 +257,178 @@ class SinkhornMatcherWithScores(SinkhornMatcher):
         scores1 = P[:, :N, :M].max(dim=-2).values  # [B, M]
 
         return P, scores0, scores1
+
+
+class SinkhornMatcherWithFilters(SinkhornMatcher):
+    """
+    Sinkhorn matcher with integrated outlier filtering.
+
+    Extends the base SinkhornMatcher with two optional outlier removal filters:
+    1. Probability ratio filter: Rejects ambiguous matches where the best match
+       probability is not significantly higher than the second-best alternative.
+    2. Dustbin margin filter: Rejects matches where the dustbin (unmatched)
+       probability is too high relative to the best match probability.
+
+    These filters are applied directly in the forward pass and can be exported to ONNX.
+
+    Args:
+        iterations: Number of Sinkhorn iterations. Default: 20.
+        epsilon: Entropy regularization parameter. Default: 1.0.
+        unused_score: Score assigned to dustbin entries. Default: 1.0.
+        distance_type: Distance metric ('l1' or 'l2'). Default: 'l2'.
+        ratio_threshold: Minimum ratio between best and second-best probabilities.
+                        If None or <= 0, ratio filtering is disabled. Default: None.
+        dustbin_margin: Minimum margin between best match and dustbin probabilities.
+                       If None or < 0, dustbin filtering is disabled. Default: None.
+
+    Returns:
+        Tuple of:
+        - P: Matching probability matrix [B, N+1, M+1]
+        - valid_mask: Boolean mask [B, N] indicating which matches pass filters
+                     (True = valid match, False = filtered outlier)
+
+    Example:
+        >>> matcher = SinkhornMatcherWithFilters(
+        ...     iterations=20,
+        ...     epsilon=1.0,
+        ...     ratio_threshold=2.0,
+        ...     dustbin_margin=0.3
+        ... )
+        >>> desc1 = torch.randn(1, 100, 256)
+        >>> desc2 = torch.randn(1, 80, 256)
+        >>> P, valid_mask = matcher(desc1, desc2)
+        >>> # valid_mask[0] is shape [100], indicating which of 100 points passed filters
+    """
+
+    def __init__(
+        self,
+        iterations: int = 20,
+        epsilon: float = 1.0,
+        unused_score: float = 1.0,
+        distance_type: str = "l2",
+        ratio_threshold: float = None,
+        dustbin_margin: float = None,
+    ) -> None:
+        super().__init__(iterations, epsilon, unused_score, distance_type)
+
+        self.ratio_threshold = ratio_threshold if ratio_threshold is not None else -1.0
+        self.dustbin_margin = dustbin_margin if dustbin_margin is not None else -1.0
+
+    def _probability_ratio_filter(
+        self,
+        P_core: torch.Tensor,
+        threshold: float,
+    ) -> torch.Tensor:
+        """
+        Filter matches based on probability ratio between best and second-best.
+
+        Args:
+            P_core: Core probability matrix [B, N, M] excluding dustbin
+            threshold: Minimum ratio value (e.g., 2.0)
+
+        Returns:
+            valid_mask: Boolean tensor [B, N] where True means the match passes
+        """
+        B, N, M = P_core.shape
+
+        # Get top-2 probabilities along the M dimension for each point in N
+        # topk returns (values, indices), we only need values
+        # Shape: [B, N, 2] where [:, :, 0] is best, [:, :, 1] is second-best
+        if M >= 2:
+            top2_probs = torch.topk(P_core, k=2, dim=2, largest=True, sorted=True).values
+            best_prob = top2_probs[:, :, 0]      # [B, N]
+            second_prob = top2_probs[:, :, 1]    # [B, N]
+        else:
+            # Edge case: only 1 point in set 2
+            best_prob = P_core[:, :, 0]          # [B, N]
+            second_prob = torch.zeros_like(best_prob)
+
+        # Calculate ratio with epsilon to avoid division by zero
+        ratio = best_prob / (second_prob + 1e-8)
+
+        # Accept points where ratio >= threshold
+        # For ONNX compatibility, we use >= comparison (returns boolean tensor)
+        valid_mask = ratio >= threshold
+
+        return valid_mask
+
+    def _dustbin_margin_filter(
+        self,
+        P: torch.Tensor,
+        margin: float,
+    ) -> torch.Tensor:
+        """
+        Filter matches based on margin between best match and dustbin probabilities.
+
+        Args:
+            P: Full probability matrix [B, N+1, M+1] including dustbin
+            margin: Minimum margin value (e.g., 0.3)
+
+        Returns:
+            valid_mask: Boolean tensor [B, N] where True means the match passes
+        """
+        B = P.shape[0]
+        N = P.shape[1] - 1  # Exclude dustbin row
+        M = P.shape[2] - 1  # Exclude dustbin column
+
+        # Extract core matches (excluding dustbin)
+        P_core = P[:, :N, :M]  # [B, N, M]
+
+        # Extract dustbin probabilities for each point in set 1
+        dustbin_probs = P[:, :N, M]  # [B, N] - last column (dustbin column)
+
+        # Get best match probability for each point (excluding dustbin)
+        best_match_probs = P_core.max(dim=2).values  # [B, N]
+
+        # Calculate margin: best_match - dustbin
+        margins = best_match_probs - dustbin_probs  # [B, N]
+
+        # Accept points where margin >= threshold
+        valid_mask = margins >= margin
+
+        return valid_mask
+
+    def forward(
+        self,
+        desc1: torch.Tensor,
+        desc2: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute matching probability matrix with outlier filtering.
+
+        Args:
+            desc1: First descriptor set [B, N, D]
+            desc2: Second descriptor set [B, M, D]
+
+        Returns:
+            Tuple of:
+            - P: Matching probability matrix [B, N+1, M+1]
+            - valid_mask: Boolean mask [B, N] indicating valid matches
+        """
+        # Get base matching probability matrix
+        P = super().forward(desc1, desc2)
+
+        B = P.shape[0]
+        N = desc1.shape[1]
+        M = desc2.shape[1]
+
+        # Initialize valid mask as all True
+        # Use torch.ones with dtype=torch.bool for ONNX compatibility
+        valid_mask = torch.ones(B, N, dtype=torch.bool, device=desc1.device)
+
+        # Extract core probability matrix (excluding dustbin)
+        P_core = P[:, :N, :M]  # [B, N, M]
+
+        # Apply probability ratio filter if enabled
+        # Check if ratio_threshold > 0 (disabled if <= 0)
+        if self.ratio_threshold > 0:
+            ratio_mask = self._probability_ratio_filter(P_core, self.ratio_threshold)
+            valid_mask = valid_mask & ratio_mask
+
+        # Apply dustbin margin filter if enabled
+        # Check if dustbin_margin >= 0 (disabled if < 0)
+        if self.dustbin_margin >= 0:
+            dustbin_mask = self._dustbin_margin_filter(P, self.dustbin_margin)
+            valid_mask = valid_mask & dustbin_mask
+
+        return P, valid_mask
