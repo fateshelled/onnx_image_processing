@@ -16,10 +16,18 @@ Usage:
 """
 
 import argparse
+import sys
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
 from PIL import Image, ImageDraw
+
+# Add project root to path for imports
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from pytorch_model.matching.outlier_filters import probability_ratio_filter
 
 
 def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Image.Image]:
@@ -49,6 +57,7 @@ def extract_matches(
     keypoints2: np.ndarray,
     threshold: float = 0.1,
     max_matches: int = 100,
+    ratio_threshold: float = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract mutual nearest-neighbor matches from the Sinkhorn probability matrix.
@@ -59,12 +68,17 @@ def extract_matches(
     - i is the argmax of P[:N, j] (best match for j)
     and the match probability exceeds the threshold.
 
+    Optionally, a probability ratio filter can be applied to reject ambiguous matches
+    where the best match probability is not significantly higher than the second-best.
+
     Args:
         matching_probs: Sinkhorn probability matrix of shape (1, K+1, K+1).
         keypoints1: Keypoints in image1 of shape (1, K, 2) as (y, x).
         keypoints2: Keypoints in image2 of shape (1, K, 2) as (y, x).
         threshold: Minimum match probability. Default is 0.1.
         max_matches: Maximum number of matches to return. Default is 100.
+        ratio_threshold: Minimum ratio between best and second-best match probabilities.
+                        If None, ratio filtering is disabled. Default is None.
 
     Returns:
         Tuple of:
@@ -91,6 +105,11 @@ def extract_matches(
         j = max_j_for_i[i]
         if max_i_for_j[j] == i:
             mutual_mask[i] = True
+
+    # Apply probability ratio filter if enabled
+    if ratio_threshold is not None:
+        ratio_mask = probability_ratio_filter(P_core, ratio_threshold)
+        mutual_mask = mutual_mask & ratio_mask
 
     # Get match probabilities
     match_indices_i = np.where(mutual_mask)[0]
@@ -250,6 +269,15 @@ def parse_args():
         help="Match probability threshold (default: 0.1)"
     )
     parser.add_argument(
+        "--ratio-threshold",
+        type=float,
+        default=None,
+        help="Probability ratio threshold for outlier filtering. "
+             "Minimum ratio between best and second-best match probabilities. "
+             "Higher values are more strict (e.g., 2.0 means best must be 2x better). "
+             "If not specified, ratio filtering is disabled."
+    )
+    parser.add_argument(
         "--max-matches",
         type=int,
         default=100,
@@ -326,8 +354,13 @@ def main():
         keypoints2,
         threshold=args.threshold,
         max_matches=args.max_matches,
+        ratio_threshold=args.ratio_threshold,
     )
-    print(f"Matches found: {len(scores)} (threshold={args.threshold})")
+
+    filter_info = f"threshold={args.threshold}"
+    if args.ratio_threshold is not None:
+        filter_info += f", ratio_threshold={args.ratio_threshold}"
+    print(f"Matches found: {len(scores)} ({filter_info})")
 
     if len(scores) == 0:
         print("No matches found. Try lowering --threshold.")
