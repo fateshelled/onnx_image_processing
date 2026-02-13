@@ -14,7 +14,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..corner.shi_tomasi import ShiTomasiScore
+from ..detector.shi_tomasi import ShiTomasiScore
 from ..orientation.angle_estimation import AngleEstimator
 from ..descriptor.bad import SparseBAD
 from ..utils import apply_nms_maxpool, select_topk_keypoints

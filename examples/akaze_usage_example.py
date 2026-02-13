@@ -6,7 +6,7 @@ and how to export it to ONNX format.
 """
 
 import torch
-from pytorch_model.feature_detection.akaze import AKAZE
+from pytorch_model.detector.akaze import AKAZE
 
 
 def main():

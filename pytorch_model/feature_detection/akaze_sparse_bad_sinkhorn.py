@@ -19,7 +19,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from pytorch_model.feature_detection.akaze import AKAZE
+from pytorch_model.detector.akaze import AKAZE
 from pytorch_model.descriptor.bad import SparseBAD
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
 

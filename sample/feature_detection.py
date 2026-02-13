@@ -23,7 +23,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image, ImageDraw
 
-from pytorch_model.corner.shi_tomasi import refine_keypoints_subpixel
+from pytorch_model.detector.shi_tomasi import refine_keypoints_subpixel
 
 
 def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Image.Image]:
