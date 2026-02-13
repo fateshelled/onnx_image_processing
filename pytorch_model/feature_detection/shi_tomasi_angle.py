@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from ..corner.shi_tomasi import ShiTomasiScore
 from ..orientation.angle_estimation import AngleEstimator
 from ..descriptor.bad import SparseBAD
+from ..utils import apply_nms_maxpool, select_topk_keypoints
 
 
 class ShiTomasiWithAngle(nn.Module):
@@ -240,6 +241,119 @@ class ShiTomasiAngleSparseBAD(nn.Module):
         descriptors = self.describe(image, keypoints, angles)
 
         return scores, angles, descriptors
+
+
+class ShiTomasiAngleSparseBADDetector(nn.Module):
+    """
+    Complete detector with NMS and top-k selection for ONNX export.
+
+    This module provides a single forward pass that:
+    1. Detects features and computes orientations
+    2. Applies NMS and selects top-k keypoints
+    3. Computes rotation-aware descriptors at selected keypoints
+
+    Designed for single-image ONNX export with end-to-end detection and
+    description. For two-image matching with Sinkhorn, see
+    ShiTomasiAngleSparseBADSinkhornMatcher.
+
+    Args:
+        max_keypoints: Maximum number of keypoints to detect per image.
+                       Output will be padded to this size.
+        block_size: Block size for Shi-Tomasi corner detection (must be odd).
+                   Default is 5.
+        patch_size: Patch size for angle estimation (must be odd). Default is 15.
+        sigma: Gaussian sigma for angle estimation. Default is 2.5.
+        num_pairs: Number of BAD descriptor comparison pairs (descriptor
+                   dimensionality). Must be 256 or 512. Default is 256.
+        binarize: If True, output binarized BAD descriptors. Default is False.
+        soft_binarize: If True and binarize=True, use sigmoid for soft
+                       binarization. Default is True.
+        temperature: Temperature for soft sigmoid binarization. Default is 10.0.
+        normalize_descriptors: If True, L2-normalize descriptors before
+                              matching. Default is True.
+        sampling_mode: Sampling mode for descriptor grid sampling.
+                       Choose 'nearest' or 'bilinear'. Default is 'nearest'.
+        nms_radius: Radius for non-maximum suppression. Default is 3.
+        score_threshold: Minimum score threshold for keypoint selection.
+                        Default is 0.0.
+
+    Example:
+        >>> detector = ShiTomasiAngleSparseBADDetector(max_keypoints=512)
+        >>> img = torch.randn(1, 1, 480, 640)
+        >>> kpts, scores, desc = detector(img)
+        >>> print(kpts.shape)   # [1, 512, 2]
+        >>> print(scores.shape) # [1, 512]
+        >>> print(desc.shape)   # [1, 512, 256]
+    """
+
+    def __init__(
+        self,
+        max_keypoints: int,
+        block_size: int = 5,
+        patch_size: int = 15,
+        sigma: float = 2.5,
+        num_pairs: int = 256,
+        binarize: bool = False,
+        soft_binarize: bool = True,
+        temperature: float = 10.0,
+        normalize_descriptors: bool = True,
+        sampling_mode: str = "nearest",
+        nms_radius: int = 3,
+        score_threshold: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        self.max_keypoints = max_keypoints
+        self.nms_radius = nms_radius
+        self.score_threshold = score_threshold
+
+        # Feature detection + orientation + description
+        self.model = ShiTomasiAngleSparseBAD(
+            block_size=block_size,
+            patch_size=patch_size,
+            sigma=sigma,
+            num_pairs=num_pairs,
+            binarize=binarize,
+            soft_binarize=soft_binarize,
+            temperature=temperature,
+            normalize_descriptors=normalize_descriptors,
+            sampling_mode=sampling_mode,
+        )
+
+    def forward(
+        self,
+        image: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Detect keypoints and compute descriptors for a single image.
+
+        Args:
+            image: Input grayscale image of shape (B, 1, H, W).
+
+        Returns:
+            Tuple of:
+                - keypoints: Detected keypoints of shape (B, K, 2) in (y, x)
+                  format. Invalid keypoints are (-1, -1).
+                - scores: Keypoint scores of shape (B, K).
+                - descriptors: Rotation-aware BAD descriptors of shape
+                  (B, K, num_pairs) at keypoint locations.
+        """
+        # 1. Detect features and compute orientations
+        score_map, angles = self.model.detect_and_orient(image)
+        score_map = score_map.squeeze(1)  # (B, H, W)
+
+        # 2. Apply NMS
+        nms_mask = apply_nms_maxpool(score_map, self.nms_radius)
+
+        # 3. Select top-k keypoints
+        keypoints, scores = select_topk_keypoints(
+            score_map, nms_mask, self.max_keypoints, self.score_threshold
+        )
+
+        # 4. Compute rotation-aware descriptors
+        descriptors = self.model.describe(image, keypoints, angles)
+
+        return keypoints, scores, descriptors
 
 
 # Example usage and integration guide

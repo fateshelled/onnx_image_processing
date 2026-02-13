@@ -23,90 +23,10 @@ import torch
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiAngleSparseBAD
-from pytorch_model.utils import apply_nms_maxpool, select_topk_keypoints
+from pytorch_model.feature_detection.shi_tomasi_angle import (
+    ShiTomasiAngleSparseBADDetector,
+)
 from onnx_export.optimize import optimize_onnx_model
-
-
-class ShiTomasiAngleSparseBADWrapper(torch.nn.Module):
-    """
-    Wrapper for ONNX export that combines detection and description.
-
-    This wrapper provides a single forward pass that:
-    1. Detects features and computes orientations
-    2. Selects top-k keypoints
-    3. Computes rotation-aware descriptors
-
-    Inputs:
-        image: (B, 1, H, W) grayscale image
-
-    Outputs:
-        keypoints: (B, K, 2) keypoint coordinates in (y, x) format
-        scores: (B, K) keypoint scores
-        descriptors: (B, K, num_pairs) rotation-aware descriptors
-    """
-
-    def __init__(
-        self,
-        max_keypoints: int,
-        block_size: int = 5,
-        patch_size: int = 15,
-        sigma: float = 2.5,
-        num_pairs: int = 256,
-        binarize: bool = False,
-        soft_binarize: bool = True,
-        temperature: float = 10.0,
-        normalize_descriptors: bool = True,
-        sampling_mode: str = "nearest",
-        nms_radius: int = 3,
-        score_threshold: float = 0.0,
-    ):
-        super().__init__()
-
-        self.max_keypoints = max_keypoints
-        self.nms_radius = nms_radius
-        self.score_threshold = score_threshold
-
-        self.model = ShiTomasiAngleSparseBAD(
-            block_size=block_size,
-            patch_size=patch_size,
-            sigma=sigma,
-            num_pairs=num_pairs,
-            binarize=binarize,
-            soft_binarize=soft_binarize,
-            temperature=temperature,
-            normalize_descriptors=normalize_descriptors,
-            sampling_mode=sampling_mode,
-        )
-
-    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Forward pass: detect, select, and describe keypoints.
-
-        Args:
-            image: Input grayscale image (B, 1, H, W)
-
-        Returns:
-            keypoints: (B, K, 2) in (y, x) format, invalid keypoints at (-1, -1)
-            scores: (B, K) keypoint scores
-            descriptors: (B, K, num_pairs) rotation-aware descriptors
-        """
-        # 1. Detect and orient
-        score_map, angles = self.model.detect_and_orient(image)
-        score_map = score_map.squeeze(1)  # (B, H, W)
-
-        # 2. Apply NMS
-        nms_mask = apply_nms_maxpool(score_map, self.nms_radius)
-
-        # 3. Select top-k keypoints
-        keypoints, scores = select_topk_keypoints(
-            score_map, nms_mask, self.max_keypoints, self.score_threshold
-        )
-
-        # 4. Compute rotation-aware descriptors
-        descriptors = self.model.describe(image, keypoints, angles)
-
-        return keypoints, scores, descriptors
 
 
 def parse_args():
@@ -242,7 +162,7 @@ def main():
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
 
-    model = ShiTomasiAngleSparseBADWrapper(
+    model = ShiTomasiAngleSparseBADDetector(
         max_keypoints=args.max_keypoints,
         block_size=args.block_size,
         patch_size=args.patch_size,
