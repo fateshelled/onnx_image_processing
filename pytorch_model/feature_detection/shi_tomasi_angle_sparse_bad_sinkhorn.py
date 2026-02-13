@@ -1,15 +1,14 @@
 """
-AKAZE + Sparse BAD + Sinkhorn Feature Matcher.
+Shi-Tomasi + Angle + Sparse BAD + Sinkhorn Feature Matcher.
 
-This module provides a feature matching model that combines AKAZE feature
-detection with orientation-aware sparse BAD descriptors and Sinkhorn matching.
-AKAZE provides per-pixel orientation information which is used to rotate BAD
-pair offsets at each keypoint, making the descriptor rotation-invariant.
+This module provides a feature matching model that combines Shi-Tomasi corner
+detection, angle estimation for rotation invariance, sparse BAD descriptors,
+and Sinkhorn matching.
 
 Pipeline:
-    1. AKAZE feature detection -> score map + orientation map (full image)
+    1. Shi-Tomasi corner detection + angle estimation -> score + orientation maps
     2. NMS + top-k -> keypoint selection
-    3. Orientation-aware BAD descriptor computation at keypoints (sparse)
+    3. Rotation-aware BAD descriptor computation at keypoints (sparse)
     4. Sinkhorn matching
 
 Designed for ONNX export as a single integrated model.
@@ -19,32 +18,26 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from pytorch_model.feature_detection.akaze import AKAZE
+from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiWithAngle
 from pytorch_model.descriptor.bad import SparseBAD
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
 
 
-class AKAZESparseBADSinkhornMatcher(nn.Module):
+class ShiTomasiAngleSparseBADSinkhornMatcher(nn.Module):
     """
-    Feature matching model with AKAZE detection and orientation-aware BAD.
+    Feature matching model with Shi-Tomasi + Angle + Sparse BAD descriptors.
 
-    Uses AKAZE for feature detection (providing both scores and orientations),
+    Uses Shi-Tomasi for feature detection combined with angle estimation,
     then computes rotation-invariant BAD descriptors at keypoint locations by
-    rotating pair offsets according to the local AKAZE orientation.
+    rotating pair offsets according to the local orientation.
 
     Args:
         max_keypoints: Maximum number of keypoints to detect per image.
                        Output will be padded to this size.
-        num_scales: Number of AKAZE scale levels. Default is 3.
-        diffusion_iterations: Number of FED iterations per scale. Default is 3.
-        kappa: Contrast parameter for AKAZE diffusion. Default is 0.05.
-        threshold: AKAZE feature detection threshold. Default is 0.001.
-        akaze_nms_size: NMS window size inside AKAZE detector (must be odd).
-                        Default is 5.
-        orientation_patch_size: Patch size for AKAZE orientation estimation
-                                (must be odd). Default is 15.
-        orientation_sigma: Gaussian sigma for AKAZE orientation weighting.
-                           Default is 2.5.
+        block_size: Block size for Shi-Tomasi corner detection (must be odd).
+                   Default is 5.
+        patch_size: Patch size for angle estimation (must be odd). Default is 15.
+        sigma: Gaussian sigma for angle estimation. Default is 2.5.
         num_pairs: Number of BAD descriptor comparison pairs (descriptor
                    dimensionality). Must be 256 or 512. Default is 256.
         binarize: If True, output binarized BAD descriptors. Default is False.
@@ -57,8 +50,7 @@ class AKAZESparseBADSinkhornMatcher(nn.Module):
         unused_score: Score for dustbin entries in Sinkhorn. Default is 1.0.
         distance_type: Distance metric for Sinkhorn cost matrix. Either 'l1'
                        or 'l2'. Default is 'l2'.
-        nms_radius: Radius for pipeline-level non-maximum suppression on the
-                    AKAZE score map. Default is 3.
+        nms_radius: Radius for non-maximum suppression. Default is 3.
         score_threshold: Minimum score threshold for keypoint selection.
                         Default is 0.0.
         normalize_descriptors: If True, L2-normalize descriptors before
@@ -71,7 +63,7 @@ class AKAZESparseBADSinkhornMatcher(nn.Module):
                       Default is None (uses max_radius).
 
     Example:
-        >>> model = AKAZESparseBADSinkhornMatcher(max_keypoints=512)
+        >>> model = ShiTomasiAngleSparseBADSinkhornMatcher(max_keypoints=512)
         >>> img1 = torch.randn(1, 1, 480, 640)
         >>> img2 = torch.randn(1, 1, 480, 640)
         >>> kpts1, kpts2, probs = model(img1, img2)
@@ -83,13 +75,9 @@ class AKAZESparseBADSinkhornMatcher(nn.Module):
     def __init__(
         self,
         max_keypoints: int,
-        num_scales: int = 3,
-        diffusion_iterations: int = 3,
-        kappa: float = 0.05,
-        threshold: float = 0.001,
-        akaze_nms_size: int = 5,
-        orientation_patch_size: int = 15,
-        orientation_sigma: float = 2.5,
+        block_size: int = 5,
+        patch_size: int = 15,
+        sigma: float = 2.5,
         num_pairs: int = 256,
         binarize: bool = False,
         soft_binarize: bool = True,
@@ -110,15 +98,11 @@ class AKAZESparseBADSinkhornMatcher(nn.Module):
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
 
-        # AKAZE feature detector (scores + orientations)
-        self.detector = AKAZE(
-            num_scales=num_scales,
-            diffusion_iterations=diffusion_iterations,
-            kappa=kappa,
-            threshold=threshold,
-            nms_size=akaze_nms_size,
-            orientation_patch_size=orientation_patch_size,
-            orientation_sigma=orientation_sigma,
+        # Feature detector + orientation estimator
+        self.detector = ShiTomasiWithAngle(
+            block_size=block_size,
+            patch_size=patch_size,
+            sigma=sigma,
         )
 
         # Sparse BAD descriptor computation with orientation support
@@ -258,9 +242,9 @@ class AKAZESparseBADSinkhornMatcher(nn.Module):
                 - matching_probs: Matching probability matrix of shape
                   (B, K+1, K+1). The last row/column is the dustbin.
         """
-        # 1. AKAZE feature detection (scores + orientations)
-        scores1, orient1 = self.detector(image1)  # (B, 1, H, W) each
-        scores2, orient2 = self.detector(image2)
+        # 1. Detect features and compute orientations
+        scores1, angles1 = self.detector(image1)  # (B, 1, H, W) each
+        scores2, angles2 = self.detector(image2)
         scores1 = scores1.squeeze(1)  # (B, H, W)
         scores2 = scores2.squeeze(1)
 
@@ -272,9 +256,9 @@ class AKAZESparseBADSinkhornMatcher(nn.Module):
         keypoints1, _ = self._select_topk_keypoints(scores1, nms_mask1)
         keypoints2, _ = self._select_topk_keypoints(scores2, nms_mask2)
 
-        # 4. Compute orientation-aware BAD descriptors at keypoints
-        desc1 = self.descriptor(image1, keypoints1, orient1)
-        desc2 = self.descriptor(image2, keypoints2, orient2)
+        # 4. Compute rotation-aware BAD descriptors at keypoints
+        desc1 = self.descriptor(image1, keypoints1, angles1)
+        desc2 = self.descriptor(image2, keypoints2, angles2)
 
         # 5. Perform Sinkhorn matching
         matching_probs = self.matcher(desc1, desc2)  # (B, K+1, K+1)

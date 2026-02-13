@@ -61,6 +61,10 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         sampling_mode: Sampling mode for descriptor grid sampling.
                        Choose 'nearest' for faster approximate sampling or
                        'bilinear' for smoother interpolation. Default is 'nearest'.
+        border_margin: Margin from image border (in pixels) to exclude keypoints.
+                      If None, uses descriptor's max_radius to ensure valid
+                      descriptor computation. Set to 0 to disable border filtering.
+                      Default is None (uses max_radius).
 
     Example:
         >>> model = ShiTomasiSparseBADSinkhornMatcher(max_keypoints=512)
@@ -89,6 +93,7 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         score_threshold: float = 0.0,
         normalize_descriptors: bool = True,
         sampling_mode: str = "nearest",
+        border_margin: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -111,6 +116,12 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             normalize_descriptors=normalize_descriptors,
             sampling_mode=sampling_mode,
         )
+
+        # Set border margin: if None, use descriptor's max_radius for safety
+        if border_margin is None:
+            self.border_margin = self.descriptor.max_radius
+        else:
+            self.border_margin = border_margin
 
         # Feature matcher: Sinkhorn
         self.matcher = SinkhornMatcher(
@@ -171,7 +182,16 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         B, H, W = scores.shape
         K = self.max_keypoints
 
-        scores_masked = scores * nms_mask
+        # Create border mask to exclude keypoints near image boundaries
+        border_mask = torch.ones_like(scores)
+        if self.border_margin > 0:
+            border_mask[:, :self.border_margin, :] = 0  # top
+            border_mask[:, -self.border_margin:, :] = 0  # bottom
+            border_mask[:, :, :self.border_margin] = 0  # left
+            border_mask[:, :, -self.border_margin:] = 0  # right
+
+        # Apply NMS mask, border mask, and score threshold
+        scores_masked = scores * nms_mask * border_mask
         scores_masked = torch.where(
             scores_masked > self.score_threshold,
             scores_masked,

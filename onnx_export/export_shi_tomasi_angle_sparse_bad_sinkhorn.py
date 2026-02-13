@@ -18,128 +18,14 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiAngleSparseBAD
-from pytorch_model.matching.sinkhorn import SinkhornMatcher
-from pytorch_model.utils import apply_nms_maxpool, select_topk_keypoints
+from pytorch_model.feature_detection.shi_tomasi_angle_sparse_bad_sinkhorn import (
+    ShiTomasiAngleSparseBADSinkhornMatcher,
+)
 from onnx_export.optimize import optimize_onnx_model
-
-
-class ShiTomasiAngleSparseBADSinkhornMatcher(torch.nn.Module):
-    """
-    Complete feature matching pipeline with Shi-Tomasi + Angle + Sparse BAD + Sinkhorn.
-
-    Pipeline:
-        1. Shi-Tomasi corner detection -> score maps
-        2. Angle estimation -> orientation maps
-        3. NMS + top-k -> keypoint selection
-        4. Rotation-aware BAD descriptor computation (sparse)
-        5. Sinkhorn matching
-
-    Inputs:
-        image1: (B, 1, H, W) first grayscale image
-        image2: (B, 1, H, W) second grayscale image
-
-    Outputs:
-        keypoints1: (B, K, 2) keypoints in first image (y, x)
-        keypoints2: (B, K, 2) keypoints in second image (y, x)
-        matching_probs: (B, K+1, K+1) matching probability matrix
-    """
-
-    def __init__(
-        self,
-        max_keypoints: int,
-        block_size: int = 5,
-        patch_size: int = 15,
-        sigma: float = 2.5,
-        num_pairs: int = 256,
-        binarize: bool = False,
-        soft_binarize: bool = True,
-        temperature: float = 10.0,
-        sinkhorn_iterations: int = 20,
-        epsilon: float = 1.0,
-        unused_score: float = 1.0,
-        distance_type: str = "l2",
-        nms_radius: int = 3,
-        score_threshold: float = 0.0,
-        normalize_descriptors: bool = True,
-        sampling_mode: str = "nearest",
-    ):
-        super().__init__()
-
-        self.max_keypoints = max_keypoints
-        self.nms_radius = nms_radius
-        self.score_threshold = score_threshold
-        self.normalize_descriptors = normalize_descriptors
-
-        # Feature detector + descriptor
-        self.descriptor = ShiTomasiAngleSparseBAD(
-            block_size=block_size,
-            patch_size=patch_size,
-            sigma=sigma,
-            num_pairs=num_pairs,
-            binarize=binarize,
-            soft_binarize=soft_binarize,
-            temperature=temperature,
-            normalize_descriptors=normalize_descriptors,
-            sampling_mode=sampling_mode,
-        )
-
-        # Feature matcher
-        self.matcher = SinkhornMatcher(
-            iterations=sinkhorn_iterations,
-            epsilon=epsilon,
-            unused_score=unused_score,
-            distance_type=distance_type,
-        )
-
-    def forward(
-        self,
-        image1: torch.Tensor,
-        image2: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Detect keypoints and compute matches between two images.
-
-        Args:
-            image1: First grayscale image (B, 1, H, W)
-            image2: Second grayscale image (B, 1, H, W)
-
-        Returns:
-            keypoints1: Detected keypoints in first image (B, K, 2) in (y, x)
-            keypoints2: Detected keypoints in second image (B, K, 2) in (y, x)
-            matching_probs: Matching probability matrix (B, K+1, K+1)
-        """
-        # 1. Detect features and compute orientations
-        scores1, angles1 = self.descriptor.detect_and_orient(image1)
-        scores2, angles2 = self.descriptor.detect_and_orient(image2)
-        scores1 = scores1.squeeze(1)  # (B, H, W)
-        scores2 = scores2.squeeze(1)
-
-        # 2. Apply NMS
-        nms_mask1 = apply_nms_maxpool(scores1, self.nms_radius)
-        nms_mask2 = apply_nms_maxpool(scores2, self.nms_radius)
-
-        # 3. Select top-k keypoints
-        keypoints1, _ = select_topk_keypoints(
-            scores1, nms_mask1, self.max_keypoints, self.score_threshold
-        )
-        keypoints2, _ = select_topk_keypoints(
-            scores2, nms_mask2, self.max_keypoints, self.score_threshold
-        )
-
-        # 4. Compute rotation-aware descriptors at keypoints
-        desc1 = self.descriptor.describe(image1, keypoints1, angles1)
-        desc2 = self.descriptor.describe(image2, keypoints2, angles2)
-
-        # 5. Perform Sinkhorn matching
-        matching_probs = self.matcher(desc1, desc2)  # (B, K+1, K+1)
-
-        return keypoints1, keypoints2, matching_probs
 
 
 def parse_args():
