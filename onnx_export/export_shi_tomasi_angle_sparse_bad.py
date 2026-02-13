@@ -82,15 +82,15 @@ def parse_args():
         "--num-pairs", "-n",
         type=int,
         choices=[256, 512],
-        default=256,
-        help="Number of BAD descriptor pairs (choices: 256 or 512, default: 256)"
+        default=512,
+        help="Number of BAD descriptor pairs (choices: 256 or 512, default: 512)"
     )
     parser.add_argument(
         "--binarization",
         type=str,
         choices=["none", "soft", "hard"],
-        default="none",
-        help="BAD binarization mode: none (threshold-centered response), soft (sigmoid), hard (binary) (default: none)"
+        default="hard",
+        help="BAD binarization mode: none (threshold-centered response), soft (sigmoid), hard (binary) (default: hard)"
     )
     parser.add_argument(
         "--temperature",
@@ -121,8 +121,8 @@ def parse_args():
     parser.add_argument(
         "--nms-radius",
         type=int,
-        default=3,
-        help="Radius for non-maximum suppression (default: 3)"
+        default=5,
+        help="Radius for non-maximum suppression (default: 5)"
     )
     parser.add_argument(
         "--score-threshold",
