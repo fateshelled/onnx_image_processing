@@ -227,60 +227,6 @@ valid_kp2 = keypoints2[0, valid_matches]
 print(f"Valid matches: {np.sum(valid_mask)}")
 ```
 
-## C++での使用例
-
-```cpp
-#include <onnxruntime/core/session/onnxruntime_cxx_api.h>
-#include <opencv2/opencv.hpp>
-
-// ONNXランタイムセッション作成
-Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "ShiTomasiAngleSparseBAD");
-Ort::SessionOptions session_options;
-Ort::Session session(env, "shi_tomasi_angle_sparse_bad_sinkhorn.onnx", session_options);
-
-// 入力データ準備
-cv::Mat img1_gray, img2_gray;
-cv::cvtColor(img1, img1_gray, cv::COLOR_BGR2GRAY);
-cv::cvtColor(img2, img2_gray, cv::COLOR_BGR2GRAY);
-
-// 正規化 (0-1範囲)
-img1_gray.convertTo(img1_gray, CV_32F, 1.0/255.0);
-img2_gray.convertTo(img2_gray, CV_32F, 1.0/255.0);
-
-// ONNXテンソルに変換
-std::vector<int64_t> input_shape = {1, 1, img1_gray.rows, img1_gray.cols};
-std::vector<float> input1(img1_gray.begin<float>(), img1_gray.end<float>());
-std::vector<float> input2(img2_gray.begin<float>(), img2_gray.end<float>());
-
-// 推論実行
-auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-Ort::Value input_tensor1 = Ort::Value::CreateTensor<float>(
-    memory_info, input1.data(), input1.size(),
-    input_shape.data(), input_shape.size()
-);
-Ort::Value input_tensor2 = Ort::Value::CreateTensor<float>(
-    memory_info, input2.data(), input2.size(),
-    input_shape.data(), input_shape.size()
-);
-
-const char* input_names[] = {"image1", "image2"};
-const char* output_names[] = {"keypoints1", "keypoints2", "matching_probs"};
-
-auto outputs = session.Run(
-    Ort::RunOptions{nullptr},
-    input_names,
-    &input_tensor1,
-    2,
-    output_names,
-    3
-);
-
-// 結果取得
-auto* keypoints1 = outputs[0].GetTensorMutableData<float>();
-auto* keypoints2 = outputs[1].GetTensorMutableData<float>();
-auto* matching_probs = outputs[2].GetTensorMutableData<float>();
-```
-
 ## AKAZEとの比較
 
 | 特徴 | Shi-Tomasi + Angle | AKAZE |

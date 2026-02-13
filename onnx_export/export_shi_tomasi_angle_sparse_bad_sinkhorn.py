@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiAngleSparseBAD
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
+from pytorch_model.utils import apply_nms_maxpool, select_topk_keypoints
 from onnx_export.optimize import optimize_onnx_model
 
 
@@ -96,69 +97,6 @@ class ShiTomasiAngleSparseBADSinkhornMatcher(torch.nn.Module):
             distance_type=distance_type,
         )
 
-    def _apply_nms_maxpool(self, scores: torch.Tensor) -> torch.Tensor:
-        """Apply non-maximum suppression using max pooling."""
-        kernel_size = 2 * self.nms_radius + 1
-        padding = self.nms_radius
-
-        scores_padded = F.pad(
-            scores.unsqueeze(1),
-            (padding, padding, padding, padding),
-            mode="constant",
-            value=float("-inf"),
-        )
-
-        local_max = F.max_pool2d(
-            scores_padded,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=0,
-        ).squeeze(1)
-
-        nms_mask = (scores >= (local_max - 1e-7)).float()
-        return nms_mask
-
-    def _select_topk_keypoints(
-        self,
-        scores: torch.Tensor,
-        nms_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select top-k keypoints from score map after NMS."""
-        B, H, W = scores.shape
-        K = self.max_keypoints
-
-        scores_masked = scores * nms_mask
-        scores_masked = torch.where(
-            scores_masked > self.score_threshold,
-            scores_masked,
-            torch.zeros_like(scores_masked),
-        )
-
-        scores_flat = scores_masked.reshape(B, -1)
-
-        topk_scores, topk_indices = torch.topk(
-            scores_flat,
-            k=K,
-            dim=1,
-            largest=True,
-            sorted=True,
-        )
-
-        y_coords = (topk_indices // W).float()
-        x_coords = (topk_indices % W).float()
-        keypoints = torch.stack([y_coords, x_coords], dim=-1)
-
-        valid_mask = (topk_scores > 0).float()
-        invalid_keypoints = torch.full_like(keypoints, -1.0)
-        keypoints = torch.where(
-            valid_mask.unsqueeze(-1) > 0.5,
-            keypoints,
-            invalid_keypoints,
-        )
-        topk_scores = topk_scores * valid_mask
-
-        return keypoints, topk_scores
-
     def forward(
         self,
         image1: torch.Tensor,
@@ -183,12 +121,16 @@ class ShiTomasiAngleSparseBADSinkhornMatcher(torch.nn.Module):
         scores2 = scores2.squeeze(1)
 
         # 2. Apply NMS
-        nms_mask1 = self._apply_nms_maxpool(scores1)
-        nms_mask2 = self._apply_nms_maxpool(scores2)
+        nms_mask1 = apply_nms_maxpool(scores1, self.nms_radius)
+        nms_mask2 = apply_nms_maxpool(scores2, self.nms_radius)
 
         # 3. Select top-k keypoints
-        keypoints1, _ = self._select_topk_keypoints(scores1, nms_mask1)
-        keypoints2, _ = self._select_topk_keypoints(scores2, nms_mask2)
+        keypoints1, _ = select_topk_keypoints(
+            scores1, nms_mask1, self.max_keypoints, self.score_threshold
+        )
+        keypoints2, _ = select_topk_keypoints(
+            scores2, nms_mask2, self.max_keypoints, self.score_threshold
+        )
 
         # 4. Compute rotation-aware descriptors at keypoints
         desc1 = self.descriptor.describe(image1, keypoints1, angles1)

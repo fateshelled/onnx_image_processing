@@ -143,8 +143,8 @@ def example_feature_matching_pipeline():
     y2 = (indices2 // w).float()
     x2 = (indices2 % w).float()
 
-    keypoints1 = torch.stack([x1, y1], dim=-1)  # (1, k, 2)
-    keypoints2 = torch.stack([x2, y2], dim=-1)  # (1, k, 2)
+    keypoints1 = torch.stack([y1, x1], dim=-1)  # (1, k, 2) in (y, x)
+    keypoints2 = torch.stack([y2, x2], dim=-1)  # (1, k, 2) in (y, x)
 
     # Get angles for keypoints
     angles1_flat = angles1.view(1, -1)

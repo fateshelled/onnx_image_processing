@@ -86,10 +86,10 @@ def test_descriptor_computation():
     print()
 
 
-def test_rotation_invariance():
-    """Test rotation invariance of descriptors."""
+def test_rotation_awareness():
+    """Test rotation awareness of descriptors."""
     print("=" * 60)
-    print("Test 3: Rotation Invariance")
+    print("Test 3: Rotation Awareness")
     print("=" * 60)
 
     # Create simple test pattern
@@ -263,7 +263,7 @@ def main():
     try:
         test_basic_functionality()
         test_descriptor_computation()
-        test_rotation_invariance()
+        test_rotation_awareness()
         test_invalid_keypoints()
         test_normalization()
         test_comparison_with_akaze()
