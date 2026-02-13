@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-ONNX export script for Shi-Tomasi + Sparse BAD + Sinkhorn image matching model.
+ONNX export script for Shi-Tomasi + Angle + Sparse BAD + Sinkhorn matching model.
 
-Exports the ShiTomasiSparseBADSinkhornMatcher model where BAD descriptors are
-computed only at detected keypoint locations, not for all pixels.
+Exports a complete feature matching pipeline that combines Shi-Tomasi corner
+detection, angle estimation, rotation-aware sparse BAD descriptors, and
+Sinkhorn matching. This is analogous to AKAZESparseBADSinkhornMatcher but
+uses Shi-Tomasi instead of AKAZE for feature detection.
 
 Usage:
-    python export_shi_tomasi_sparse_bad_sinkhorn.py --output shi_tomasi_sparse_bad_sinkhorn.onnx --height 480 --width 640
-    python export_shi_tomasi_sparse_bad_sinkhorn.py --output shi_tomasi_sparse_bad_sinkhorn.onnx --max-keypoints 256
+    python export_shi_tomasi_angle_sparse_bad_sinkhorn.py --output shi_tomasi_angle_sparse_bad_sinkhorn.onnx
+    python export_shi_tomasi_angle_sparse_bad_sinkhorn.py --output model.onnx --max-keypoints 512
+    python export_shi_tomasi_angle_sparse_bad_sinkhorn.py --output model.onnx --num-pairs 512 --binarization soft
 """
 
 import argparse
@@ -19,19 +22,21 @@ import torch
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.feature_detection.shi_tomasi_sparse_bad_sinkhorn import ShiTomasiSparseBADSinkhornMatcher
+from pytorch_model.feature_detection.shi_tomasi_angle_sparse_bad_sinkhorn import (
+    ShiTomasiAngleSparseBADSinkhornMatcher,
+)
 from onnx_export.optimize import optimize_onnx_model
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export Shi-Tomasi + Sparse BAD + Sinkhorn image matching model to ONNX format"
+        description="Export Shi-Tomasi + Angle + Sparse BAD + Sinkhorn matching model to ONNX format"
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="shi_tomasi_sparse_bad_sinkhorn.onnx",
-        help="Output ONNX file path (default: shi_tomasi_sparse_bad_sinkhorn.onnx)"
+        default="shi_tomasi_angle_sparse_bad_sinkhorn.onnx",
+        help="Output ONNX file path (default: shi_tomasi_angle_sparse_bad_sinkhorn.onnx)"
     )
     parser.add_argument(
         "--height", "-H",
@@ -51,24 +56,33 @@ def parse_args():
         default=1024,
         help="Maximum number of keypoints per image (default: 1024)"
     )
+    # --- Shi-Tomasi detector parameters ---
     parser.add_argument(
         "--block-size",
         type=int,
-        default=3,
-        help="Block size for Shi-Tomasi structure tensor computation (default: 3)"
+        default=5,
+        help="Shi-Tomasi block size (default: 5)"
     )
+    # --- Angle estimation parameters ---
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=15,
+        help="Patch size for angle estimation (default: 15)"
+    )
+    parser.add_argument(
+        "--sigma",
+        type=float,
+        default=2.5,
+        help="Gaussian sigma for angle estimation (default: 2.5)"
+    )
+    # --- BAD descriptor parameters ---
     parser.add_argument(
         "--num-pairs", "-n",
         type=int,
         choices=[256, 512],
         default=512,
-        help="Number of BAD descriptor bits (choices: 256 or 512, default: 512)"
-    )
-    parser.add_argument(
-        "--box-size", "-b",
-        type=int,
-        default=5,
-        help="Box size for BAD averaging (default: 5)"
+        help="Number of BAD descriptor pairs (choices: 256 or 512, default: 512)"
     )
     parser.add_argument(
         "--binarization",
@@ -83,6 +97,7 @@ def parse_args():
         default=10.0,
         help="Temperature for soft sigmoid binarization (default: 10.0)"
     )
+    # --- Sinkhorn parameters ---
     parser.add_argument(
         "--sinkhorn-iterations", "-i",
         type=int,
@@ -105,13 +120,13 @@ def parse_args():
         "--normalize-descriptors",
         action="store_true",
         default=True,
-        help="L2-normalize descriptors before matching (default: True, strongly recommended)"
+        help="L2-normalize descriptors before matching (default: True)"
     )
     parser.add_argument(
         "--no-normalize-descriptors",
         dest="normalize_descriptors",
         action="store_false",
-        help="Disable descriptor normalization (not recommended)"
+        help="Disable descriptor normalization"
     )
     parser.add_argument(
         "--distance-type",
@@ -120,6 +135,7 @@ def parse_args():
         default="l2",
         help="Distance metric for Sinkhorn cost matrix (default: l2)"
     )
+    # --- Pipeline parameters ---
     parser.add_argument(
         "--nms-radius",
         type=int,
@@ -130,7 +146,7 @@ def parse_args():
         "--score-threshold",
         type=float,
         default=0.0,
-        help="Minimum corner score threshold for keypoint selection (default: 0.0)"
+        help="Minimum score threshold for keypoint selection (default: 0.0)"
     )
     parser.add_argument(
         "--sampling-mode",
@@ -139,6 +155,7 @@ def parse_args():
         default="nearest",
         help="Sampling mode for sparse BAD descriptor extraction (default: nearest)"
     )
+    # --- ONNX export options ---
     parser.add_argument(
         "--opset-version",
         type=int,
@@ -151,7 +168,7 @@ def parse_args():
         help="Enable dynamic input shape (batch, height, width)"
     )
     parser.add_argument(
-        "--disable_dynamo",
+        "--disable-dynamo",
         action="store_true",
         help="Disable dynamo"
     )
@@ -166,15 +183,15 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # NOTE: Learned BAD patterns are fixed for 256/512 bits.
-
     # Create model
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
-    model = ShiTomasiSparseBADSinkhornMatcher(
+
+    model = ShiTomasiAngleSparseBADSinkhornMatcher(
         max_keypoints=args.max_keypoints,
         block_size=args.block_size,
-        sobel_size=3,
+        patch_size=args.patch_size,
+        sigma=args.sigma,
         num_pairs=args.num_pairs,
         binarize=binarize,
         soft_binarize=soft_binarize,
@@ -206,6 +223,7 @@ def main():
         }
 
     # Export to ONNX
+    print(f"Exporting Shi-Tomasi + Angle + Sparse BAD + Sinkhorn model to ONNX format...")
     torch.onnx.export(
         model,
         (dummy_image1, dummy_image2),
@@ -222,11 +240,12 @@ def main():
     # Optimize ONNX model
     optimization = "skipped"
     if not args.no_optimize:
+        print("Optimizing ONNX model...")
         optimization = optimize_onnx_model(args.output)
 
     K = args.max_keypoints
-    print(f"Exported ONNX model to: {args.output}")
-    print(f"  Model type: Sparse BAD (descriptors computed at keypoints only)")
+    print(f"\nExported ONNX model to: {args.output}")
+    print(f"  Model type: Shi-Tomasi + Angle + Sparse BAD + Sinkhorn")
     print(f"  Input image1 shape: (B, 1, {args.height}, {args.width})")
     print(f"  Input image2 shape: (B, 1, {args.height}, {args.width})")
     print(f"  Output keypoints1 shape: (B, {K}, 2)")
@@ -234,14 +253,19 @@ def main():
     print(f"  Output matching_probs shape: (B, {K + 1}, {K + 1})")
     print(f"  Max keypoints: {K}")
     print(f"  Block size: {args.block_size}")
+    print(f"  Patch size: {args.patch_size}")
+    print(f"  Sigma: {args.sigma}")
     print(f"  Number of pairs: {args.num_pairs}")
     print(f"  Binarization: {args.binarization}")
+    print(f"  Temperature: {args.temperature}")
     print(f"  Sinkhorn iterations: {args.sinkhorn_iterations}")
     print(f"  Epsilon: {args.epsilon}")
     print(f"  Unused score: {args.unused_score}")
     print(f"  Distance type: {args.distance_type}")
     print(f"  Sampling mode: {args.sampling_mode}")
     print(f"  Normalize descriptors: {args.normalize_descriptors}")
+    print(f"  NMS radius: {args.nms_radius}")
+    print(f"  Score threshold: {args.score_threshold}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
     print(f"  Optimization: {optimization}")

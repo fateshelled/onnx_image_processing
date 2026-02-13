@@ -18,7 +18,7 @@ import torch
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.feature_detection.akaze import AKAZE
+from pytorch_model.detector.akaze import AKAZE
 from onnx_export.optimize import optimize_onnx_model
 
 

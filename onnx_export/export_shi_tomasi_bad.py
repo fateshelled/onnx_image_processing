@@ -54,8 +54,8 @@ def parse_args():
         "--num-pairs", "-n",
         type=int,
         choices=[256, 512],
-        default=256,
-        help="Number of BAD descriptor bits (choices: 256 or 512, default: 256)"
+        default=512,
+        help="Number of BAD descriptor bits (choices: 256 or 512, default: 512)"
     )
     parser.add_argument(
         "--box-size", "-b",
@@ -67,8 +67,8 @@ def parse_args():
         "--binarization",
         type=str,
         choices=["none", "soft", "hard"],
-        default="none",
-        help="BAD binarization mode: none (threshold-centered response), soft (sigmoid), hard (binary) (default: none)"
+        default="hard",
+        help="BAD binarization mode: none (threshold-centered response), soft (sigmoid), hard (binary) (default: hard)"
     )
     parser.add_argument(
         "--temperature",

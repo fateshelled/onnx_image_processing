@@ -15,7 +15,7 @@ import torch
 # Add parent directory to path for importing pytorch_model
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.corner.shi_tomasi import ShiTomasiScore
+from pytorch_model.detector.shi_tomasi import ShiTomasiScore
 from onnx_export.optimize import optimize_onnx_model
 
 

@@ -13,7 +13,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from pytorch_model.corner.shi_tomasi import ShiTomasiScore
+from pytorch_model.detector.shi_tomasi import ShiTomasiScore
 from pytorch_model.descriptor.bad import BADDescriptor
 
 

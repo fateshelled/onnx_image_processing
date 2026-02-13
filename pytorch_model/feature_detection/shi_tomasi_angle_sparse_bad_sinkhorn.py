@@ -1,15 +1,14 @@
 """
-Shi-Tomasi + Sparse BAD + Sinkhorn Feature Matcher.
+Shi-Tomasi + Angle + Sparse BAD + Sinkhorn Feature Matcher.
 
-This module provides a feature matching model where BAD descriptors are
-computed only at detected keypoint locations (sparse), rather than densely
-for all pixels. This reduces computation when the number of keypoints is
-much smaller than the total number of pixels.
+This module provides a feature matching model that combines Shi-Tomasi corner
+detection, angle estimation for rotation invariance, sparse BAD descriptors,
+and Sinkhorn matching.
 
 Pipeline:
-    1. Shi-Tomasi corner detection -> score map (full image)
+    1. Shi-Tomasi corner detection + angle estimation -> score + orientation maps
     2. NMS + top-k -> keypoint selection
-    3. BAD descriptor computation at keypoints only (sparse)
+    3. Rotation-aware BAD descriptor computation at keypoints (sparse)
     4. Sinkhorn matching
 
 Designed for ONNX export as a single integrated model.
@@ -18,30 +17,29 @@ Designed for ONNX export as a single integrated model.
 import torch
 from torch import nn
 
-from pytorch_model.detector.shi_tomasi import ShiTomasiScore
+from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiWithAngle
 from pytorch_model.descriptor.bad import SparseBAD
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
 from pytorch_model.utils import apply_nms_maxpool, select_topk_keypoints
 
 
-class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
+class ShiTomasiAngleSparseBADSinkhornMatcher(nn.Module):
     """
-    Feature matching model with sparse BAD descriptor computation.
+    Feature matching model with Shi-Tomasi + Angle + Sparse BAD descriptors.
 
-    Unlike ShiTomasiBADSinkhornMatcher which computes dense BAD descriptors
-    for all pixels, this model first detects keypoints using Shi-Tomasi
-    corner detection, then computes BAD descriptors only at those keypoint
-    locations. This is more efficient when max_keypoints << H * W.
+    Uses Shi-Tomasi for feature detection combined with angle estimation,
+    then computes rotation-invariant BAD descriptors at keypoint locations by
+    rotating pair offsets according to the local orientation.
 
     Args:
         max_keypoints: Maximum number of keypoints to detect per image.
                        Output will be padded to this size.
-        block_size: Block size for Shi-Tomasi structure tensor computation.
-                    Must be a positive odd integer. Default is 3.
-        sobel_size: Sobel kernel size for gradient computation.
-                    Currently only supports 3. Default is 3.
+        block_size: Block size for Shi-Tomasi corner detection (must be odd).
+                   Default is 5.
+        patch_size: Patch size for angle estimation (must be odd). Default is 15.
+        sigma: Gaussian sigma for angle estimation. Default is 2.5.
         num_pairs: Number of BAD descriptor comparison pairs (descriptor
-                   dimensionality). Default is 256.
+                   dimensionality). Must be 256 or 512. Default is 256.
         binarize: If True, output binarized BAD descriptors. Default is False.
         soft_binarize: If True and binarize=True, use sigmoid for soft
                        binarization. Default is True.
@@ -49,27 +47,25 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         sinkhorn_iterations: Number of Sinkhorn iterations for matching.
                             Default is 20.
         epsilon: Entropy regularization parameter for Sinkhorn. Default is 1.0.
-        unused_score: Score for dustbin entries in Sinkhorn (controls match
-                      threshold). Default is 1.0.
+        unused_score: Score for dustbin entries in Sinkhorn. Default is 1.0.
         distance_type: Distance metric for Sinkhorn cost matrix. Either 'l1'
                        or 'l2'. Default is 'l2'.
         nms_radius: Radius for non-maximum suppression. Default is 3.
-        score_threshold: Minimum corner score threshold for keypoint selection.
-                        Default is 0.0 (no filtering).
-        normalize_descriptors: If True, L2-normalize descriptors before matching.
-                              Default is True.
+        score_threshold: Minimum score threshold for keypoint selection.
+                        Default is 0.0.
+        normalize_descriptors: If True, L2-normalize descriptors before
+                              matching. Default is True.
         sampling_mode: Sampling mode for descriptor grid sampling.
-                       Choose 'nearest' for faster approximate sampling or
-                       'bilinear' for smoother interpolation. Default is 'nearest'.
+                       Choose 'nearest' or 'bilinear'. Default is 'nearest'.
         border_margin: Margin from image border (in pixels) to exclude keypoints.
                       If None, uses descriptor's max_radius to ensure valid
                       descriptor computation. Set to 0 to disable border filtering.
                       Default is None (uses max_radius).
 
     Example:
-        >>> model = ShiTomasiSparseBADSinkhornMatcher(max_keypoints=512)
-        >>> img1 = torch.randn(1, 1, 480, 640)  # Grayscale image 1
-        >>> img2 = torch.randn(1, 1, 480, 640)  # Grayscale image 2
+        >>> model = ShiTomasiAngleSparseBADSinkhornMatcher(max_keypoints=512)
+        >>> img1 = torch.randn(1, 1, 480, 640)
+        >>> img2 = torch.randn(1, 1, 480, 640)
         >>> kpts1, kpts2, probs = model(img1, img2)
         >>> print(kpts1.shape)  # [1, 512, 2]
         >>> print(kpts2.shape)  # [1, 512, 2]
@@ -79,8 +75,9 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
     def __init__(
         self,
         max_keypoints: int,
-        block_size: int = 3,
-        sobel_size: int = 3,
+        block_size: int = 5,
+        patch_size: int = 15,
+        sigma: float = 2.5,
         num_pairs: int = 256,
         binarize: bool = False,
         soft_binarize: bool = True,
@@ -101,13 +98,14 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
 
-        # Corner detector only (no dense BAD computation)
-        self.corner_detector = ShiTomasiScore(
+        # Feature detector + orientation estimator
+        self.detector = ShiTomasiWithAngle(
             block_size=block_size,
-            sobel_size=sobel_size,
+            patch_size=patch_size,
+            sigma=sigma,
         )
 
-        # Sparse BAD descriptor computation
+        # Sparse BAD descriptor computation with orientation support
         self.descriptor = SparseBAD(
             num_pairs=num_pairs,
             binarize=binarize,
@@ -152,9 +150,9 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
                 - matching_probs: Matching probability matrix of shape
                   (B, K+1, K+1). The last row/column is the dustbin.
         """
-        # 1. Compute Shi-Tomasi corner scores only (no dense BAD)
-        scores1 = self.corner_detector(image1)  # (B, 1, H, W)
-        scores2 = self.corner_detector(image2)
+        # 1. Detect features and compute orientations
+        scores1, angles1 = self.detector(image1)  # (B, 1, H, W) each
+        scores2, angles2 = self.detector(image2)
         scores1 = scores1.squeeze(1)  # (B, H, W)
         scores2 = scores2.squeeze(1)
 
@@ -172,9 +170,9 @@ class ShiTomasiSparseBADSinkhornMatcher(nn.Module):
             self.score_threshold, self.border_margin,
         )
 
-        # 4. Compute BAD descriptors at keypoints only (sparse)
-        desc1 = self.descriptor(image1, keypoints1)  # (B, K, num_pairs)
-        desc2 = self.descriptor(image2, keypoints2)
+        # 4. Compute rotation-aware BAD descriptors at keypoints
+        desc1 = self.descriptor(image1, keypoints1, angles1)
+        desc2 = self.descriptor(image2, keypoints2, angles2)
 
         # 5. Perform Sinkhorn matching
         matching_probs = self.matcher(desc1, desc2)  # (B, K+1, K+1)
