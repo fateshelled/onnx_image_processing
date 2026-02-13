@@ -49,6 +49,7 @@ def select_topk_keypoints(
     nms_mask: torch.Tensor,
     max_keypoints: int,
     score_threshold: float = 0.0,
+    border_margin: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Select top-k keypoints from score map after NMS.
@@ -58,6 +59,8 @@ def select_topk_keypoints(
         nms_mask: NMS mask of shape (B, H, W).
         max_keypoints: Maximum number of keypoints to select.
         score_threshold: Minimum score threshold for keypoint selection.
+        border_margin: Margin in pixels from image border to exclude
+            keypoints. Set to 0 to disable border filtering. Default is 0.
 
     Returns:
         Tuple of:
@@ -68,7 +71,20 @@ def select_topk_keypoints(
     B, H, W = scores.shape
     K = max_keypoints
 
-    scores_masked = scores * nms_mask
+    # Create border mask to exclude keypoints near image boundaries.
+    # Uses comparison + broadcasting instead of slice assignment to avoid
+    # ScatterND in ONNX (which causes warnings on CUDA with duplicate indices).
+    if border_margin > 0:
+        m = border_margin
+        y_idx = torch.arange(H, device=scores.device)
+        x_idx = torch.arange(W, device=scores.device)
+        y_valid = ((y_idx >= m) & (y_idx < H - m)).float()
+        x_valid = ((x_idx >= m) & (x_idx < W - m)).float()
+        border_mask = y_valid.view(1, H, 1) * x_valid.view(1, 1, W)
+        scores_masked = scores * nms_mask * border_mask
+    else:
+        scores_masked = scores * nms_mask
+
     scores_masked = torch.where(
         scores_masked > score_threshold,
         scores_masked,

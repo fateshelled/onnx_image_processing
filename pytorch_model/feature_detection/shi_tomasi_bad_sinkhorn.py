@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from pytorch_model.feature_detection.shi_tomasi_bad import ShiTomasiBADDetector
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
 from pytorch_model.descriptor.bad import extract_descriptors_at_keypoints_subpixel
+from pytorch_model.utils import apply_nms_maxpool, select_topk_keypoints
 
 
 class ShiTomasiBADSinkhornMatcher(nn.Module):
@@ -116,117 +117,6 @@ class ShiTomasiBADSinkhornMatcher(nn.Module):
             distance_type=distance_type,
         )
 
-    def _apply_nms_maxpool(self, scores: torch.Tensor) -> torch.Tensor:
-        """
-        Apply non-maximum suppression using max pooling.
-
-        Uses max pooling to find local maxima in the score map. A pixel is
-        kept if its score equals the maximum value in its local neighborhood.
-        This approach is fully ONNX-compatible and efficient on GPU/NPU.
-
-        Args:
-            scores: Corner score map of shape (B, H, W).
-
-        Returns:
-            NMS mask of shape (B, H, W) where 1.0 indicates local maximum
-            and 0.0 indicates suppressed pixel.
-        """
-        B, H, W = scores.shape
-        kernel_size = 2 * self.nms_radius + 1
-        padding = self.nms_radius
-
-        # Pad with -inf to prevent border pixels from being selected
-        scores_padded = F.pad(
-            scores.unsqueeze(1),  # (B, 1, H, W)
-            (padding, padding, padding, padding),
-            mode="constant",
-            value=float("-inf"),
-        )
-
-        # Apply max pooling to find local maxima
-        local_max = F.max_pool2d(
-            scores_padded,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=0,
-        ).squeeze(1)  # (B, H, W)
-
-        # Create binary mask: pixel is local maximum if score >= local max
-        # Use small epsilon for floating point comparison
-        nms_mask = (scores >= (local_max - 1e-7)).float()
-
-        return nms_mask
-
-    def _select_topk_keypoints(
-        self,
-        scores: torch.Tensor,
-        nms_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Select top-k keypoints from score map after NMS.
-
-        Applies threshold filtering, then selects the top max_keypoints by
-        score. If fewer than max_keypoints pass the threshold, the output is
-        padded with invalid keypoints at (-1, -1) with score 0.
-
-        Args:
-            scores: Corner score map of shape (B, H, W).
-            nms_mask: NMS mask of shape (B, H, W).
-
-        Returns:
-            Tuple of:
-                - keypoints: Keypoint coordinates of shape (B, K, 2) in (y, x)
-                  format, padded with (-1, -1) for invalid entries.
-                - keypoint_scores: Scores for each keypoint of shape (B, K),
-                  padded with 0.0 for invalid entries.
-        """
-        B, H, W = scores.shape
-        K = self.max_keypoints
-
-        # Apply NMS mask and threshold
-        scores_masked = scores * nms_mask  # (B, H, W)
-        scores_masked = torch.where(
-            scores_masked > self.score_threshold,
-            scores_masked,
-            torch.zeros_like(scores_masked),
-        )
-
-        # Flatten spatial dimensions
-        scores_flat = scores_masked.reshape(B, -1)  # (B, H*W)
-
-        # Get top-k scores and indices
-        topk_scores, topk_indices = torch.topk(
-            scores_flat,
-            k=K,
-            dim=1,
-            largest=True,
-            sorted=True,
-        )  # topk_scores: (B, K), topk_indices: (B, K)
-
-        # Convert flat indices to (y, x) coordinates
-        y_coords = (topk_indices // W).float()  # (B, K)
-        x_coords = (topk_indices % W).float()  # (B, K)
-
-        # Stack to create keypoint coordinates (B, K, 2)
-        keypoints = torch.stack([y_coords, x_coords], dim=-1)
-
-        # Create validity mask (score > 0 means valid keypoint)
-        valid_mask = (topk_scores > 0).float()  # (B, K)
-
-        # Replace invalid keypoints with (-1, -1)
-        # Use full_like to create a tensor filled with -1.0
-        invalid_keypoints = torch.full_like(keypoints, -1.0)
-        keypoints = torch.where(
-            valid_mask.unsqueeze(-1) > 0.5,
-            keypoints,
-            invalid_keypoints,
-        )
-
-        # Set invalid scores to 0
-        topk_scores = topk_scores * valid_mask
-
-        return keypoints, topk_scores
-
     def _extract_descriptors_at_keypoints_batched(
         self,
         descriptor_map: torch.Tensor,
@@ -248,14 +138,12 @@ class ShiTomasiBADSinkhornMatcher(nn.Module):
             keypoints.
         """
         B, D, H, W = descriptor_map.shape
-        # K = keypoints.shape[1]
 
         # Create validity mask (keypoints with y >= 0 are valid)
         valid_mask = (keypoints[:, :, 0] >= 0).float()  # (B, K)
 
         # Clamp keypoints to valid range for extraction
         # (invalid ones will be masked out anyway)
-        # Clamp y coordinates to [0, H-1] and x coordinates to [0, W-1]
         y_coords = torch.clamp(keypoints[:, :, 0], min=0.0, max=float(H - 1))
         x_coords = torch.clamp(keypoints[:, :, 1], min=0.0, max=float(W - 1))
         keypoints_clamped = torch.stack([y_coords, x_coords], dim=-1)
@@ -305,12 +193,16 @@ class ShiTomasiBADSinkhornMatcher(nn.Module):
         scores2 = scores2.squeeze(1)
 
         # 2. Apply NMS to both score maps
-        nms_mask1 = self._apply_nms_maxpool(scores1)  # (B, H, W)
-        nms_mask2 = self._apply_nms_maxpool(scores2)
+        nms_mask1 = apply_nms_maxpool(scores1, self.nms_radius)
+        nms_mask2 = apply_nms_maxpool(scores2, self.nms_radius)
 
         # 3. Select top-k keypoints from both images
-        keypoints1, kp_scores1 = self._select_topk_keypoints(scores1, nms_mask1)
-        keypoints2, kp_scores2 = self._select_topk_keypoints(scores2, nms_mask2)
+        keypoints1, _ = select_topk_keypoints(
+            scores1, nms_mask1, self.max_keypoints, self.score_threshold,
+        )
+        keypoints2, _ = select_topk_keypoints(
+            scores2, nms_mask2, self.max_keypoints, self.score_threshold,
+        )
 
         # 4. Extract descriptors at keypoint locations
         desc1 = self._extract_descriptors_at_keypoints_batched(desc_map1, keypoints1)
