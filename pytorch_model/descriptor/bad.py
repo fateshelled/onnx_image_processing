@@ -331,3 +331,246 @@ def extract_descriptors_at_keypoints_subpixel(
     descriptors = sampled.squeeze(-1).permute(0, 2, 1)
 
     return descriptors
+
+
+class SparseBAD(nn.Module):
+    """
+    Sparse BAD descriptor computation at keypoint locations only.
+
+    Instead of computing dense descriptors for all pixels, this module
+    computes BAD descriptors only at specified keypoint locations. This is
+    more efficient when the number of keypoints is much smaller than the
+    total number of pixels.
+
+    Supports both non-oriented mode (for Shi-Tomasi) and oriented mode
+    (for AKAZE or angle estimation) where pair offsets are rotated according
+    to keypoint orientations for rotation invariance.
+
+    Args:
+        num_pairs: Number of BAD descriptor comparison pairs (descriptor
+                   dimensionality). Must be 256 or 512. Default is 256.
+        binarize: If True, output binarized BAD descriptors. Default is False.
+        soft_binarize: If True and binarize=True, use sigmoid for soft
+                       binarization. Default is True.
+        temperature: Temperature for soft sigmoid binarization. Default is 10.0.
+        normalize_descriptors: If True, L2-normalize descriptors. Default is True.
+        sampling_mode: Sampling mode for grid_sample ('nearest' or 'bilinear').
+                       Default is 'nearest'.
+
+    Example:
+        >>> # Non-oriented mode (Shi-Tomasi)
+        >>> sparse_bad = SparseBAD(num_pairs=256)
+        >>> img = torch.randn(1, 1, 480, 640)
+        >>> keypoints = torch.randint(0, 480, (1, 100, 2)).float()  # (B, K, 2)
+        >>> desc = sparse_bad(img, keypoints)
+        >>> print(desc.shape)  # [1, 100, 256]
+        >>>
+        >>> # Oriented mode (AKAZE/angle estimation)
+        >>> orientation = torch.randn(1, 1, 480, 640)  # Orientation map
+        >>> desc_oriented = sparse_bad(img, keypoints, orientation)
+        >>> print(desc_oriented.shape)  # [1, 100, 256]
+    """
+
+    def __init__(
+        self,
+        num_pairs: int = 256,
+        binarize: bool = False,
+        soft_binarize: bool = True,
+        temperature: float = 10.0,
+        normalize_descriptors: bool = True,
+        sampling_mode: str = "nearest",
+    ):
+        super().__init__()
+
+        if num_pairs not in (256, 512):
+            raise ValueError(
+                f"num_pairs must be 256 or 512 to use learned BAD patterns, got {num_pairs}"
+            )
+        if sampling_mode not in ("nearest", "bilinear"):
+            raise ValueError(
+                f"sampling_mode must be 'nearest' or 'bilinear', got {sampling_mode}"
+            )
+
+        self.num_pairs = num_pairs
+        self.binarize = binarize
+        self.soft_binarize = soft_binarize
+        self.temperature = temperature
+        self.normalize_descriptors = normalize_descriptors
+        self.sampling_mode = sampling_mode
+
+        # Load learned BAD parameters
+        box_params, thresholds = _get_bad_learned_params(num_pairs)
+        self.register_buffer("offset_x1", box_params[:, 0] - 16.0)
+        self.register_buffer("offset_x2", box_params[:, 1] - 16.0)
+        self.register_buffer("offset_y1", box_params[:, 2] - 16.0)
+        self.register_buffer("offset_y2", box_params[:, 3] - 16.0)
+        self.register_buffer("radii", box_params[:, 4].to(torch.int64))
+        self.register_buffer("thresholds", thresholds)
+
+        # Pre-reshape buffers for performance and ONNX graph clarity
+        self.register_buffer("offset_y1_v", self.offset_y1.view(1, 1, -1))
+        self.register_buffer("offset_x1_v", self.offset_x1.view(1, 1, -1))
+        self.register_buffer("offset_y2_v", self.offset_y2.view(1, 1, -1))
+        self.register_buffer("offset_x2_v", self.offset_x2.view(1, 1, -1))
+        self.register_buffer("thresholds_v", self.thresholds.view(1, 1, -1))
+
+        # One-hot selection matrix mapping each pair to its radius channel
+        max_radius = int(torch.max(self.radii).item())
+        self.max_radius = max_radius
+        radius_select = torch.zeros(max_radius + 1, num_pairs)
+        for i in range(num_pairs):
+            radius_select[int(self.radii[i].item()), i] = 1.0
+        self.register_buffer("radius_select", radius_select)
+
+        # Bank of normalized box kernels for each radius
+        coords = torch.arange(-max_radius, max_radius + 1, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(coords, coords, indexing="ij")
+        radius_values = torch.arange(max_radius + 1, dtype=torch.float32).view(-1, 1, 1)
+        square_masks = (
+            (grid_y.abs() <= radius_values) & (grid_x.abs() <= radius_values)
+        ).to(torch.float32)
+        denom = ((2.0 * radius_values + 1.0) ** 2).clamp_min(1.0)
+        kernel_bank = (square_masks / denom).unsqueeze(1)
+        self.register_buffer("box_kernel_bank", kernel_bank)
+
+    def forward(
+        self,
+        image: torch.Tensor,
+        keypoints: torch.Tensor,
+        orientation: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute BAD descriptors at keypoint locations.
+
+        Args:
+            image: Input grayscale image of shape (B, 1, H, W).
+            keypoints: Keypoint coordinates of shape (B, K, 2) in (y, x) format.
+                       Invalid keypoints at (-1, -1) are handled by clamping
+                       and subsequent masking.
+            orientation: Optional orientation map of shape (B, 1, H, W) in radians.
+                        If provided, pair offsets are rotated for rotation
+                        invariance. If None, uses non-oriented mode.
+
+        Returns:
+            Descriptors of shape (B, K, num_pairs) at keypoint locations.
+            Invalid keypoints get zero descriptors.
+        """
+        _B, _C, H, W = image.shape
+
+        # Validity mask before clamping
+        valid_mask = (keypoints[:, :, 0] >= 0).float()  # (B, K)
+
+        # Clamp invalid keypoints to valid range for sampling
+        y_clamped = torch.clamp(keypoints[:, :, 0], min=0.0, max=float(H - 1))
+        x_clamped = torch.clamp(keypoints[:, :, 1], min=0.0, max=float(W - 1))
+        kp_clamped = torch.stack([y_clamped, x_clamped], dim=-1)  # (B, K, 2)
+
+        # Normalization scales for pixel -> [-1, 1] conversion
+        norm_scale_y = 2.0 / (H - 1 + 1e-8)
+        norm_scale_x = 2.0 / (W - 1 + 1e-8)
+
+        # Precompute box-averaged image bank
+        kernels = self.box_kernel_bank.to(device=image.device, dtype=image.dtype)
+        padded = F.pad(
+            image,
+            (self.max_radius, self.max_radius, self.max_radius, self.max_radius),
+            mode="replicate",
+        )
+        box_avg_bank = F.conv2d(padded, kernels, stride=1)  # (B, R+1, H, W)
+
+        # Use pre-reshaped buffers, casting to the correct dtype
+        offset_y1 = self.offset_y1_v.to(dtype=image.dtype)
+        offset_x1 = self.offset_x1_v.to(dtype=image.dtype)
+        offset_y2 = self.offset_y2_v.to(dtype=image.dtype)
+        offset_x2 = self.offset_x2_v.to(dtype=image.dtype)
+
+        if orientation is not None:
+            # Oriented mode: rotate offsets by keypoint orientations
+            # Sample orientation at keypoint locations
+            ky_norm = y_clamped * norm_scale_y - 1.0  # (B, K)
+            kx_norm = x_clamped * norm_scale_x - 1.0
+            orient_grid = torch.stack([kx_norm, ky_norm], dim=-1).unsqueeze(2)  # (B, K, 1, 2)
+            theta = F.grid_sample(
+                orientation,
+                orient_grid,
+                mode="nearest",
+                padding_mode="border",
+                align_corners=True,
+            ).squeeze(1).squeeze(-1)  # (B, K)
+
+            cos_t = torch.cos(theta).unsqueeze(-1)  # (B, K, 1)
+            sin_t = torch.sin(theta).unsqueeze(-1)
+
+            # 2-D rotation [cos -sin; sin cos] applied to (ox, oy) offsets
+            rot_dy1 = offset_x1 * sin_t + offset_y1 * cos_t  # (B, K, P)
+            rot_dx1 = offset_x1 * cos_t - offset_y1 * sin_t
+            rot_dy2 = offset_x2 * sin_t + offset_y2 * cos_t
+            rot_dx2 = offset_x2 * cos_t - offset_y2 * sin_t
+
+            # Absolute sample positions
+            kp_y = kp_clamped[:, :, 0:1]  # (B, K, 1)
+            kp_x = kp_clamped[:, :, 1:2]
+
+            pos1_y = kp_y + rot_dy1  # (B, K, P)
+            pos1_x = kp_x + rot_dx1
+            pos2_y = kp_y + rot_dy2
+            pos2_x = kp_x + rot_dx2
+        else:
+            # Non-oriented mode: use fixed offsets
+            kp_expanded = kp_clamped.unsqueeze(2)  # (B, K, 1, 2)
+
+            pos1_y = kp_expanded[:, :, :, 0] + offset_y1
+            pos1_x = kp_expanded[:, :, :, 1] + offset_x1
+            pos2_y = kp_expanded[:, :, :, 0] + offset_y2
+            pos2_x = kp_expanded[:, :, :, 1] + offset_x2
+
+        # Build normalized grids for grid_sample
+        grid1 = torch.stack(
+            [pos1_x * norm_scale_x - 1.0, pos1_y * norm_scale_y - 1.0],
+            dim=-1,
+        )  # (B, K, P, 2)
+        grid2 = torch.stack(
+            [pos2_x * norm_scale_x - 1.0, pos2_y * norm_scale_y - 1.0],
+            dim=-1,
+        )
+
+        # Sample from box-averaged bank
+        sampled1 = F.grid_sample(
+            box_avg_bank,
+            grid1,
+            mode=self.sampling_mode,
+            padding_mode="border",
+            align_corners=True,
+        )  # (B, R+1, K, P)
+        sampled2 = F.grid_sample(
+            box_avg_bank,
+            grid2,
+            mode=self.sampling_mode,
+            padding_mode="border",
+            align_corners=True,
+        )
+
+        # Select the correct radius channel for each pair via multiply+sum
+        rs = self.radius_select.to(dtype=sampled1.dtype).view(1, -1, 1, self.num_pairs)
+        sample1 = (sampled1 * rs).sum(dim=1)  # (B, K, P)
+        sample2 = (sampled2 * rs).sum(dim=1)
+        diff = sample1 - sample2
+
+        centered = diff - self.thresholds_v.to(diff.dtype)
+
+        # BAD bit is 1 when response <= threshold
+        if not self.binarize:
+            desc = centered
+        elif self.soft_binarize:
+            desc = torch.sigmoid(-centered * self.temperature)
+        else:
+            desc = (centered <= 0).to(centered.dtype)
+
+        # Zero out invalid keypoints' descriptors
+        desc = desc * valid_mask.unsqueeze(-1)
+
+        # Normalize descriptors if enabled
+        if self.normalize_descriptors:
+            desc = F.normalize(desc, p=2, dim=-1)
+
+        return desc
