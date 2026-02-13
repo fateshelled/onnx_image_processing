@@ -60,3 +60,55 @@ def probability_ratio_filter(
         valid_mask[i] = ratio >= ratio_threshold
 
     return valid_mask
+
+
+def dustbin_margin_filter(
+    P: np.ndarray,
+    margin: float = 0.3,
+) -> np.ndarray:
+    """
+    Filter matches based on the margin between best match and dustbin probabilities.
+
+    The Sinkhorn algorithm with dustbin mechanism assigns probability mass to a
+    "dustbin" (unmatched) state. This filter rejects matches where the dustbin
+    probability is high relative to the best match probability, indicating the
+    point is better left unmatched.
+
+    Args:
+        P: Full Sinkhorn probability matrix of shape (K+1, K+1) including dustbin.
+           P[i, j] for i,j < K are real matches, P[i, K] and P[K, j] are dustbin.
+        margin: Minimum margin that best match probability must exceed dustbin
+               probability. Higher values are more strict. Default is 0.3.
+
+    Returns:
+        valid_mask: Boolean array of shape (K,) where True indicates the point i
+                   has a sufficiently strong match compared to its dustbin probability.
+
+    Example:
+        >>> # Point 0: best_match=0.7, dustbin=0.2 -> margin=0.5 (PASS with margin=0.3)
+        >>> # Point 1: best_match=0.4, dustbin=0.5 -> margin=-0.1 (FAIL)
+        >>> P = np.array([[0.7, 0.1, 0.2],
+        ...               [0.2, 0.3, 0.5],
+        ...               [0.1, 0.6, 0.3]])
+        >>> mask = dustbin_margin_filter(P, margin=0.3)
+        >>> # Only point 0 passes
+    """
+    K = P.shape[0] - 1  # Exclude dustbin row/column
+
+    # Extract dustbin probabilities for each point
+    # P[i, K] is the probability that point i in image1 goes to dustbin
+    dustbin_probs = P[:K, K]  # Shape: (K,)
+
+    # Extract best match probabilities (excluding dustbin)
+    # For each point i, find the maximum probability among real matches
+    P_core = P[:K, :K]  # Shape: (K, K)
+    best_match_probs = np.max(P_core, axis=1)  # Shape: (K,)
+
+    # Calculate margin: best_match - dustbin
+    # Positive margin means the point prefers a real match over dustbin
+    margins = best_match_probs - dustbin_probs
+
+    # Accept points where margin exceeds the threshold
+    valid_mask = margins >= margin
+
+    return valid_mask

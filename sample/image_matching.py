@@ -27,7 +27,10 @@ from PIL import Image, ImageDraw
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from pytorch_model.matching.outlier_filters import probability_ratio_filter
+from pytorch_model.matching.outlier_filters import (
+    probability_ratio_filter,
+    dustbin_margin_filter,
+)
 
 
 def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Image.Image]:
@@ -58,6 +61,7 @@ def extract_matches(
     threshold: float = 0.1,
     max_matches: int = 100,
     ratio_threshold: float = None,
+    dustbin_margin: float = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract mutual nearest-neighbor matches from the Sinkhorn probability matrix.
@@ -68,8 +72,11 @@ def extract_matches(
     - i is the argmax of P[:N, j] (best match for j)
     and the match probability exceeds the threshold.
 
-    Optionally, a probability ratio filter can be applied to reject ambiguous matches
-    where the best match probability is not significantly higher than the second-best.
+    Optionally, additional outlier filters can be applied:
+    - Probability ratio filter: Rejects ambiguous matches where the best match
+      probability is not significantly higher than the second-best.
+    - Dustbin margin filter: Rejects matches where the dustbin (unmatched)
+      probability is too high relative to the best match probability.
 
     Args:
         matching_probs: Sinkhorn probability matrix of shape (1, K+1, K+1).
@@ -79,6 +86,8 @@ def extract_matches(
         max_matches: Maximum number of matches to return. Default is 100.
         ratio_threshold: Minimum ratio between best and second-best match probabilities.
                         If None, ratio filtering is disabled. Default is None.
+        dustbin_margin: Minimum margin between best match and dustbin probabilities.
+                       If None, dustbin margin filtering is disabled. Default is None.
 
     Returns:
         Tuple of:
@@ -110,6 +119,11 @@ def extract_matches(
     if ratio_threshold is not None:
         ratio_mask = probability_ratio_filter(P_core, ratio_threshold)
         mutual_mask = mutual_mask & ratio_mask
+
+    # Apply dustbin margin filter if enabled
+    if dustbin_margin is not None:
+        dustbin_mask = dustbin_margin_filter(P, dustbin_margin)
+        mutual_mask = mutual_mask & dustbin_mask
 
     # Get match probabilities
     match_indices_i = np.where(mutual_mask)[0]
@@ -278,6 +292,15 @@ def parse_args():
              "If not specified, ratio filtering is disabled."
     )
     parser.add_argument(
+        "--dustbin-margin",
+        type=float,
+        default=None,
+        help="Dustbin margin threshold for outlier filtering. "
+             "Minimum margin between best match probability and dustbin probability. "
+             "Higher values are more strict (e.g., 0.3 means best match must be 0.3 higher). "
+             "If not specified, dustbin margin filtering is disabled."
+    )
+    parser.add_argument(
         "--max-matches",
         type=int,
         default=100,
@@ -355,11 +378,14 @@ def main():
         threshold=args.threshold,
         max_matches=args.max_matches,
         ratio_threshold=args.ratio_threshold,
+        dustbin_margin=args.dustbin_margin,
     )
 
     filter_info = f"threshold={args.threshold}"
     if args.ratio_threshold is not None:
         filter_info += f", ratio_threshold={args.ratio_threshold}"
+    if args.dustbin_margin is not None:
+        filter_info += f", dustbin_margin={args.dustbin_margin}"
     print(f"Matches found: {len(scores)} ({filter_info})")
 
     if len(scores) == 0:
