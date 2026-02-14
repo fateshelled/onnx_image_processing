@@ -20,6 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pytorch_model.feature_detection.shi_tomasi_sparse_bad_sinkhorn import ShiTomasiSparseBADSinkhornMatcher
+from pytorch_model.feature_detection.match_extraction_wrapper import MatchExtractionWrapper
 from onnx_export.optimize import optimize_onnx_model
 
 
@@ -139,6 +140,25 @@ def parse_args():
         default="nearest",
         help="Sampling mode for sparse BAD descriptor extraction (default: nearest)"
     )
+    # --- Match extraction options ---
+    parser.add_argument(
+        "--with-extraction",
+        action="store_true",
+        help="Add match extraction to the model (outputs matched keypoints instead of probability matrix)"
+    )
+    parser.add_argument(
+        "--max-matches",
+        type=int,
+        default=100,
+        help="Maximum number of matches to return (only used with --with-extraction, default: 100)"
+    )
+    parser.add_argument(
+        "--match-threshold",
+        type=float,
+        default=0.1,
+        help="Minimum match probability threshold (only used with --with-extraction, default: 0.1)"
+    )
+    # --- ONNX export options ---
     parser.add_argument(
         "--opset-version",
         type=int,
@@ -171,7 +191,7 @@ def main():
     # Create model
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
-    model = ShiTomasiSparseBADSinkhornMatcher(
+    base_model = ShiTomasiSparseBADSinkhornMatcher(
         max_keypoints=args.max_keypoints,
         block_size=args.block_size,
         sobel_size=3,
@@ -188,24 +208,50 @@ def main():
         normalize_descriptors=args.normalize_descriptors,
         sampling_mode=args.sampling_mode,
     )
+
+    # Wrap with match extraction if requested
+    if args.with_extraction:
+        model = MatchExtractionWrapper(
+            feature_matcher=base_model,
+            max_matches=args.max_matches,
+            match_threshold=args.match_threshold,
+        )
+    else:
+        model = base_model
+
     model.eval()
 
     # Create dummy inputs (B, 1, H, W)
     dummy_image1 = torch.randn(1, 1, args.height, args.width)
     dummy_image2 = torch.randn(1, 1, args.height, args.width)
 
-    # Configure dynamic axes if requested
-    dynamic_axes = None
-    if args.dynamic_axes:
-        dynamic_axes = {
-            "image1": {0: "batch", 2: "height", 3: "width"},
-            "image2": {0: "batch", 2: "height", 3: "width"},
-            "keypoints1": {0: "batch"},
-            "keypoints2": {0: "batch"},
-            "matching_probs": {0: "batch"},
-        }
+    # Configure output names and dynamic axes based on model type
+    if args.with_extraction:
+        output_names = ["matched_kpts1", "matched_kpts2", "scores", "valid_mask"]
+        dynamic_axes = None
+        if args.dynamic_axes:
+            dynamic_axes = {
+                "image1": {0: "batch", 2: "height", 3: "width"},
+                "image2": {0: "batch", 2: "height", 3: "width"},
+                "matched_kpts1": {0: "batch"},
+                "matched_kpts2": {0: "batch"},
+                "scores": {0: "batch"},
+                "valid_mask": {0: "batch"},
+            }
+    else:
+        output_names = ["keypoints1", "keypoints2", "matching_probs"]
+        dynamic_axes = None
+        if args.dynamic_axes:
+            dynamic_axes = {
+                "image1": {0: "batch", 2: "height", 3: "width"},
+                "image2": {0: "batch", 2: "height", 3: "width"},
+                "keypoints1": {0: "batch"},
+                "keypoints2": {0: "batch"},
+                "matching_probs": {0: "batch"},
+            }
 
     # Export to ONNX
+    model_type = "with match extraction" if args.with_extraction else ""
     torch.onnx.export(
         model,
         (dummy_image1, dummy_image2),
@@ -214,7 +260,7 @@ def main():
         opset_version=args.opset_version,
         do_constant_folding=True,
         input_names=["image1", "image2"],
-        output_names=["keypoints1", "keypoints2", "matching_probs"],
+        output_names=output_names,
         dynamic_axes=dynamic_axes,
         dynamo=not args.disable_dynamo,
     )

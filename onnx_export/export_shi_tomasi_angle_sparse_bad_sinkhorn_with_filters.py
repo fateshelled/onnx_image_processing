@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-ONNX export script for Shi-Tomasi + Angle + Sparse BAD + Sinkhorn matching model.
+ONNX export script for Shi-Tomasi + Angle + Sparse BAD + Sinkhorn matching with outlier filters.
 
-Exports a complete feature matching pipeline that combines Shi-Tomasi corner
-detection, angle estimation, rotation-aware sparse BAD descriptors, and
-Sinkhorn matching. This is analogous to AKAZESparseBADSinkhornMatcher but
-uses Shi-Tomasi instead of AKAZE for feature detection.
+Exports a complete feature matching pipeline with integrated outlier filtering:
+- Probability ratio filter: Rejects ambiguous matches
+- Dustbin margin filter: Rejects matches with high dustbin probability
 
 Usage:
-    python export_shi_tomasi_angle_sparse_bad_sinkhorn.py --output shi_tomasi_angle_sparse_bad_sinkhorn.onnx
-    python export_shi_tomasi_angle_sparse_bad_sinkhorn.py --output model.onnx --max-keypoints 512
-    python export_shi_tomasi_angle_sparse_bad_sinkhorn.py --output model.onnx --num-pairs 512 --binarization soft
+    python export_shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.py --output model.onnx
+    python export_shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.py --output model.onnx --ratio-threshold 2.0
+    python export_shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.py --output model.onnx --dustbin-margin 0.3
+    python export_shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.py --output model.onnx --ratio-threshold 2.0 --dustbin-margin 0.3
 """
 
 import argparse
@@ -23,7 +23,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pytorch_model.feature_detection.shi_tomasi_angle_sparse_bad_sinkhorn import (
-    ShiTomasiAngleSparseBADSinkhornMatcher,
+    ShiTomasiAngleSparseBADSinkhornMatcherWithFilters,
 )
 from pytorch_model.feature_detection.match_extraction_wrapper import MatchExtractionWrapper
 from onnx_export.optimize import optimize_onnx_model
@@ -31,13 +31,13 @@ from onnx_export.optimize import optimize_onnx_model
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Export Shi-Tomasi + Angle + Sparse BAD + Sinkhorn matching model to ONNX format"
+        description="Export Shi-Tomasi + Angle + Sparse BAD + Sinkhorn with outlier filters to ONNX"
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default="shi_tomasi_angle_sparse_bad_sinkhorn.onnx",
-        help="Output ONNX file path (default: shi_tomasi_angle_sparse_bad_sinkhorn.onnx)"
+        default="shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.onnx",
+        help="Output ONNX file path (default: shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.onnx)"
     )
     parser.add_argument(
         "--height", "-H",
@@ -56,6 +56,25 @@ def parse_args():
         type=int,
         default=1024,
         help="Maximum number of keypoints per image (default: 1024)"
+    )
+    # --- Outlier filter parameters ---
+    parser.add_argument(
+        "--ratio-threshold",
+        type=float,
+        default=10.0,
+        help="Probability ratio threshold for outlier filtering. "
+             "Minimum ratio between best and second-best match probabilities. "
+             "Higher values are more strict (e.g., 10.0). "
+             "If not specified, ratio filtering is disabled."
+    )
+    parser.add_argument(
+        "--dustbin-margin",
+        type=float,
+        default=0.3,
+        help="Dustbin margin threshold for outlier filtering. "
+             "Minimum margin between best match and dustbin probabilities. "
+             "Higher values are more strict (e.g., 0.3). "
+             "If not specified, dustbin margin filtering is disabled."
     )
     # --- Shi-Tomasi detector parameters ---
     parser.add_argument(
@@ -90,7 +109,7 @@ def parse_args():
         type=str,
         choices=["none", "soft", "hard"],
         default="hard",
-        help="BAD binarization mode: none (threshold-centered response), soft (sigmoid), hard (binary) (default: hard)"
+        help="BAD binarization mode: none, soft (sigmoid), hard (binary) (default: hard)"
     )
     parser.add_argument(
         "--temperature",
@@ -206,7 +225,7 @@ def main():
     binarize = args.binarization != "none"
     soft_binarize = args.binarization == "soft"
 
-    base_model = ShiTomasiAngleSparseBADSinkhornMatcher(
+    base_model = ShiTomasiAngleSparseBADSinkhornMatcherWithFilters(
         max_keypoints=args.max_keypoints,
         block_size=args.block_size,
         patch_size=args.patch_size,
@@ -219,6 +238,8 @@ def main():
         epsilon=args.epsilon,
         unused_score=args.unused_score,
         distance_type=args.distance_type,
+        ratio_threshold=args.ratio_threshold,
+        dustbin_margin=args.dustbin_margin,
         nms_radius=args.nms_radius,
         score_threshold=args.score_threshold,
         normalize_descriptors=args.normalize_descriptors,
@@ -255,7 +276,7 @@ def main():
                 "valid_mask": {0: "batch"},
             }
     else:
-        output_names = ["keypoints1", "keypoints2", "matching_probs"]
+        output_names = ["keypoints1", "keypoints2", "matching_probs", "valid_mask"]
         dynamic_axes = None
         if args.dynamic_axes:
             dynamic_axes = {
@@ -264,10 +285,11 @@ def main():
                 "keypoints1": {0: "batch"},
                 "keypoints2": {0: "batch"},
                 "matching_probs": {0: "batch"},
+                "valid_mask": {0: "batch"},
             }
 
     # Export to ONNX
-    model_type = "with match extraction" if args.with_extraction else ""
+    model_type = "with match extraction" if args.with_extraction else "with filters"
     print(f"Exporting Shi-Tomasi + Angle + Sparse BAD + Sinkhorn {model_type} to ONNX...")
     torch.onnx.export(
         model,
@@ -291,7 +313,7 @@ def main():
     K = args.max_keypoints
     print(f"\nExported ONNX model to: {args.output}")
     if args.with_extraction:
-        print(f"  Model type: Shi-Tomasi + Angle + Sparse BAD + Sinkhorn + Match Extraction")
+        print(f"  Model type: Shi-Tomasi + Angle + Sparse BAD + Sinkhorn + Filters + Match Extraction")
         print(f"  Input image1 shape: (B, 1, {args.height}, {args.width})")
         print(f"  Input image2 shape: (B, 1, {args.height}, {args.width})")
         print(f"  Output matched_kpts1 shape: (B, {args.max_matches}, 2)")
@@ -301,13 +323,23 @@ def main():
         print(f"  Max matches: {args.max_matches}")
         print(f"  Match threshold: {args.match_threshold}")
     else:
-        print(f"  Model type: Shi-Tomasi + Angle + Sparse BAD + Sinkhorn")
+        print(f"  Model type: Shi-Tomasi + Angle + Sparse BAD + Sinkhorn + Filters")
         print(f"  Input image1 shape: (B, 1, {args.height}, {args.width})")
         print(f"  Input image2 shape: (B, 1, {args.height}, {args.width})")
         print(f"  Output keypoints1 shape: (B, {K}, 2)")
         print(f"  Output keypoints2 shape: (B, {K}, 2)")
         print(f"  Output matching_probs shape: (B, {K + 1}, {K + 1})")
+        print(f"  Output valid_mask shape: (B, {K})")
     print(f"  Max keypoints: {K}")
+    print(f"  Outlier filters:")
+    if args.ratio_threshold is not None:
+        print(f"    - Probability ratio threshold: {args.ratio_threshold}")
+    else:
+        print(f"    - Probability ratio filter: DISABLED")
+    if args.dustbin_margin is not None:
+        print(f"    - Dustbin margin: {args.dustbin_margin}")
+    else:
+        print(f"    - Dustbin margin filter: DISABLED")
     print(f"  Block size: {args.block_size}")
     print(f"  Patch size: {args.patch_size}")
     print(f"  Sigma: {args.sigma}")
