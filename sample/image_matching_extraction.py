@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """
-Image matching sample using Shi-Tomasi + BAD + Sinkhorn ONNX model.
+Image matching sample using ONNX models with built-in match extraction.
 
-Runs end-to-end feature matching between two images using the exported
-ONNX model and visualizes the matched keypoint pairs.
+This script works with ONNX models exported with the --with-extraction flag,
+which directly output matched keypoint pairs instead of probability matrices.
 
 Usage:
-    # First, export the ONNX model:
-    python onnx_export/export_shi_tomasi_bad_sinkhorn.py -o shi_tomasi_bad_sinkhorn.onnx -H 480 -W 640
+    # First, export an ONNX model with match extraction:
+    python onnx_export/export_shi_tomasi_bad_sinkhorn.py \
+        -o model_with_extraction.onnx -H 480 -W 640 \
+        --with-extraction --max-matches 100 --match-threshold 0.1
 
-    # Then, run the sample:
-    python sample/image_matching.py --model shi_tomasi_bad_sinkhorn.onnx --input1 image1.png --input2 image2.png
-    python sample/image_matching.py --model shi_tomasi_bad_sinkhorn.onnx --input1 image1.png --input2 image2.png --threshold 0.1
-    python sample/image_matching.py --model shi_tomasi_bad_sinkhorn.onnx --input1 image1.png --input2 image2.png --max-matches 50
+    # Then, run this sample:
+    python sample/image_matching_extraction.py --model model_with_extraction.onnx --input1 image1.png --input2 image2.png
+    python sample/image_matching_extraction.py --model model_with_extraction.onnx --input1 image1.png --input2 image2.png --colorize
 """
 
 import argparse
 import time
 
 import numpy as np
-import onnxruntime as ort
 from PIL import Image, ImageDraw
 
 from provider_utils import create_session
 
 
-def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Image.Image]:
+def load_image(
+    image_path: str, height: int, width: int
+) -> tuple[np.ndarray, Image.Image]:
     """
     Load an image file as a grayscale float32 array, resized to the model input size.
 
@@ -44,78 +46,6 @@ def load_image(image_path: str, height: int, width: int) -> tuple[np.ndarray, Im
     arr = np.array(img_resized, dtype=np.float32)
     rgb = img_resized.convert("RGB")
     return arr[np.newaxis, np.newaxis, :, :], rgb
-
-
-def extract_matches(
-    matching_probs: np.ndarray,
-    keypoints1: np.ndarray,
-    keypoints2: np.ndarray,
-    threshold: float = 0.1,
-    max_matches: int = 100,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Extract mutual nearest-neighbor matches from the Sinkhorn probability matrix.
-
-    A match between keypoint i in image1 and keypoint j in image2 is accepted
-    when both of the following hold:
-    - j is the argmax of P[i, :M] (best match for i)
-    - i is the argmax of P[:N, j] (best match for j)
-    and the match probability exceeds the threshold.
-
-    Args:
-        matching_probs: Sinkhorn probability matrix of shape (1, K+1, K+1).
-        keypoints1: Keypoints in image1 of shape (1, K, 2) as (y, x).
-        keypoints2: Keypoints in image2 of shape (1, K, 2) as (y, x).
-        threshold: Minimum match probability. Default is 0.1.
-        max_matches: Maximum number of matches to return. Default is 100.
-
-    Returns:
-        Tuple of:
-            - matched_kpts1: (N, 2) matched keypoint coordinates in image1.
-            - matched_kpts2: (N, 2) matched keypoint coordinates in image2.
-            - match_scores: (N,) match probability scores.
-    """
-    P = matching_probs[0]  # (K+1, K+1)
-    kpts1 = keypoints1[0]  # (K, 2)
-    kpts2 = keypoints2[0]  # (K, 2)
-
-    K = kpts1.shape[0]
-
-    # Core probability matrix excluding dustbin
-    P_core = P[:K, :K]  # (K, K)
-
-    # Mutual nearest neighbors
-    max_j_for_i = np.argmax(P_core, axis=1)  # (K,) best match in image2 for each i
-    max_i_for_j = np.argmax(P_core, axis=0)  # (K,) best match in image1 for each j
-
-    # Check mutual consistency: i matches j AND j matches i
-    mutual_mask = np.zeros(K, dtype=bool)
-    for i in range(K):
-        j = max_j_for_i[i]
-        if max_i_for_j[j] == i:
-            mutual_mask[i] = True
-
-    # Get match probabilities
-    match_indices_i = np.where(mutual_mask)[0]
-    match_indices_j = max_j_for_i[match_indices_i]
-    scores = P_core[match_indices_i, match_indices_j]
-
-    # Apply threshold
-    above_threshold = scores >= threshold
-    match_indices_i = match_indices_i[above_threshold]
-    match_indices_j = match_indices_j[above_threshold]
-    scores = scores[above_threshold]
-
-    # Sort by score descending and take top matches
-    sort_order = np.argsort(scores)[::-1][:max_matches]
-    match_indices_i = match_indices_i[sort_order]
-    match_indices_j = match_indices_j[sort_order]
-    scores = scores[sort_order]
-
-    matched_kpts1 = kpts1[match_indices_i]  # (N, 2)
-    matched_kpts2 = kpts2[match_indices_j]  # (N, 2)
-
-    return matched_kpts1, matched_kpts2, scores
 
 
 def score_to_color(normalized_score: float) -> tuple[int, int, int]:
@@ -220,60 +150,44 @@ def visualize_matches(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Image matching sample using Shi-Tomasi + BAD + Sinkhorn ONNX model"
+        description="Image matching sample using ONNX models with built-in match extraction"
     )
     parser.add_argument(
-        "--model", "-m",
+        "--model",
+        "-m",
         type=str,
         required=True,
-        help="Path to the exported ONNX model file"
+        help="Path to the ONNX model file (exported with --with-extraction)",
     )
     parser.add_argument(
-        "--input1", "-i1",
+        "--input1", "-i1", type=str, required=True, help="First input image path"
+    )
+    parser.add_argument(
+        "--input2", "-i2", type=str, required=True, help="Second input image path"
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
         type=str,
-        required=True,
-        help="First input image path"
-    )
-    parser.add_argument(
-        "--input2", "-i2",
-        type=str,
-        required=True,
-        help="Second input image path"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        type=str,
-        default="image_matching_result.png",
-        help="Output visualization image path (default: image_matching_result.png)"
-    )
-    parser.add_argument(
-        "--threshold", "-t",
-        type=float,
-        default=0.1,
-        help="Match probability threshold (default: 0.1)"
-    )
-    parser.add_argument(
-        "--max-matches",
-        type=int,
-        default=100,
-        help="Maximum number of matches to visualize (default: 100)"
+        default="image_matching_extraction_result.png",
+        help="Output visualization image path (default: image_matching_extraction_result.png)",
     )
     parser.add_argument(
         "--circle-radius",
         type=int,
         default=3,
-        help="Radius of keypoint circles in visualization (default: 3)"
+        help="Radius of keypoint circles in visualization (default: 3)",
     )
     parser.add_argument(
         "--line-width",
         type=int,
         default=1,
-        help="Width of match lines in visualization (default: 1)"
+        help="Width of match lines in visualization (default: 1)",
     )
     parser.add_argument(
         "--colorize",
         action="store_true",
-        help="Colorize matches by score (blue=low, red=high)"
+        help="Colorize matches by score (blue=low, red=high)",
     )
     return parser.parse_args()
 
@@ -288,6 +202,15 @@ def main():
 
     input_names = [inp.name for inp in inputs]
     output_names = [out.name for out in outputs]
+
+    # Verify this is a model with match extraction
+    expected_outputs = ["matched_kpts1", "matched_kpts2", "scores", "valid_mask"]
+    if not all(name in output_names for name in expected_outputs):
+        print(f"Error: This model does not have match extraction outputs.")
+        print(f"Expected outputs: {expected_outputs}")
+        print(f"Found outputs: {output_names}")
+        print(f"\nPlease export your model with the --with-extraction flag.")
+        return
 
     # Get model input dimensions
     input_shape1 = inputs[0].shape  # [B, 1, H, W]
@@ -327,26 +250,24 @@ def main():
         )
         elapsed += time.time() - start_time
 
-    keypoints1 = results[0]       # (1, K, 2)
-    keypoints2 = results[1]       # (1, K, 2)
-    matching_probs = results[2]   # (1, K+1, K+1)
+    # Extract results
+    matched_kpts1 = results[0]  # (1, max_matches, 2)
+    matched_kpts2 = results[1]  # (1, max_matches, 2)
+    scores = results[2]  # (1, max_matches)
+    valid_mask = results[3]  # (1, max_matches) - float type for TensorRT compatibility
 
-    print(f"Keypoints in image 1: {keypoints1.shape[1]}")
-    print(f"Keypoints in image 2: {keypoints2.shape[1]}")
-    print(f"Matching probability matrix shape: {list(matching_probs.shape)}")
+    # Filter valid matches (convert float mask to bool)
+    valid_mask_bool = valid_mask[0] > 0.5
+    matched_kpts1 = matched_kpts1[0][valid_mask_bool]  # (N, 2)
+    matched_kpts2 = matched_kpts2[0][valid_mask_bool]  # (N, 2)
+    scores = scores[0][valid_mask_bool]  # (N,)
 
-    # Extract matches
-    matched_kpts1, matched_kpts2, scores = extract_matches(
-        matching_probs,
-        keypoints1,
-        keypoints2,
-        threshold=args.threshold,
-        max_matches=args.max_matches,
-    )
-    print(f"\nMatches found: {len(scores)} (threshold={args.threshold})")
+    print(f"\nMatches found: {len(scores)}")
 
     if len(scores) == 0:
-        print("No matches found. Try lowering --threshold.")
+        print("No matches found. The model may need different parameters:")
+        print("  - Try exporting with a lower --match-threshold")
+        print("  - Try exporting with a higher --max-matches")
         return
 
     print(f"Match score range: [{scores.min():.4f}, {scores.max():.4f}]")
