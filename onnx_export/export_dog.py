@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -57,7 +58,7 @@ def parse_args():
     parser.add_argument(
         "--sigma-ratio",
         type=float,
-        default=1.4142135623730951,  # sqrt(2)
+        default=math.sqrt(2),
         help="Ratio between consecutive sigma values (default: sqrt(2))"
     )
     parser.add_argument(
@@ -83,7 +84,7 @@ def parse_args():
         help="Enable dynamic input shape (batch, height, width)"
     )
     parser.add_argument(
-        "--disable_dynamo",
+        "--disable-dynamo",
         action="store_true",
         help="Disable dynamo"
     )
@@ -97,6 +98,19 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Validate output path to prevent path traversal attacks
+    output_path = Path(args.output).resolve()
+
+    # Ensure parent directory exists
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        print(f"Error: Cannot create output directory: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Use the validated path
+    args.output = str(output_path)
 
     # Create model
     if args.with_score:

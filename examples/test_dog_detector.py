@@ -9,6 +9,7 @@ This script demonstrates:
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -93,19 +94,22 @@ def test_onnx_export():
     print("Testing ONNX Export")
     print("=" * 60)
 
+    # Create temporary directory for test outputs
+    temp_dir = Path(tempfile.mkdtemp())
+
     # Test DoGDetector export
     print("\n1. Exporting DoGDetector...")
     detector = DoGDetector(num_scales=5, sigma_base=1.6)
     detector.eval()
 
     dummy_input = torch.randn(1, 1, 256, 320)
-    output_path = "/tmp/dog_detector_test.onnx"
+    output_path = temp_dir / "dog_detector_test.onnx"
 
     try:
         torch.onnx.export(
             detector,
             dummy_input,
-            output_path,
+            str(output_path),
             export_params=True,
             opset_version=18,
             do_constant_folding=True,
@@ -116,20 +120,20 @@ def test_onnx_export():
         print(f"✓ DoGDetector exported to: {output_path}")
     except Exception as e:
         print(f"✗ DoGDetector export failed: {e}")
-        return False
+        raise RuntimeError(f"DoGDetector ONNX export failed: {e}") from e
 
     # Test DoGDetectorWithScore export
     print("\n2. Exporting DoGDetectorWithScore...")
     detector_score = DoGDetectorWithScore(num_scales=5, sigma_base=1.6)
     detector_score.eval()
 
-    output_path_score = "/tmp/dog_detector_with_score_test.onnx"
+    output_path_score = temp_dir / "dog_detector_with_score_test.onnx"
 
     try:
         torch.onnx.export(
             detector_score,
             dummy_input,
-            output_path_score,
+            str(output_path_score),
             export_params=True,
             opset_version=18,
             do_constant_folding=True,
@@ -140,10 +144,9 @@ def test_onnx_export():
         print(f"✓ DoGDetectorWithScore exported to: {output_path_score}")
     except Exception as e:
         print(f"✗ DoGDetectorWithScore export failed: {e}")
-        return False
+        raise RuntimeError(f"DoGDetectorWithScore ONNX export failed: {e}") from e
 
     print("\n✓ All ONNX exports successful!\n")
-    return True
 
 
 def test_different_scales():
@@ -190,7 +193,7 @@ def main():
         test_different_scales()
 
         # Test ONNX export
-        onnx_success = test_onnx_export()
+        test_onnx_export()
 
         # Summary
         print("=" * 60)
