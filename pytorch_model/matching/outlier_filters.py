@@ -19,6 +19,9 @@ def probability_ratio_filter(
     the second-best alternative. Low ratios indicate ambiguous matches that are
     likely to be outliers.
 
+    This implementation uses vectorized NumPy operations for efficient processing
+    of large keypoint sets.
+
     Args:
         P: Matching probability matrix of shape (K, K) excluding dustbin.
            P[i, j] represents the probability of matching point i to point j.
@@ -37,27 +40,26 @@ def probability_ratio_filter(
         >>> # Points 0 and 1 pass (8.0, 18.0), point 2 fails (1.14)
     """
     K = P.shape[0]
-    valid_mask = np.zeros(K, dtype=bool)
 
-    for i in range(K):
-        # Get top 2 probabilities for point i
-        row_probs = P[i, :]
-        top2_indices = np.argpartition(row_probs, -2)[-2:]
-        top2_probs = row_probs[top2_indices]
-        top2_probs_sorted = np.sort(top2_probs)[::-1]  # Descending order
+    # Handle edge case: if K < 2, cannot compute second-best match
+    if K < 2:
+        # With only one match option, accept all (ratio is infinite)
+        return np.ones(K, dtype=bool)
 
-        best_prob = top2_probs_sorted[0]
-        second_prob = top2_probs_sorted[1]
+    # Sort probabilities along axis 1 (for each row) in descending order
+    # sorted_probs[:, 0] will be best, sorted_probs[:, 1] will be second-best
+    sorted_probs = np.sort(P, axis=1)[:, ::-1]  # Shape: (K, K), descending
 
-        # Calculate ratio (avoid division by zero)
-        if second_prob > 1e-8:
-            ratio = best_prob / second_prob
-        else:
-            # If second best is near zero, best match is very strong
-            ratio = float('inf')
+    # Extract best and second-best probabilities for all points
+    best_prob = sorted_probs[:, 0]      # Shape: (K,)
+    second_prob = sorted_probs[:, 1]    # Shape: (K,)
 
-        # Accept if ratio exceeds threshold
-        valid_mask[i] = ratio >= ratio_threshold
+    # Calculate ratio (avoid division by zero with epsilon)
+    # Using vectorized operations for all points simultaneously
+    ratio = best_prob / (second_prob + 1e-8)  # Shape: (K,)
+
+    # Accept points where ratio exceeds threshold
+    valid_mask = ratio >= ratio_threshold  # Shape: (K,)
 
     return valid_mask
 
