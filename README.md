@@ -4,6 +4,7 @@ ONNX exportable pytorch model for image processing.
 - Feature Detection
   - Shi-Tomasi corner detection
   - AKAZE feature detection
+  - DoG (Difference of Gaussians) feature detection
   - BAD (Box Average Difference) descriptor
   - Shi-Tomasi + BAD unified feature detection
   - Shi-Tomasi + Angle + Sparse BAD (rotation-invariant descriptors)
