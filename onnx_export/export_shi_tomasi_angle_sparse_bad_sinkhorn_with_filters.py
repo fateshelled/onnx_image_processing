@@ -60,16 +60,16 @@ def parse_args():
     parser.add_argument(
         "--ratio-threshold",
         type=float,
-        default=None,
+        default=10.0,
         help="Probability ratio threshold for outlier filtering. "
              "Minimum ratio between best and second-best match probabilities. "
-             "Higher values are more strict (e.g., 2.0). "
+             "Higher values are more strict (e.g., 10.0). "
              "If not specified, ratio filtering is disabled."
     )
     parser.add_argument(
         "--dustbin-margin",
         type=float,
-        default=None,
+        default=0.3,
         help="Dustbin margin threshold for outlier filtering. "
              "Minimum margin between best match and dustbin probabilities. "
              "Higher values are more strict (e.g., 0.3). "

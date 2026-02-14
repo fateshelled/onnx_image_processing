@@ -402,7 +402,8 @@ class SinkhornMatcherWithFilters(SinkhornMatcher):
 
         Returns:
             Tuple of:
-            - P: Matching probability matrix [B, N+1, M+1]
+            - P: Matching probability matrix [B, N+1, M+1] with filters applied
+                 (filtered keypoints are assigned to dustbin)
             - valid_mask: Boolean mask [B, N] indicating valid matches
         """
         # Get base matching probability matrix
@@ -431,4 +432,34 @@ class SinkhornMatcherWithFilters(SinkhornMatcher):
             dustbin_mask = self._dustbin_margin_filter(P, self.dustbin_margin)
             valid_mask = valid_mask & dustbin_mask
 
-        return P, valid_mask
+        # Apply the filter mask to the probability matrix
+        # For invalid keypoints (valid_mask == False), set all match probabilities to 0
+        # and dustbin probability to 1.0 (forcing them to be unmatched)
+        # This is done in an ONNX-compatible way using broadcasting and masking
+
+        # Create a mask for valid rows: [B, N, 1]
+        valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # [B, N, 1]
+
+        # For the core probability matrix (excluding dustbin):
+        # - If valid: keep original probabilities (multiply by 1)
+        # - If invalid: set to 0 (multiply by 0)
+        P_core_filtered = P[:, :N, :M] * valid_mask_expanded  # [B, N, M]
+
+        # For the dustbin column (last column for each keypoint):
+        # - If valid: keep original dustbin probability
+        # - If invalid: set to 1.0 (100% unmatched)
+        # Formula: invalid * 1.0 + valid * original_dustbin_prob
+        invalid_mask_expanded = (1.0 - valid_mask_expanded)  # [B, N, 1]
+        P_dustbin_col = invalid_mask_expanded + valid_mask_expanded * P[:, :N, M:M+1]  # [B, N, 1]
+
+        # Reconstruct the filtered probability matrix
+        # Concatenate core matches and dustbin column: [B, N, M+1]
+        P_filtered_rows = torch.cat([P_core_filtered, P_dustbin_col], dim=-1)
+
+        # Keep the dustbin row unchanged (last row)
+        P_dustbin_row = P[:, N:N+1, :]  # [B, 1, M+1]
+
+        # Combine filtered rows and dustbin row: [B, N+1, M+1]
+        P_filtered = torch.cat([P_filtered_rows, P_dustbin_row], dim=1)
+
+        return P_filtered, valid_mask
