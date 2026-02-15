@@ -109,9 +109,19 @@ def main():
     fast_detector = FASTScore(threshold=threshold, use_nms=use_nms, nms_radius=3)
     fast_detector.eval()
 
-    # Load image
+    # Load image with error handling
     print(f"Loading image: {image_path}")
-    image_tensor, image_rgb = load_image(image_path)
+    try:
+        image_tensor, image_rgb = load_image(image_path)
+    except FileNotFoundError:
+        print(f"Error: Image file '{image_path}' not found.")
+        print("Please provide a valid image path or create a test image.")
+        print("\nUsage: Update 'image_path' variable in main() to point to your image.")
+        return
+    except Exception as e:
+        print(f"Error loading image: {e}")
+        return
+
     print(f"  Image shape: {image_tensor.shape}")
 
     # Detect corners

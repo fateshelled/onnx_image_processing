@@ -2,7 +2,7 @@
 
 ## Overview
 
-This is an ONNX-friendly PyTorch implementation of FAST (Features from Accelerated Segment Test) corner detection, optimized using the "Faster than FAST" (2025) binary encoding strategy.
+This is an ONNX-friendly PyTorch implementation of FAST (Features from Accelerated Segment Test) corner detection, optimized using a binary encoding strategy for GPU-efficient execution.
 
 ## Features
 
@@ -168,7 +168,7 @@ Images are padded with 3 pixels on all sides using replication mode to handle bo
 
 ## References
 
-1. **Faster than FAST** (2025) - Binary encoding optimization strategy
+1. **Binary Encoding Optimization** - GPU-efficient FAST implementation strategy
 2. Rosten, E. & Drummond, T. (2006). "Machine learning for high-speed corner detection." ECCV 2006.
 3. CUDA_ORB implementation - Baseline for optimization
 

@@ -30,7 +30,7 @@ class FASTScore(nn.Module):
         nms_radius: Radius for non-maximum suppression. Default is 3.
 
     Reference:
-        "Faster than FAST" (2025) - Binary encoding optimization for GPU acceleration
+        Binary encoding optimization strategy for GPU-efficient FAST implementation
     """
 
     def __init__(
@@ -56,15 +56,12 @@ class FASTScore(nn.Module):
 
         self.register_buffer('circle_offsets', circle_offsets)
 
-        # Precompute bit masks for 9 consecutive bits
-        # mask_9bits[i] represents a mask with 9 consecutive 1s starting at position i
-        masks = []
-        for i in range(16):
-            mask = 0
-            for j in range(9):
-                mask |= (1 << ((i + j) % 16))
-            masks.append(mask)
-        self.register_buffer('masks_9bits', torch.tensor(masks, dtype=torch.int32))
+        # Precompute powers of 2 for binary encoding
+        powers_of_2 = torch.tensor(
+            [1 << i for i in range(16)],
+            dtype=torch.int32
+        )
+        self.register_buffer('powers_of_2', powers_of_2.view(1, 1, 1, 16))
 
     def _sample_circle_pixels(self, image: torch.Tensor) -> torch.Tensor:
         """
@@ -139,21 +136,10 @@ class FASTScore(nn.Module):
         dark_mask = (diff >= threshold).to(torch.int32)  # (N, H, W, 16)
         bright_mask = (diff <= -threshold).to(torch.int32)  # (N, H, W, 16)
 
-        # Convert bit masks to 16-bit integers
-        # Use bit shifting: bit[i] contributes 2^i to the result
-        bit_positions = torch.arange(16, device=diff.device, dtype=torch.int32)
-        bit_positions = bit_positions.view(1, 1, 1, 16)
-
-        # Compute powers of 2: [1, 2, 4, 8, ..., 32768]
-        powers_of_2 = torch.tensor(
-            [1 << i for i in range(16)],
-            device=diff.device,
-            dtype=torch.int32
-        ).view(1, 1, 1, 16)
-
+        # Convert bit masks to 16-bit integers using precomputed powers of 2
         # Encode: sum of (bit_i * 2^i)
-        dark_bits = (dark_mask * powers_of_2).sum(dim=-1)  # (N, H, W)
-        bright_bits = (bright_mask * powers_of_2).sum(dim=-1)  # (N, H, W)
+        dark_bits = (dark_mask * self.powers_of_2).sum(dim=-1)  # (N, H, W)
+        bright_bits = (bright_mask * self.powers_of_2).sum(dim=-1)  # (N, H, W)
 
         return dark_bits, bright_bits
 
@@ -161,7 +147,7 @@ class FASTScore(nn.Module):
         """
         Detect if there are 9 consecutive bits set in a 16-bit circular pattern.
 
-        Uses bitwise operations to check all 16 possible positions without loops.
+        Uses fully vectorized bitwise operations to check all 16 possible positions in parallel.
 
         Args:
             bits_16: 16-bit encoded states of shape (N, H, W)
@@ -173,28 +159,32 @@ class FASTScore(nn.Module):
         # Create a 24-bit buffer by appending the lower 8 bits to the upper end
         # This allows us to detect patterns like [..., 15, 16, 1, 2, ...]
 
-        # Extract lower 8 bits and upper 16 bits
+        # Extract lower 8 bits
         lower_8 = bits_16 & 0xFF  # bits [0:7]
 
         # Create 24-bit buffer: upper_16_bits | (lower_8_bits << 16)
         # This represents: [bit0, bit1, ..., bit15, bit0, bit1, ..., bit7]
         buffer_24 = bits_16.to(torch.int32) | (lower_8.to(torch.int32) << 16)
 
-        # Check all 16 possible starting positions for 9 consecutive bits
+        # Vectorized check: all 16 possible starting positions for 9 consecutive bits
         # mask for 9 consecutive bits: 0b111111111 = 0x1FF
         mask_9 = 0x1FF
 
-        # Check each position by shifting and masking
-        detections = []
-        for shift in range(16):
-            # Extract 9 bits starting at position 'shift'
-            shifted = (buffer_24 >> shift) & mask_9
-            # Check if all 9 bits are set
-            is_all_set = (shifted == mask_9)
-            detections.append(is_all_set)
+        # Create shift amounts tensor: [0, 1, 2, ..., 15] with shape (16, 1, 1, 1)
+        shifts = torch.arange(16, device=bits_16.device, dtype=torch.int32)
+        shifts = shifts.view(16, *([1] * bits_16.ndim))
+
+        # Expand buffer_24 to (1, N, H, W) for broadcasting
+        buffer_expanded = buffer_24.unsqueeze(0)  # (1, N, H, W)
+
+        # Apply all shifts in parallel: (16, N, H, W)
+        shifted = (buffer_expanded >> shifts) & mask_9
+
+        # Check if all 9 bits are set for each shift position: (16, N, H, W)
+        is_all_set = (shifted == mask_9)
 
         # Combine: detected if ANY of the 16 positions has 9 consecutive bits
-        detected = torch.stack(detections, dim=-1).any(dim=-1)  # (N, H, W)
+        detected = is_all_set.any(dim=0)  # (N, H, W)
 
         return detected
 
