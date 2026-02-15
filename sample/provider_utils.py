@@ -60,7 +60,7 @@ def create_session(
 
     Args:
         model_path: Path to ONNX model file
-        provider: Provider name - "cpu", "cuda", or "tensorrt" (default: "tensorrt")
+        provider: Provider name - "cpu", "cuda", or "tensorrt" (default: "cuda")
         **provider_options: Provider-specific options to override defaults
 
     Returns:
