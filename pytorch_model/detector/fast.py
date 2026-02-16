@@ -147,7 +147,8 @@ class FASTScore(nn.Module):
         """
         Detect if there are 9 consecutive bits set in a 16-bit circular pattern.
 
-        Uses fully vectorized bitwise operations to check all 16 possible positions in parallel.
+        Uses fully vectorized operations with arithmetic-only operations for
+        full ONNX/TensorRT compatibility (no bitwise operations).
 
         Args:
             bits_16: 16-bit encoded states of shape (N, H, W)
@@ -159,29 +160,35 @@ class FASTScore(nn.Module):
         # Create a 24-bit buffer by appending the lower 8 bits to the upper end
         # This allows us to detect patterns like [..., 15, 16, 1, 2, ...]
 
-        # Extract lower 8 bits
-        lower_8 = bits_16 & 0xFF  # bits [0:7]
+        # Extract lower 8 bits using modulo instead of bitwise AND
+        # lower_8 = bits_16 & 0xFF -> bits_16 % 256
+        lower_8 = bits_16 % 256  # bits [0:7]
 
         # Create 24-bit buffer: upper_16_bits | (lower_8_bits << 16)
+        # Since the bits don't overlap, OR can be replaced with addition
         # This represents: [bit0, bit1, ..., bit15, bit0, bit1, ..., bit7]
-        buffer_24 = bits_16.to(torch.int32) | (lower_8.to(torch.int32) << 16)
+        buffer_24 = bits_16.to(torch.int32) + (lower_8.to(torch.int32) * 65536)
 
         # Vectorized check: all 16 possible starting positions for 9 consecutive bits
-        # mask for 9 consecutive bits: 0b111111111 = 0x1FF
-        mask_9 = 0x1FF
+        # mask for 9 consecutive bits: 0b111111111 = 0x1FF = 511
 
-        # Create shift amounts tensor: [0, 1, 2, ..., 15] with shape (16, 1, 1, 1)
-        shifts = torch.arange(16, device=bits_16.device, dtype=torch.int32)
-        shifts = shifts.view(16, *([1] * bits_16.ndim))
+        # Create division factors tensor: [2^0, 2^1, 2^2, ..., 2^15] with shape (16, 1, 1, 1)
+        divisors = torch.tensor(
+            [2 ** i for i in range(16)],
+            device=bits_16.device,
+            dtype=torch.int32
+        )
+        divisors = divisors.view(16, *([1] * bits_16.ndim))
 
         # Expand buffer_24 to (1, N, H, W) for broadcasting
         buffer_expanded = buffer_24.unsqueeze(0)  # (1, N, H, W)
 
-        # Apply all shifts in parallel: (16, N, H, W)
-        shifted = (buffer_expanded >> shifts) & mask_9
+        # Apply all divisions in parallel and mask to 9 bits using modulo
+        # shifted = (buffer_expanded // divisors) & 0x1FF -> % 512
+        shifted = (buffer_expanded // divisors) % 512  # (16, N, H, W)
 
         # Check if all 9 bits are set for each shift position: (16, N, H, W)
-        is_all_set = (shifted == mask_9)
+        is_all_set = (shifted == 511)  # 0x1FF = 511
 
         # Combine: detected if ANY of the 16 positions has 9 consecutive bits
         detected = is_all_set.any(dim=0)  # (N, H, W)
