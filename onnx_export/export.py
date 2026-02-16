@@ -19,16 +19,56 @@ from pathlib import Path
 # Registry of export configurations
 # Each entry: (script_name, output_name, extra_args)
 EXPORT_CONFIGS = [
-    ("export_shi_tomasi.py", "shi_tomasi.onnx", ["--height", "480", "--width", "640"]),
-    ("export_bad.py", "bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
-    ("export_sinkhorn.py", "sinkhorn_matcher.onnx", ["--num-points1", "100", "--num-points2", "100", "--desc-dim", "256"]),
-    ("export_shi_tomasi_bad.py", "shi_tomasi_bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256"]),
-    ("export_shi_tomasi_bad_sinkhorn.py", "shi_tomasi_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "1024"]),
-    ("export_shi_tomasi_sparse_bad_sinkhorn.py", "shi_tomasi_sparse_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "1024"]),
-    ("export_shi_tomasi_angle_sparse_bad.py", "shi_tomasi_angle_sparse_bad.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "1024"]),
-    ("export_shi_tomasi_angle_sparse_bad_sinkhorn.py", "shi_tomasi_angle_sparse_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "1024"]),
-    ("export_akaze.py", "akaze.onnx", ["--height", "480", "--width", "640"]),
-    ("export_akaze_sparse_bad_sinkhorn.py", "akaze_sparse_bad_sinkhorn.onnx", ["--height", "480", "--width", "640", "--num-pairs", "256", "--max-keypoints", "1024"]),
+    (
+        "export_shi_tomasi_bad_sinkhorn.py",
+        "shi_tomasi_bad_sinkhorn.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024"]
+    ),
+    (
+        "export_shi_tomasi_bad_sinkhorn.py",
+        "shi_tomasi_bad_sinkhorn_extraction.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024", "--with-extraction"]
+    ),
+    (
+        "export_shi_tomasi_sparse_bad_sinkhorn.py",
+        "shi_tomasi_sparse_bad_sinkhorn.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024"]
+    ),
+    (
+        "export_shi_tomasi_sparse_bad_sinkhorn.py",
+        "shi_tomasi_sparse_bad_sinkhorn_extraction.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024", "--with-extraction"]
+    ),
+    (
+        "export_shi_tomasi_angle_sparse_bad_sinkhorn.py",
+        "shi_tomasi_angle_sparse_bad_sinkhorn.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024"]
+    ),
+    (
+        "export_shi_tomasi_angle_sparse_bad_sinkhorn.py",
+        "shi_tomasi_angle_sparse_bad_sinkhorn_extraction.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024", "--with-extraction"]
+    ),
+    (
+        "export_shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.py",
+        "shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024"]
+    ),
+    (
+        "export_shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.py",
+        "shi_tomasi_angle_sparse_bad_sinkhorn_with_filters_extraction.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024", "--with-extraction"]
+    ),
+    (
+        "export_akaze_sparse_bad_sinkhorn.py",
+        "akaze_sparse_bad_sinkhorn.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024"]
+    ),
+    (
+        "export_akaze_sparse_bad_sinkhorn.py",
+        "akaze_sparse_bad_sinkhorn_extraction.onnx",
+        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024", "--with-extraction"]
+    ),
 ]
 
 
