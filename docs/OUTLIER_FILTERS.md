@@ -22,9 +22,7 @@ ONNXモデルの推論結果に対してCPU上でフィルタリングを適用�
 python sample/image_matching.py \
   --model model.onnx \
   --input1 img1.png \
-  --input2 img2.png \
-  --ratio-threshold 2.0 \
-  --dustbin-margin 0.3
+  --input2 img2.png
 ```
 
 **メリット**:
