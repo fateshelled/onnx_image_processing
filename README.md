@@ -24,6 +24,10 @@ ONNX exportable pytorch model for image processing.
   - Align depth image to rgb image
 - Point Cloud
   - Voxel Downsampling
+- Visual Odometry
+  - Camera pose estimation
+  - Trajectory management and visualization
+  - ONNX-based feature matching for VO
 
 ## Sample: Feature Detection (Shi-Tomasi + BAD)
 
@@ -97,3 +101,54 @@ python sample/image_matching.py --model shi_tomasi_sparse_bad_sinkhorn.onnx --in
 | `--threshold`, `-t` | `0.1` | Minimum match probability threshold |
 | `--max-matches` | `100` | Maximum number of matches to visualize |
 | `--colorize` | (flag) | Colorize match lines by confidence (blue=low, red=high) |
+
+---
+
+## Sample: Visual Odometry
+
+Estimate camera trajectory from video or image sequence using the ONNX feature matching model.
+
+### 1. Export ONNX model
+
+```bash
+python onnx_export/export_shi_tomasi_angle_sparse_bad_sinkhorn.py -o matcher.onnx -H 480 -W 640 --max-keypoints 512
+```
+
+### 2. Run visual odometry
+
+```bash
+# From video file
+python sample/visual_odometry.py --model matcher.onnx --video video.mp4 --fx 525 --fy 525 --cx 320 --cy 240 --save-trajectory trajectory.npz --save-plot trajectory.png
+
+# From image sequence
+python sample/visual_odometry.py --model matcher.onnx --image-dir frames/ --fx 525 --fy 525 --cx 320 --cy 240 --save-plot trajectory_3d.png --plot-3d
+```
+
+### Requirements
+
+```bash
+pip install torch onnx onnxruntime onnxscript numpy opencv-python matplotlib
+```
+
+#### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--model`, `-m` | (required) | Path to the exported ONNX model file |
+| `--video`, `-v` | (mutually exclusive) | Input video file path |
+| `--image-dir`, `-d` | (mutually exclusive) | Input image directory path |
+| `--fx` | (required) | Focal length in x direction (pixels) |
+| `--fy` | (required) | Focal length in y direction (pixels) |
+| `--cx` | (required) | Principal point x coordinate (pixels) |
+| `--cy` | (required) | Principal point y coordinate (pixels) |
+| `--match-threshold`, `-t` | `0.1` | Match probability threshold |
+| `--ransac-threshold` | `1.0` | RANSAC reprojection threshold (pixels) |
+| `--min-matches` | `20` | Minimum number of matches required |
+| `--skip-frames` | `0` | Process every N-th frame (0=all frames) |
+| `--max-frames` | `None` | Maximum number of frames to process |
+| `--save-trajectory` | `None` | Save trajectory to file (*.npz) |
+| `--save-plot` | `None` | Save trajectory plot to file (*.png) |
+| `--plot-3d` | (flag) | Plot 3D trajectory instead of 2D |
+| `--quiet`, `-q` | (flag) | Suppress progress output |
+
+For detailed documentation, see [docs/VISUAL_ODOMETRY.md](docs/VISUAL_ODOMETRY.md).
