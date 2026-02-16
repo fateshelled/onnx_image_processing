@@ -31,7 +31,8 @@ def optimize_onnx_model(model_path: str) -> str:
     try:
         model_simplified, check = onnxsim.simplify(model)
         if check:
-            onnx.save(model_simplified, model_path)
+            # Save without external data file to keep all data in a single .onnx file
+            onnx.save(model_simplified, model_path, save_as_external_data=False)
             return "onnxsim"
         else:
             raise RuntimeError("onnxsim simplify check failed")
@@ -41,7 +42,8 @@ def optimize_onnx_model(model_path: str) -> str:
     # Fallback to onnxoptimizer
     try:
         model_optimized = onnxoptimizer.optimize(model)
-        onnx.save(model_optimized, model_path)
+        # Save without external data file to keep all data in a single .onnx file
+        onnx.save(model_optimized, model_path, save_as_external_data=False)
         return "onnxoptimizer"
     except Exception as e:
         print(f"  onnxoptimizer failed ({e}), saving unoptimized model.")
