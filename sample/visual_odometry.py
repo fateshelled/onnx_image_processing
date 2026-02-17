@@ -15,6 +15,9 @@ Usage:
     # Run VO on image sequence:
     python sample/visual_odometry.py --model matcher.onnx --image-dir frames/ --fx 525 --fy 525 --cx 320 --cy 240
 
+    # Run VO on webcam:
+    python sample/visual_odometry.py --model matcher.onnx --camera 0 --fx 525 --fy 525 --cx 320 --cy 240 --display
+
     # Save trajectory and visualization:
     python sample/visual_odometry.py --model matcher.onnx --video video.mp4 --fx 525 --fy 525 --cx 320 --cy 240 --save-trajectory trajectory.npz --save-plot trajectory.png
 """
@@ -131,20 +134,32 @@ def extract_matches(
 
 
 class VideoReader:
-    """Read frames from video file or image sequence."""
+    """Read frames from video file, image sequence, or webcam."""
 
-    def __init__(self, source: str, is_video: bool = True):
+    def __init__(self, source, is_video: bool = True, is_camera: bool = False):
         """
         Initialize video reader.
 
         Args:
-            source: Video file path or image directory
+            source: Video file path, image directory, or camera device ID
             is_video: If True, read from video file; otherwise from image directory
+            is_camera: If True, read from webcam (source should be camera ID)
         """
         self.is_video = is_video
+        self.is_camera = is_camera
         self.source = source
 
-        if is_video:
+        if is_camera:
+            # Open webcam
+            self.cap = cv2.VideoCapture(int(source))
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Failed to open camera: {source}")
+            self.total_frames = float('inf')  # Unlimited for camera
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+            if self.fps == 0:
+                self.fps = 30.0  # Default FPS for cameras
+        elif is_video:
+            # Open video file
             self.cap = cv2.VideoCapture(source)
             if not self.cap.isOpened():
                 raise RuntimeError(f"Failed to open video: {source}")
@@ -171,7 +186,7 @@ class VideoReader:
         Returns:
             Tuple of (success, frame)
         """
-        if self.is_video:
+        if self.is_camera or self.is_video:
             ret, frame = self.cap.read()
             return ret, frame
         else:
@@ -183,7 +198,7 @@ class VideoReader:
 
     def release(self):
         """Release resources."""
-        if self.is_video:
+        if self.is_camera or self.is_video:
             self.cap.release()
 
     def __len__(self) -> int:
@@ -203,9 +218,10 @@ def run_visual_odometry(
     skip_frames: int = 1,
     max_frames: int = None,
     verbose: bool = True,
+    display: bool = False,
 ) -> Trajectory:
     """
-    Run visual odometry on video/image sequence.
+    Run visual odometry on video/image sequence/webcam.
 
     Args:
         session: ONNX Runtime session
@@ -219,6 +235,7 @@ def run_visual_odometry(
         skip_frames: Process every N-th frame
         max_frames: Maximum number of frames to process
         verbose: Print progress information
+        display: Display frames and trajectory in real-time
 
     Returns:
         Trajectory object containing camera poses
@@ -234,6 +251,7 @@ def run_visual_odometry(
         raise RuntimeError("Failed to read first frame")
 
     prev_image = load_image_from_array(prev_frame, model_height, model_width)
+    display_frame = prev_frame.copy() if display else None
 
     frame_count = 0
     processed_count = 0
@@ -242,6 +260,8 @@ def run_visual_odometry(
 
     if verbose:
         print(f"Processing frames (skip={skip_frames})...")
+        if display:
+            print("Press 'q' to quit, 's' to save current trajectory")
 
     start_time = time.time()
 
@@ -314,14 +334,51 @@ def run_visual_odometry(
 
         # Update previous frame
         prev_image = curr_image
+        display_frame = curr_frame.copy() if display else None
 
         if verbose and processed_count % 10 == 0:
             elapsed = time.time() - start_time
             fps = processed_count / elapsed
-            print(f"Frame {frame_count}/{reader.total_frames}: "
-                  f"matches={num_matches}, inliers={num_inliers}, "
-                  f"position={trajectory.get_current_position()}, "
-                  f"fps={fps:.1f}")
+            if reader.is_camera or reader.total_frames == float('inf'):
+                print(f"Frame {frame_count}: "
+                      f"matches={num_matches}, inliers={num_inliers}, "
+                      f"position={trajectory.get_current_position()}, "
+                      f"fps={fps:.1f}")
+            else:
+                print(f"Frame {frame_count}/{reader.total_frames}: "
+                      f"matches={num_matches}, inliers={num_inliers}, "
+                      f"position={trajectory.get_current_position()}, "
+                      f"fps={fps:.1f}")
+
+        # Display frame and trajectory in real-time
+        if display and display_frame is not None:
+            # Draw trajectory info on frame
+            info_frame = display_frame.copy()
+            pos = trajectory.get_current_position()
+            dist = trajectory.get_trajectory_length()
+
+            cv2.putText(info_frame, f"Frame: {frame_count}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(info_frame, f"Distance: {dist:.2f}m", (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(info_frame, f"Matches: {num_matches}", (10, 120),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(info_frame, f"Inliers: {num_inliers}", (10, 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.imshow('Visual Odometry', info_frame)
+
+            # Check for key press
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\nQuitting...")
+                break
+            elif key == ord('s'):
+                save_path = f"trajectory_{int(time.time())}.npz"
+                trajectory.save_to_file(save_path)
+                print(f"\nTrajectory saved to: {save_path}")
 
     elapsed = time.time() - start_time
 
@@ -354,6 +411,11 @@ def parse_args():
         "--image-dir", "-d",
         type=str,
         help="Input image directory path"
+    )
+    source_group.add_argument(
+        "--camera", "-c",
+        type=int,
+        help="Webcam device ID (e.g., 0 for default camera)"
     )
 
     # Model and camera parameters
@@ -439,6 +501,11 @@ def parse_args():
         help="Plot 3D trajectory instead of 2D"
     )
     parser.add_argument(
+        "--display",
+        action="store_true",
+        help="Display frames and trajectory in real-time (press 'q' to quit, 's' to save)"
+    )
+    parser.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress progress output"
@@ -478,33 +545,43 @@ def main():
     )
     print(f"\nCamera intrinsics: {camera_intrinsics}")
 
-    # Open video/image source
-    if args.video:
+    # Open video/image/camera source
+    if args.camera is not None:
+        print(f"\nOpening camera: {args.camera}")
+        reader = VideoReader(args.camera, is_video=False, is_camera=True)
+    elif args.video:
         print(f"\nOpening video: {args.video}")
-        reader = VideoReader(args.video, is_video=True)
+        reader = VideoReader(args.video, is_video=True, is_camera=False)
     else:
         print(f"\nOpening image directory: {args.image_dir}")
-        reader = VideoReader(args.image_dir, is_video=False)
+        reader = VideoReader(args.image_dir, is_video=False, is_camera=False)
 
-    print(f"Total frames: {len(reader)}")
+    if reader.is_camera:
+        print(f"Camera mode (unlimited frames)")
+    else:
+        print(f"Total frames: {len(reader)}")
     print(f"FPS: {reader.fps:.2f}")
 
     # Run visual odometry
-    trajectory = run_visual_odometry(
-        session,
-        reader,
-        camera_intrinsics,
-        model_height,
-        model_width,
-        match_threshold=args.match_threshold,
-        ransac_threshold=args.ransac_threshold,
-        min_matches=args.min_matches,
-        skip_frames=args.skip_frames,
-        max_frames=args.max_frames,
-        verbose=not args.quiet,
-    )
-
-    reader.release()
+    try:
+        trajectory = run_visual_odometry(
+            session,
+            reader,
+            camera_intrinsics,
+            model_height,
+            model_width,
+            match_threshold=args.match_threshold,
+            ransac_threshold=args.ransac_threshold,
+            min_matches=args.min_matches,
+            skip_frames=args.skip_frames,
+            max_frames=args.max_frames,
+            verbose=not args.quiet,
+            display=args.display,
+        )
+    finally:
+        reader.release()
+        if args.display:
+            cv2.destroyAllWindows()
 
     # Save trajectory if requested
     if args.save_trajectory:

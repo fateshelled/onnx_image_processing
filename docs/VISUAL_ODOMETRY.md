@@ -86,6 +86,21 @@ python sample/visual_odometry.py \
     --save-plot trajectory.png
 ```
 
+#### From Webcam (Real-time)
+
+```bash
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --fx 525.0 \
+    --fy 525.0 \
+    --cx 319.5 \
+    --cy 239.5 \
+    --display
+```
+
+Press `q` to quit or `s` to save trajectory during real-time processing.
+
 #### 3D Trajectory Visualization
 
 ```bash
@@ -107,7 +122,7 @@ python sample/visual_odometry.py \
 | Option | Description |
 |--------|-------------|
 | `--model`, `-m` | Path to ONNX model file |
-| `--video`, `-v` OR `--image-dir`, `-d` | Input video file or image directory |
+| `--video`, `-v` OR `--image-dir`, `-d` OR `--camera`, `-c` | Input source: video file, image directory, or camera device ID |
 | `--fx` | Focal length in x direction (pixels) |
 | `--fy` | Focal length in y direction (pixels) |
 | `--cx` | Principal point x coordinate (pixels) |
@@ -122,6 +137,7 @@ python sample/visual_odometry.py \
 | `--min-matches` | 20 | Minimum number of matches required |
 | `--skip-frames` | 0 | Process every N-th frame (0=all frames) |
 | `--max-frames` | None | Maximum number of frames to process |
+| `--display` | False | Display frames and trajectory in real-time |
 | `--save-trajectory` | None | Save trajectory to file (*.npz) |
 | `--save-plot` | None | Save trajectory plot (*.png) |
 | `--plot-3d` | False | Plot 3D trajectory instead of 2D |

@@ -122,6 +122,9 @@ python sample/visual_odometry.py --model matcher.onnx --video video.mp4 --fx 525
 
 # From image sequence
 python sample/visual_odometry.py --model matcher.onnx --image-dir frames/ --fx 525 --fy 525 --cx 320 --cy 240 --save-plot trajectory_3d.png --plot-3d
+
+# From webcam (real-time)
+python sample/visual_odometry.py --model matcher.onnx --camera 0 --fx 525 --fy 525 --cx 320 --cy 240 --display
 ```
 
 ### Requirements
@@ -137,6 +140,7 @@ pip install torch onnx onnxruntime onnxscript numpy opencv-python matplotlib
 | `--model`, `-m` | (required) | Path to the exported ONNX model file |
 | `--video`, `-v` | (mutually exclusive) | Input video file path |
 | `--image-dir`, `-d` | (mutually exclusive) | Input image directory path |
+| `--camera`, `-c` | (mutually exclusive) | Webcam device ID (e.g., 0) |
 | `--fx` | (required) | Focal length in x direction (pixels) |
 | `--fy` | (required) | Focal length in y direction (pixels) |
 | `--cx` | (required) | Principal point x coordinate (pixels) |
@@ -146,6 +150,7 @@ pip install torch onnx onnxruntime onnxscript numpy opencv-python matplotlib
 | `--min-matches` | `20` | Minimum number of matches required |
 | `--skip-frames` | `0` | Process every N-th frame (0=all frames) |
 | `--max-frames` | `None` | Maximum number of frames to process |
+| `--display` | (flag) | Display frames and trajectory in real-time |
 | `--save-trajectory` | `None` | Save trajectory to file (*.npz) |
 | `--save-plot` | `None` | Save trajectory plot to file (*.png) |
 | `--plot-3d` | (flag) | Plot 3D trajectory instead of 2D |
