@@ -119,7 +119,7 @@ def main():
             *extra_args
         ]
         if args.disable_dynamo:
-            cmd.append("--disable_dynamo")
+            cmd.append("--disable-dynamo")
         if args.no_optimize:
             cmd.append("--no-optimize")
 
@@ -144,7 +144,7 @@ def main():
                 "--output", str(dynamic_output_path),
                 *extra_args,
                 "--dynamic-axes",
-                "--disable_dynamo",
+                "--disable-dynamo",
             ]
             if args.no_optimize:
                 cmd_dynamic.append("--no-optimize")

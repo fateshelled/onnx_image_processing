@@ -70,7 +70,7 @@ def parse_args():
         help="Enable dynamic input shape (batch, height, width)"
     )
     parser.add_argument(
-        "--disable_dynamo",
+        "--disable-dynamo",
         action="store_true",
         help="Disable dynamo"
     )

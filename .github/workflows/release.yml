@@ -17,7 +17,7 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-      options: --user 0--shm-size=2gb
+      options: --user 0 --shm-size=2gb
 
     steps:
       - name: Checkout repository
@@ -29,7 +29,7 @@ jobs:
 
       - name: Export ONNX models
         run: |
-          python onnx_export/export.py --output-dir ./onnx_models --dynamic-axes
+          python onnx_export/export.py --output-dir ./onnx_models
 
       - name: Verify ONNX models
         run: |
