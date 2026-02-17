@@ -6,8 +6,8 @@ This script serves as a central registry for all ONNX export configurations.
 Add new models to the EXPORT_CONFIGS list below.
 
 Usage:
-    python export_all.py --output-dir ./models
-    python export_all.py --output-dir ./models --dynamic-axes
+    python export.py --output-dir ./models
+    python export.py --output-dir ./models --dynamic-axes
 """
 
 import argparse

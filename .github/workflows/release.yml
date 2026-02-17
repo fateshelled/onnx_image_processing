@@ -29,7 +29,7 @@ jobs:
 
       - name: Export ONNX models
         run: |
-          python onnx_export/export_all.py --output-dir ./onnx_models --dynamic-axes
+          python onnx_export/export.py --output-dir ./onnx_models --dynamic-axes
 
       - name: Verify ONNX models
         run: |
