@@ -20,16 +20,6 @@ from pathlib import Path
 # Each entry: (script_name, output_name, extra_args)
 EXPORT_CONFIGS = [
     (
-        "export_shi_tomasi_bad_sinkhorn.py",
-        "shi_tomasi_bad_sinkhorn.onnx",
-        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024"]
-    ),
-    (
-        "export_shi_tomasi_bad_sinkhorn.py",
-        "shi_tomasi_bad_sinkhorn_extraction.onnx",
-        ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024", "--with-extraction"]
-    ),
-    (
         "export_shi_tomasi_sparse_bad_sinkhorn.py",
         "shi_tomasi_sparse_bad_sinkhorn.onnx",
         ["--height", "480", "--width", "640", "--num-pairs", "512", "--max-keypoints", "1024"]

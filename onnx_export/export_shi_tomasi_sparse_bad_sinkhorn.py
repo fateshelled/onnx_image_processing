@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pytorch_model.feature_detection.shi_tomasi_sparse_bad_sinkhorn import ShiTomasiSparseBADSinkhornMatcher
 from pytorch_model.feature_detection.match_extraction_wrapper import MatchExtractionWrapper
-from onnx_export.optimize import optimize_onnx_model
+from onnx_export.optimize import optimize_onnx_model, remove_external_data
 
 
 def parse_args():
@@ -269,6 +269,8 @@ def main():
     optimization = "skipped"
     if not args.no_optimize:
         optimization = optimize_onnx_model(args.output)
+    else:
+        remove_external_data(args.output)
 
     K = args.max_keypoints
     print(f"Exported ONNX model to: {args.output}")

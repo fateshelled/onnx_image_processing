@@ -16,7 +16,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from pytorch_model.detector.shi_tomasi import ShiTomasiScore
-from onnx_export.optimize import optimize_onnx_model
+from onnx_export.optimize import optimize_onnx_model, remove_external_data
 
 
 def parse_args():
@@ -107,6 +107,8 @@ def main():
     optimization = "skipped"
     if not args.no_optimize:
         optimization = optimize_onnx_model(args.output)
+    else:
+        remove_external_data(args.output)
 
     print(f"Exported ONNX model to: {args.output}")
     print(f"  Input shape: (N, 1, {args.height}, {args.width})")
