@@ -334,6 +334,8 @@ def run_visual_odometry(
         # Initialize status for display
         status_message = None
         pose_updated = False
+        inlier_mask = None
+        num_inliers = 0
 
         if num_matches < min_matches:
             if verbose:
@@ -381,8 +383,38 @@ def run_visual_odometry(
         if display:
             # Draw trajectory info on frame
             info_frame = curr_frame.copy()
+            frame_h, frame_w = info_frame.shape[:2]
             pos = trajectory.get_current_position()
             dist = trajectory.get_trajectory_length()
+
+            # Scale keypoints from model resolution to frame resolution
+            scale_x = frame_w / model_width
+            scale_y = frame_h / model_height
+
+            # Draw matched keypoints
+            if num_matches > 0:
+                for i in range(len(matched_kpts2)):
+                    # Keypoints are in (y, x) format
+                    y, x = matched_kpts2[i]
+                    px = int(x * scale_x)
+                    py = int(y * scale_y)
+
+                    # Color based on inlier/outlier status
+                    if pose_updated and inlier_mask is not None and inlier_mask[i]:
+                        # Inliers: Green
+                        color = (0, 255, 0)
+                        radius = 4
+                    elif inlier_mask is not None and not inlier_mask[i]:
+                        # Outliers (RANSAC rejected): Red
+                        color = (0, 0, 255)
+                        radius = 3
+                    else:
+                        # No pose estimate: Yellow
+                        color = (0, 255, 255)
+                        radius = 3
+
+                    cv2.circle(info_frame, (px, py), radius, color, -1)
+                    cv2.circle(info_frame, (px, py), radius + 1, (0, 0, 0), 1)
 
             # Display current status
             cv2.putText(info_frame, f"Frame: {frame_count}", (10, 30),
