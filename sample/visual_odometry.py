@@ -387,9 +387,25 @@ def run_visual_odometry(
             pos = trajectory.get_current_position()
             dist = trajectory.get_trajectory_length()
 
+            # Auto-scale font size and thickness based on frame size
+            # Reference: 640x480 with font_scale=0.7, thickness=2
+            base_width = 640
+            base_height = 480
+            size_scale = min(frame_w / base_width, frame_h / base_height)
+            font_scale = 0.7 * size_scale
+            font_thickness = max(1, int(2 * size_scale))
+
+            # Calculate line spacing based on scaled font
+            line_height = int(30 * size_scale)
+            margin_x = int(10 * size_scale)
+            start_y = line_height
+
             # Scale keypoints from model resolution to frame resolution
             scale_x = frame_w / model_width
             scale_y = frame_h / model_height
+
+            # Scale keypoint radius based on frame size
+            base_radius = max(1, int(3 * size_scale))
 
             # Draw matched keypoints
             if num_matches > 0:
@@ -403,41 +419,49 @@ def run_visual_odometry(
                     if pose_updated and inlier_mask is not None and inlier_mask[i]:
                         # Inliers: Green
                         color = (0, 255, 0)
-                        radius = 4
+                        radius = base_radius + 1
                     elif inlier_mask is not None and not inlier_mask[i]:
                         # Outliers (RANSAC rejected): Red
                         color = (0, 0, 255)
-                        radius = 3
+                        radius = base_radius
                     else:
                         # No pose estimate: Yellow
                         color = (0, 255, 255)
-                        radius = 3
+                        radius = base_radius
 
                     cv2.circle(info_frame, (px, py), radius, color, -1)
                     cv2.circle(info_frame, (px, py), radius + 1, (0, 0, 0), 1)
 
-            # Display current status
-            cv2.putText(info_frame, f"Frame: {frame_count}", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Always display the same number of lines to prevent flickering
+            # Line 1: Frame number
+            cv2.putText(info_frame, f"Frame: {frame_count}",
+                       (margin_x, start_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
 
+            # Line 2: Status message (error or OK)
             if status_message:
-                # Show error/warning message
-                cv2.putText(info_frame, status_message, (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]", (10, 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(info_frame, f"Distance: {dist:.2f}m", (10, 120),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(info_frame, status_message,
+                           (margin_x, start_y + line_height),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
             else:
-                # Show normal trajectory info
-                cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]", (10, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(info_frame, f"Distance: {dist:.2f}m", (10, 90),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(info_frame, f"Matches: {num_matches}", (10, 120),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(info_frame, f"Inliers: {num_inliers}", (10, 150),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(info_frame, "STATUS: OK",
+                           (margin_x, start_y + line_height),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+            # Line 3: Position
+            cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]",
+                       (margin_x, start_y + line_height * 2),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+            # Line 4: Distance
+            cv2.putText(info_frame, f"Distance: {dist:.2f}m",
+                       (margin_x, start_y + line_height * 3),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+            # Line 5: Matches and Inliers
+            cv2.putText(info_frame, f"Matches: {num_matches} | Inliers: {num_inliers}",
+                       (margin_x, start_y + line_height * 4),
+                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
 
             cv2.imshow('Visual Odometry', info_frame)
 
