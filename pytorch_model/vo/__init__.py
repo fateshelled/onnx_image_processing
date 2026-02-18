@@ -9,6 +9,12 @@ from .pose_estimation import (
     matrix_to_transformation,
 )
 from .trajectory import Trajectory
+from .camera import (
+    BaseCamera,
+    OpenCVCamera,
+    RealSenseCamera,
+    create_camera,
+)
 
 __all__ = [
     "CameraIntrinsics",
@@ -18,4 +24,8 @@ __all__ = [
     "transformation_to_matrix",
     "matrix_to_transformation",
     "Trajectory",
+    "BaseCamera",
+    "OpenCVCamera",
+    "RealSenseCamera",
+    "create_camera",
 ]

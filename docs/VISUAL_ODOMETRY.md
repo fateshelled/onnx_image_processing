@@ -101,6 +101,24 @@ python sample/visual_odometry.py \
 
 Press `q` to quit or `s` to save trajectory during real-time processing.
 
+#### From RealSense Camera
+
+```bash
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --camera-backend realsense \
+    --fx 525.0 \
+    --fy 525.0 \
+    --cx 319.5 \
+    --cy 239.5 \
+    --camera-width 640 \
+    --camera-height 480 \
+    --display
+```
+
+Note: Requires `pyrealsense2` package. Install with: `pip install pyrealsense2`
+
 #### 3D Trajectory Visualization
 
 ```bash
@@ -128,6 +146,15 @@ python sample/visual_odometry.py \
 | `--cx` | Principal point x coordinate (pixels) |
 | `--cy` | Principal point y coordinate (pixels) |
 
+### Camera Options (for --camera mode)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--camera-backend` | opencv | Camera backend (opencv or realsense) |
+| `--camera-width` | 640 | Camera resolution width |
+| `--camera-height` | 480 | Camera resolution height |
+| `--camera-fps` | 30 | Camera framerate |
+
 ### Optional Arguments
 
 | Option | Default | Description |
@@ -142,6 +169,76 @@ python sample/visual_odometry.py \
 | `--save-plot` | None | Save trajectory plot (*.png) |
 | `--plot-3d` | False | Plot 3D trajectory instead of 2D |
 | `--quiet`, `-q` | False | Suppress progress output |
+
+## Camera Backends
+
+The Visual Odometry implementation supports multiple camera backends through a unified interface.
+
+### OpenCV Backend (Default)
+
+Standard USB/webcam cameras using OpenCV's `cv2.VideoCapture`:
+
+```bash
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --camera-backend opencv \
+    --fx 525 --fy 525 --cx 320 --cy 240 \
+    --display
+```
+
+**Features:**
+- Works with any USB webcam
+- Simple setup, no additional dependencies
+- Resolution and FPS configurable (subject to hardware support)
+
+### RealSense Backend
+
+Intel RealSense D400/D500 series cameras using `pyrealsense2`:
+
+```bash
+# Install RealSense SDK
+pip install pyrealsense2
+
+# Run VO with RealSense
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --camera-backend realsense \
+    --fx 525 --fy 525 --cx 320 --cy 240 \
+    --camera-width 640 \
+    --camera-height 480 \
+    --camera-fps 30 \
+    --display
+```
+
+**Features:**
+- High-quality RGB streams
+- Built-in depth sensor (for future RGBD-SLAM)
+- Hardware-synchronized RGB-D frames
+- Auto-exposure and white balance
+
+**Note:** The current implementation uses RGB only. Depth support will be added for RGBD-SLAM.
+
+### Camera Wrapper Architecture
+
+The implementation uses an abstract `BaseCamera` class with concrete implementations:
+
+```python
+from pytorch_model.vo import create_camera
+
+# Create OpenCV camera
+camera = create_camera(backend="opencv", device_id=0, width=640, height=480)
+
+# Create RealSense camera
+camera = create_camera(backend="realsense", device_id=0, width=640, height=480, fps=30)
+
+# Unified interface
+ret, frame = camera.read()
+camera.release()
+```
+
+This architecture makes it easy to add support for other camera types in the future.
 
 ## Algorithm Details
 

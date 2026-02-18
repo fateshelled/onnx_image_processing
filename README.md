@@ -125,6 +125,9 @@ python sample/visual_odometry.py --model matcher.onnx --image-dir frames/ --fx 5
 
 # From webcam (real-time)
 python sample/visual_odometry.py --model matcher.onnx --camera 0 --fx 525 --fy 525 --cx 320 --cy 240 --display
+
+# From RealSense camera
+python sample/visual_odometry.py --model matcher.onnx --camera 0 --camera-backend realsense --fx 525 --fy 525 --cx 320 --cy 240 --display --camera-width 640 --camera-height 480
 ```
 
 ### Requirements
@@ -145,6 +148,10 @@ pip install torch onnx onnxruntime onnxscript numpy opencv-python matplotlib
 | `--fy` | (required) | Focal length in y direction (pixels) |
 | `--cx` | (required) | Principal point x coordinate (pixels) |
 | `--cy` | (required) | Principal point y coordinate (pixels) |
+| `--camera-backend` | `opencv` | Camera backend (opencv or realsense) |
+| `--camera-width` | `640` | Camera resolution width |
+| `--camera-height` | `480` | Camera resolution height |
+| `--camera-fps` | `30` | Camera framerate |
 | `--match-threshold`, `-t` | `0.1` | Match probability threshold |
 | `--ransac-threshold` | `1.0` | RANSAC reprojection threshold (pixels) |
 | `--min-matches` | `20` | Minimum number of matches required |

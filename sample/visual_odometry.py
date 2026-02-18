@@ -41,6 +41,7 @@ from pytorch_model.vo import (
     CameraIntrinsics,
     estimate_pose_ransac,
     Trajectory,
+    create_camera,
 )
 from provider_utils import create_session
 
@@ -136,7 +137,16 @@ def extract_matches(
 class VideoReader:
     """Read frames from video file, image sequence, or webcam."""
 
-    def __init__(self, source, is_video: bool = True, is_camera: bool = False):
+    def __init__(
+        self,
+        source,
+        is_video: bool = True,
+        is_camera: bool = False,
+        camera_backend: str = "opencv",
+        camera_width: int = 640,
+        camera_height: int = 480,
+        camera_fps: int = 30,
+    ):
         """
         Initialize video reader.
 
@@ -144,20 +154,29 @@ class VideoReader:
             source: Video file path, image directory, or camera device ID
             is_video: If True, read from video file; otherwise from image directory
             is_camera: If True, read from webcam (source should be camera ID)
+            camera_backend: Camera backend ("opencv" or "realsense")
+            camera_width: Camera resolution width
+            camera_height: Camera resolution height
+            camera_fps: Camera framerate
         """
         self.is_video = is_video
         self.is_camera = is_camera
         self.source = source
+        self.camera = None
+        self.cap = None
 
         if is_camera:
-            # Open webcam
-            self.cap = cv2.VideoCapture(int(source))
-            if not self.cap.isOpened():
-                raise RuntimeError(f"Failed to open camera: {source}")
+            # Open camera using wrapper
+            self.camera = create_camera(
+                backend=camera_backend,
+                device_id=int(source),
+                width=camera_width,
+                height=camera_height,
+                fps=camera_fps,
+                enable_depth=False,
+            )
             self.total_frames = float('inf')  # Unlimited for camera
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-            if self.fps == 0:
-                self.fps = 30.0  # Default FPS for cameras
+            self.fps = self.camera.get_fps()
         elif is_video:
             # Open video file
             self.cap = cv2.VideoCapture(source)
@@ -186,7 +205,10 @@ class VideoReader:
         Returns:
             Tuple of (success, frame)
         """
-        if self.is_camera or self.is_video:
+        if self.is_camera:
+            ret, frame = self.camera.read()
+            return ret, frame
+        elif self.is_video:
             ret, frame = self.cap.read()
             return ret, frame
         else:
@@ -198,7 +220,9 @@ class VideoReader:
 
     def release(self):
         """Release resources."""
-        if self.is_camera or self.is_video:
+        if self.is_camera and self.camera is not None:
+            self.camera.release()
+        elif self.is_video and self.cap is not None:
             self.cap.release()
 
     def __len__(self) -> int:
@@ -464,6 +488,31 @@ def parse_args():
         required=True,
         help="Principal point y coordinate (pixels)"
     )
+    parser.add_argument(
+        "--camera-backend",
+        type=str,
+        default="opencv",
+        choices=["opencv", "realsense"],
+        help="Camera backend (opencv or realsense, default: opencv)"
+    )
+    parser.add_argument(
+        "--camera-width",
+        type=int,
+        default=640,
+        help="Camera resolution width (default: 640)"
+    )
+    parser.add_argument(
+        "--camera-height",
+        type=int,
+        default=480,
+        help="Camera resolution height (default: 480)"
+    )
+    parser.add_argument(
+        "--camera-fps",
+        type=int,
+        default=30,
+        help="Camera framerate (default: 30)"
+    )
 
     # Processing parameters
     parser.add_argument(
@@ -562,8 +611,16 @@ def main():
 
     # Open video/image/camera source
     if args.camera is not None:
-        print(f"\nOpening camera: {args.camera}")
-        reader = VideoReader(args.camera, is_video=False, is_camera=True)
+        print(f"\nOpening camera: {args.camera} (backend: {args.camera_backend})")
+        reader = VideoReader(
+            args.camera,
+            is_video=False,
+            is_camera=True,
+            camera_backend=args.camera_backend,
+            camera_width=args.camera_width,
+            camera_height=args.camera_height,
+            camera_fps=args.camera_fps,
+        )
     elif args.video:
         print(f"\nOpening video: {args.video}")
         reader = VideoReader(args.video, is_video=True, is_camera=False)
