@@ -492,8 +492,8 @@ def parse_args():
         "--camera-backend",
         type=str,
         default="opencv",
-        choices=["opencv", "realsense"],
-        help="Camera backend (opencv or realsense, default: opencv)"
+        choices=["opencv", "realsense", "orbbec"],
+        help="Camera backend (opencv, realsense, or orbbec, default: opencv)"
     )
     parser.add_argument(
         "--camera-width",
@@ -618,14 +618,14 @@ def main():
         reader = VideoReader(args.image_dir, is_video=False, is_camera=False)
 
     # Create camera intrinsics
-    # For RealSense cameras, auto-detect intrinsics if not provided
-    if args.camera is not None and args.camera_backend == "realsense":
+    # For RealSense/Orbbec cameras, auto-detect intrinsics if not provided
+    if args.camera is not None and args.camera_backend in ["realsense", "orbbec"]:
         if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
-            print("\nAuto-detecting camera intrinsics from RealSense...")
+            print(f"\nAuto-detecting camera intrinsics from {args.camera_backend.capitalize()}...")
             if hasattr(reader.camera, 'get_camera_intrinsics'):
                 camera_intrinsics = reader.camera.get_camera_intrinsics()
                 if camera_intrinsics is None:
-                    raise RuntimeError("Failed to get camera intrinsics from RealSense")
+                    raise RuntimeError(f"Failed to get camera intrinsics from {args.camera_backend.capitalize()}")
                 print(f"Camera intrinsics (auto-detected): {camera_intrinsics}")
             else:
                 raise RuntimeError("Camera does not support intrinsics auto-detection")
@@ -641,10 +641,10 @@ def main():
             )
             print(f"\nCamera intrinsics (manual): {camera_intrinsics}")
     else:
-        # Non-RealSense: require manual specification
+        # Non-RealSense/Orbbec: require manual specification
         if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
             raise ValueError(
-                "Camera intrinsics (--fx, --fy, --cx, --cy) are required for non-RealSense cameras. "
+                "Camera intrinsics (--fx, --fy, --cx, --cy) are required for OpenCV cameras and video files. "
                 "Please specify all intrinsic parameters."
             )
         camera_intrinsics = CameraIntrinsics(

@@ -9,5 +9,6 @@ onnxoptimizer>=0.3.13
 opencv-python>=4.5.0
 matplotlib>=3.3.0
 
-# Optional dependencies for RealSense camera support
-# pyrealsense2>=2.50.0
+# Optional dependencies for camera support
+# pyrealsense2>=2.50.0  # For Intel RealSense cameras
+# pyorbbecsdk>=1.5.0    # For Orbbec cameras (Astra, Femto, Gemini)

@@ -374,6 +374,287 @@ class RealSenseCamera(BaseCamera):
         )
 
 
+class OrbbecCamera(BaseCamera):
+    """
+    Orbbec camera wrapper.
+
+    Wraps pyorbbecsdk for Orbbec Astra/Femto/Gemini series cameras.
+    Provides RGB and optionally depth streams.
+    """
+
+    def __init__(
+        self,
+        device_id: Optional[int] = None,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+        enable_depth: bool = False,
+    ):
+        """
+        Initialize Orbbec camera.
+
+        Args:
+            device_id: Camera device index (None for first available)
+            width: RGB stream width (default: 640)
+            height: RGB stream height (default: 480)
+            fps: Stream framerate (default: 30)
+            enable_depth: Enable depth stream (default: False)
+        """
+        self.device_id = device_id if device_id is not None else 0
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.enable_depth = enable_depth
+
+        self.pipeline = None
+        self.config = None
+        self.align = None
+
+        # Check if pyorbbecsdk is available
+        try:
+            from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode
+            self.ob = __import__('pyorbbecsdk')
+            self.Pipeline = Pipeline
+            self.Config = Config
+            self.OBSensorType = OBSensorType
+            self.OBFormat = OBFormat
+            self.OBAlignMode = OBAlignMode
+        except ImportError:
+            raise ImportError(
+                "pyorbbecsdk is not installed. "
+                "Install it with: pip install pyorbbecsdk"
+            )
+
+    def open(self) -> bool:
+        """Open the camera."""
+        try:
+            # Create pipeline and config
+            self.pipeline = self.Pipeline()
+            self.config = self.Config()
+
+            # Get device
+            device_list = self.pipeline.get_device_list()
+            if device_list.get_count() == 0:
+                print("No Orbbec devices found")
+                return False
+
+            if self.device_id >= device_list.get_count():
+                print(f"Device index {self.device_id} out of range (found {device_list.get_count()} devices)")
+                return False
+
+            # Enable color stream
+            color_profiles = self.pipeline.get_stream_profile_list(self.OBSensorType.COLOR_SENSOR)
+            if color_profiles is None:
+                print("No color profiles found")
+                return False
+
+            # Find matching profile
+            color_profile = None
+            for i in range(color_profiles.get_count()):
+                profile = color_profiles.get_profile(i)
+                if (profile.get_width() == self.width and
+                    profile.get_height() == self.height and
+                    profile.get_fps() == self.fps):
+                    color_profile = profile
+                    break
+
+            if color_profile is None:
+                # Try to find any profile and use it
+                if color_profiles.get_count() > 0:
+                    color_profile = color_profiles.get_profile(0)
+                    self.width = color_profile.get_width()
+                    self.height = color_profile.get_height()
+                    self.fps = color_profile.get_fps()
+                    print(f"Using available profile: {self.width}x{self.height}@{self.fps}fps")
+                else:
+                    print("No suitable color profile found")
+                    return False
+
+            self.config.enable_stream(color_profile)
+
+            # Enable depth stream if requested
+            if self.enable_depth:
+                depth_profiles = self.pipeline.get_stream_profile_list(self.OBSensorType.DEPTH_SENSOR)
+                if depth_profiles and depth_profiles.get_count() > 0:
+                    # Find matching depth profile
+                    depth_profile = None
+                    for i in range(depth_profiles.get_count()):
+                        profile = depth_profiles.get_profile(i)
+                        if (profile.get_width() == self.width and
+                            profile.get_height() == self.height and
+                            profile.get_fps() == self.fps):
+                            depth_profile = profile
+                            break
+
+                    if depth_profile is None:
+                        depth_profile = depth_profiles.get_profile(0)
+
+                    self.config.enable_stream(depth_profile)
+                    # Enable hardware alignment
+                    self.config.set_align_mode(self.OBAlignMode.HW_MODE)
+
+            # Start pipeline
+            self.pipeline.start(self.config)
+            return True
+
+        except Exception as e:
+            print(f"Failed to open Orbbec camera: {e}")
+            return False
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """
+        Read a frame from the camera.
+
+        Returns RGB image. Use read_rgbd() for RGB+Depth.
+        """
+        if self.pipeline is None:
+            return False, None
+
+        try:
+            # Wait for frames (timeout 1000ms)
+            frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+            if frames is None:
+                return False, None
+
+            # Get color frame
+            color_frame = frames.get_color_frame()
+            if color_frame is None:
+                return False, None
+
+            # Convert to numpy array
+            color_image = np.asanyarray(color_frame.get_data())
+
+            # Convert RGB to BGR for OpenCV compatibility
+            if len(color_image.shape) == 3 and color_image.shape[2] == 3:
+                color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+
+            return True, color_image
+
+        except Exception as e:
+            print(f"Failed to read frame: {e}")
+            return False, None
+
+    def read_rgbd(self) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Read RGB and depth frames from the camera.
+
+        Returns:
+            Tuple of (success, rgb_image, depth_image)
+            - success: True if frames were read successfully
+            - rgb_image: BGR image array (H, W, 3) or None
+            - depth_image: Depth image array (H, W) in millimeters or None
+        """
+        if self.pipeline is None:
+            return False, None, None
+
+        if not self.enable_depth:
+            ret, rgb = self.read()
+            return ret, rgb, None
+
+        try:
+            # Wait for frames
+            frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+            if frames is None:
+                return False, None, None
+
+            # Get frames
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+
+            if color_frame is None:
+                return False, None, None
+
+            # Convert to numpy arrays
+            color_image = np.asanyarray(color_frame.get_data())
+            if len(color_image.shape) == 3 and color_image.shape[2] == 3:
+                color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+
+            depth_image = np.asanyarray(depth_frame.get_data()) if depth_frame else None
+
+            return True, color_image, depth_image
+
+        except Exception as e:
+            print(f"Failed to read RGBD frames: {e}")
+            return False, None, None
+
+    def get_intrinsics(self):
+        """
+        Get camera intrinsic parameters.
+
+        Returns:
+            Camera intrinsics object or None if not available
+        """
+        if self.pipeline is None:
+            return None
+
+        try:
+            # Get camera parameters from color stream
+            frames = self.pipeline.wait_for_frames(timeout_ms=1000)
+            if frames is None:
+                return None
+
+            color_frame = frames.get_color_frame()
+            if color_frame is None:
+                return None
+
+            camera_params = color_frame.get_camera_param()
+            return camera_params
+        except Exception:
+            return None
+
+    def get_camera_intrinsics(self):
+        """
+        Get camera intrinsic parameters as CameraIntrinsics object.
+
+        Returns:
+            CameraIntrinsics object or None if not available
+        """
+        camera_params = self.get_intrinsics()
+        if camera_params is None:
+            return None
+
+        # Import here to avoid circular dependency
+        from .pose_estimation import CameraIntrinsics
+
+        # Orbbec provides RGB camera intrinsics
+        rgb_intrinsic = camera_params.rgb_intrinsic
+
+        return CameraIntrinsics(
+            fx=rgb_intrinsic.fx,
+            fy=rgb_intrinsic.fy,
+            cx=rgb_intrinsic.cx,
+            cy=rgb_intrinsic.cy,
+            width=rgb_intrinsic.width,
+            height=rgb_intrinsic.height,
+        )
+
+    def release(self) -> None:
+        """Release camera resources."""
+        if self.pipeline is not None:
+            self.pipeline.stop()
+            self.pipeline = None
+        self.config = None
+
+    def is_opened(self) -> bool:
+        """Check if camera is opened."""
+        return self.pipeline is not None
+
+    def get_fps(self) -> float:
+        """Get camera FPS."""
+        return float(self.fps)
+
+    def get_resolution(self) -> Tuple[int, int]:
+        """Get camera resolution."""
+        return (self.width, self.height)
+
+    def __repr__(self) -> str:
+        return (
+            f"OrbbecCamera(device_id={self.device_id}, "
+            f"resolution={self.width}x{self.height}, "
+            f"fps={self.fps}, depth={self.enable_depth})"
+        )
+
+
 def create_camera(
     backend: str = "opencv",
     device_id: int = 0,
@@ -386,12 +667,12 @@ def create_camera(
     Create a camera instance based on backend type.
 
     Args:
-        backend: Camera backend ("opencv" or "realsense")
-        device_id: Camera device ID (for OpenCV) or serial number (for RealSense)
+        backend: Camera backend ("opencv", "realsense", or "orbbec")
+        device_id: Camera device ID (for OpenCV/Orbbec) or serial number (for RealSense)
         width: Camera resolution width
         height: Camera resolution height
         fps: Camera framerate
-        enable_depth: Enable depth stream (RealSense only)
+        enable_depth: Enable depth stream (RealSense/Orbbec only)
 
     Returns:
         Camera instance
@@ -422,8 +703,20 @@ def create_camera(
             raise RuntimeError("Failed to open RealSense camera")
         return camera
 
+    elif backend == "orbbec":
+        camera = OrbbecCamera(
+            device_id=device_id,
+            width=width,
+            height=height,
+            fps=fps,
+            enable_depth=enable_depth,
+        )
+        if not camera.open():
+            raise RuntimeError("Failed to open Orbbec camera")
+        return camera
+
     else:
         raise ValueError(
             f"Unsupported camera backend: {backend}. "
-            f"Supported backends: opencv, realsense"
+            f"Supported backends: opencv, realsense, orbbec"
         )

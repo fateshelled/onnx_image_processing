@@ -13,6 +13,7 @@ from .camera import (
     BaseCamera,
     OpenCVCamera,
     RealSenseCamera,
+    OrbbecCamera,
     create_camera,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "BaseCamera",
     "OpenCVCamera",
     "RealSenseCamera",
+    "OrbbecCamera",
     "create_camera",
 ]
