@@ -307,66 +307,81 @@ def run_visual_odometry(
         num_matches = len(scores)
         total_matches += num_matches
 
+        # Initialize status for display
+        status_message = None
+        pose_updated = False
+
         if num_matches < min_matches:
             if verbose:
                 print(f"Frame {frame_count}: Insufficient matches ({num_matches} < {min_matches}), skipping...")
-            # Keep previous frame and continue
-            continue
+            status_message = f"INSUFFICIENT MATCHES ({num_matches}/{min_matches})"
+        else:
+            # Estimate pose using RANSAC
+            R, t, inlier_mask = estimate_pose_ransac(
+                matched_kpts1,
+                matched_kpts2,
+                camera_intrinsics,
+                ransac_threshold=ransac_threshold,
+            )
 
-        # Estimate pose using RANSAC
-        R, t, inlier_mask = estimate_pose_ransac(
-            matched_kpts1,
-            matched_kpts2,
-            camera_intrinsics,
-            ransac_threshold=ransac_threshold,
-        )
+            num_inliers = np.sum(inlier_mask)
+            total_inliers += num_inliers
 
-        num_inliers = np.sum(inlier_mask)
-        total_inliers += num_inliers
-
-        if R is None or num_inliers < min_matches:
-            if verbose:
-                print(f"Frame {frame_count}: Pose estimation failed (inliers={num_inliers}), skipping...")
-            continue
-
-        # Add pose to trajectory
-        trajectory.add_relative_pose(R, t)
-
-        # Update previous frame
-        prev_image = curr_image
-        display_frame = curr_frame.copy() if display else None
-
-        if verbose and processed_count % 10 == 0:
-            elapsed = time.time() - start_time
-            fps = processed_count / elapsed
-            if reader.is_camera or reader.total_frames == float('inf'):
-                print(f"Frame {frame_count}: "
-                      f"matches={num_matches}, inliers={num_inliers}, "
-                      f"position={trajectory.get_current_position()}, "
-                      f"fps={fps:.1f}")
+            if R is None or num_inliers < min_matches:
+                if verbose:
+                    print(f"Frame {frame_count}: Pose estimation failed (inliers={num_inliers}), skipping...")
+                status_message = f"POSE ESTIMATION FAILED (inliers={num_inliers}/{min_matches})"
             else:
-                print(f"Frame {frame_count}/{reader.total_frames}: "
-                      f"matches={num_matches}, inliers={num_inliers}, "
-                      f"position={trajectory.get_current_position()}, "
-                      f"fps={fps:.1f}")
+                # Add pose to trajectory
+                trajectory.add_relative_pose(R, t)
+                pose_updated = True
 
-        # Display frame and trajectory in real-time
-        if display and display_frame is not None:
+                # Update previous frame only on success
+                prev_image = curr_image
+
+                if verbose and processed_count % 10 == 0:
+                    elapsed = time.time() - start_time
+                    fps = processed_count / elapsed
+                    if reader.is_camera or reader.total_frames == float('inf'):
+                        print(f"Frame {frame_count}: "
+                              f"matches={num_matches}, inliers={num_inliers}, "
+                              f"position={trajectory.get_current_position()}, "
+                              f"fps={fps:.1f}")
+                    else:
+                        print(f"Frame {frame_count}/{reader.total_frames}: "
+                              f"matches={num_matches}, inliers={num_inliers}, "
+                              f"position={trajectory.get_current_position()}, "
+                              f"fps={fps:.1f}")
+
+        # Display frame and trajectory in real-time (always update if display is on)
+        if display:
             # Draw trajectory info on frame
-            info_frame = display_frame.copy()
+            info_frame = curr_frame.copy()
             pos = trajectory.get_current_position()
             dist = trajectory.get_trajectory_length()
 
+            # Display current status
             cv2.putText(info_frame, f"Frame: {frame_count}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(info_frame, f"Distance: {dist:.2f}m", (10, 90),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(info_frame, f"Matches: {num_matches}", (10, 120),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(info_frame, f"Inliers: {num_inliers}", (10, 150),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            if status_message:
+                # Show error/warning message
+                cv2.putText(info_frame, status_message, (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]", (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(info_frame, f"Distance: {dist:.2f}m", (10, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                # Show normal trajectory info
+                cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]", (10, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(info_frame, f"Distance: {dist:.2f}m", (10, 90),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(info_frame, f"Matches: {num_matches}", (10, 120),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(info_frame, f"Inliers: {num_inliers}", (10, 150),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             cv2.imshow('Visual Odometry', info_frame)
 
