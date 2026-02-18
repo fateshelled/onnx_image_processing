@@ -323,6 +323,29 @@ class RealSenseCamera(BaseCamera):
         except Exception:
             return None
 
+    def get_camera_intrinsics(self):
+        """
+        Get camera intrinsic parameters as CameraIntrinsics object.
+
+        Returns:
+            CameraIntrinsics object or None if not available
+        """
+        intrinsics = self.get_intrinsics()
+        if intrinsics is None:
+            return None
+
+        # Import here to avoid circular dependency
+        from .pose_estimation import CameraIntrinsics
+
+        return CameraIntrinsics(
+            fx=intrinsics.fx,
+            fy=intrinsics.fy,
+            cx=intrinsics.ppx,
+            cy=intrinsics.ppy,
+            width=intrinsics.width,
+            height=intrinsics.height,
+        )
+
     def release(self) -> None:
         """Release camera resources."""
         if self.pipeline is not None:

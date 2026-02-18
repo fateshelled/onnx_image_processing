@@ -104,6 +104,16 @@ Press `q` to quit or `s` to save trajectory during real-time processing.
 #### From RealSense Camera
 
 ```bash
+# Auto-detect camera intrinsics (recommended)
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --camera-backend realsense \
+    --camera-width 640 \
+    --camera-height 480 \
+    --display
+
+# Or specify intrinsics manually
 python sample/visual_odometry.py \
     --model matcher.onnx \
     --camera 0 \
@@ -117,7 +127,10 @@ python sample/visual_odometry.py \
     --display
 ```
 
-Note: Requires `pyrealsense2` package. Install with: `pip install pyrealsense2`
+**Note:**
+- Requires `pyrealsense2` package. Install with: `pip install pyrealsense2`
+- Camera intrinsics are automatically detected from RealSense cameras
+- Manual specification overrides auto-detection
 
 #### 3D Trajectory Visualization
 
@@ -141,10 +154,10 @@ python sample/visual_odometry.py \
 |--------|-------------|
 | `--model`, `-m` | Path to ONNX model file |
 | `--video`, `-v` OR `--image-dir`, `-d` OR `--camera`, `-c` | Input source: video file, image directory, or camera device ID |
-| `--fx` | Focal length in x direction (pixels) |
-| `--fy` | Focal length in y direction (pixels) |
-| `--cx` | Principal point x coordinate (pixels) |
-| `--cy` | Principal point y coordinate (pixels) |
+| `--fx` | Focal length in x direction (pixels). **Optional for RealSense** (auto-detected). |
+| `--fy` | Focal length in y direction (pixels). **Optional for RealSense** (auto-detected). |
+| `--cx` | Principal point x coordinate (pixels). **Optional for RealSense** (auto-detected). |
+| `--cy` | Principal point y coordinate (pixels). **Optional for RealSense** (auto-detected). |
 
 ### Camera Options (for --camera mode)
 
@@ -200,12 +213,11 @@ Intel RealSense D400/D500 series cameras using `pyrealsense2`:
 # Install RealSense SDK
 pip install pyrealsense2
 
-# Run VO with RealSense
+# Run VO with RealSense (auto-detect intrinsics)
 python sample/visual_odometry.py \
     --model matcher.onnx \
     --camera 0 \
     --camera-backend realsense \
-    --fx 525 --fy 525 --cx 320 --cy 240 \
     --camera-width 640 \
     --camera-height 480 \
     --camera-fps 30 \
@@ -217,6 +229,7 @@ python sample/visual_odometry.py \
 - Built-in depth sensor (for future RGBD-SLAM)
 - Hardware-synchronized RGB-D frames
 - Auto-exposure and white balance
+- **Automatic intrinsics detection** - no need to specify fx, fy, cx, cy
 
 **Note:** The current implementation uses RGB only. Depth support will be added for RGBD-SLAM.
 

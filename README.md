@@ -126,7 +126,10 @@ python sample/visual_odometry.py --model matcher.onnx --image-dir frames/ --fx 5
 # From webcam (real-time)
 python sample/visual_odometry.py --model matcher.onnx --camera 0 --fx 525 --fy 525 --cx 320 --cy 240 --display
 
-# From RealSense camera
+# From RealSense camera (auto-detects intrinsics)
+python sample/visual_odometry.py --model matcher.onnx --camera 0 --camera-backend realsense --display --camera-width 640 --camera-height 480
+
+# From RealSense camera (manual intrinsics)
 python sample/visual_odometry.py --model matcher.onnx --camera 0 --camera-backend realsense --fx 525 --fy 525 --cx 320 --cy 240 --display --camera-width 640 --camera-height 480
 ```
 
@@ -144,10 +147,10 @@ pip install torch onnx onnxruntime onnxscript numpy opencv-python matplotlib
 | `--video`, `-v` | (mutually exclusive) | Input video file path |
 | `--image-dir`, `-d` | (mutually exclusive) | Input image directory path |
 | `--camera`, `-c` | (mutually exclusive) | Webcam device ID (e.g., 0) |
-| `--fx` | (required) | Focal length in x direction (pixels) |
-| `--fy` | (required) | Focal length in y direction (pixels) |
-| `--cx` | (required) | Principal point x coordinate (pixels) |
-| `--cy` | (required) | Principal point y coordinate (pixels) |
+| `--fx` | (optional) | Focal length in x direction (pixels). Auto-detected for RealSense. |
+| `--fy` | (optional) | Focal length in y direction (pixels). Auto-detected for RealSense. |
+| `--cx` | (optional) | Principal point x coordinate (pixels). Auto-detected for RealSense. |
+| `--cy` | (optional) | Principal point y coordinate (pixels). Auto-detected for RealSense. |
 | `--camera-backend` | `opencv` | Camera backend (opencv or realsense) |
 | `--camera-width` | `640` | Camera resolution width |
 | `--camera-height` | `480` | Camera resolution height |

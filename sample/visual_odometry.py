@@ -467,26 +467,26 @@ def parse_args():
     parser.add_argument(
         "--fx",
         type=float,
-        required=True,
-        help="Focal length in x direction (pixels)"
+        default=None,
+        help="Focal length in x direction (pixels). Auto-detected for RealSense cameras."
     )
     parser.add_argument(
         "--fy",
         type=float,
-        required=True,
-        help="Focal length in y direction (pixels)"
+        default=None,
+        help="Focal length in y direction (pixels). Auto-detected for RealSense cameras."
     )
     parser.add_argument(
         "--cx",
         type=float,
-        required=True,
-        help="Principal point x coordinate (pixels)"
+        default=None,
+        help="Principal point x coordinate (pixels). Auto-detected for RealSense cameras."
     )
     parser.add_argument(
         "--cy",
         type=float,
-        required=True,
-        help="Principal point y coordinate (pixels)"
+        default=None,
+        help="Principal point y coordinate (pixels). Auto-detected for RealSense cameras."
     )
     parser.add_argument(
         "--camera-backend",
@@ -598,17 +598,6 @@ def main():
     for out in outputs:
         print(f"  Output: {out.name} {out.shape}")
 
-    # Create camera intrinsics
-    camera_intrinsics = CameraIntrinsics(
-        fx=args.fx,
-        fy=args.fy,
-        cx=args.cx,
-        cy=args.cy,
-        width=model_width,
-        height=model_height,
-    )
-    print(f"\nCamera intrinsics: {camera_intrinsics}")
-
     # Open video/image/camera source
     if args.camera is not None:
         print(f"\nOpening camera: {args.camera} (backend: {args.camera_backend})")
@@ -627,6 +616,46 @@ def main():
     else:
         print(f"\nOpening image directory: {args.image_dir}")
         reader = VideoReader(args.image_dir, is_video=False, is_camera=False)
+
+    # Create camera intrinsics
+    # For RealSense cameras, auto-detect intrinsics if not provided
+    if args.camera is not None and args.camera_backend == "realsense":
+        if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
+            print("\nAuto-detecting camera intrinsics from RealSense...")
+            if hasattr(reader.camera, 'get_camera_intrinsics'):
+                camera_intrinsics = reader.camera.get_camera_intrinsics()
+                if camera_intrinsics is None:
+                    raise RuntimeError("Failed to get camera intrinsics from RealSense")
+                print(f"Camera intrinsics (auto-detected): {camera_intrinsics}")
+            else:
+                raise RuntimeError("Camera does not support intrinsics auto-detection")
+        else:
+            # Use manually specified intrinsics
+            camera_intrinsics = CameraIntrinsics(
+                fx=args.fx,
+                fy=args.fy,
+                cx=args.cx,
+                cy=args.cy,
+                width=model_width,
+                height=model_height,
+            )
+            print(f"\nCamera intrinsics (manual): {camera_intrinsics}")
+    else:
+        # Non-RealSense: require manual specification
+        if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
+            raise ValueError(
+                "Camera intrinsics (--fx, --fy, --cx, --cy) are required for non-RealSense cameras. "
+                "Please specify all intrinsic parameters."
+            )
+        camera_intrinsics = CameraIntrinsics(
+            fx=args.fx,
+            fy=args.fy,
+            cx=args.cx,
+            cy=args.cy,
+            width=model_width,
+            height=model_height,
+        )
+        print(f"\nCamera intrinsics: {camera_intrinsics}")
 
     if reader.is_camera:
         print(f"Camera mode (unlimited frames)")
