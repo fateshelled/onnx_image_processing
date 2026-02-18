@@ -655,6 +655,264 @@ class OrbbecCamera(BaseCamera):
         )
 
 
+class OAKCamera(BaseCamera):
+    """
+    Luxonis OAK-D camera wrapper.
+
+    Wraps depthai for OAK-D series cameras (OAK-D, OAK-D Lite, OAK-D Pro).
+    Provides RGB and optionally depth streams.
+    """
+
+    def __init__(
+        self,
+        device_id: Optional[str] = None,
+        width: int = 640,
+        height: int = 480,
+        fps: int = 30,
+        enable_depth: bool = False,
+    ):
+        """
+        Initialize OAK-D camera.
+
+        Args:
+            device_id: Device MxID (None for first available)
+            width: RGB stream width (default: 640)
+            height: RGB stream height (default: 480)
+            fps: Stream framerate (default: 30)
+            enable_depth: Enable depth stream (default: False)
+        """
+        self.device_id = device_id
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.enable_depth = enable_depth
+
+        self.pipeline = None
+        self.device = None
+        self.q_rgb = None
+        self.q_depth = None
+
+        # Check if depthai is available
+        try:
+            import depthai as dai
+            self.dai = dai
+        except ImportError:
+            raise ImportError(
+                "depthai is not installed. "
+                "Install it with: pip install depthai"
+            )
+
+    def open(self) -> bool:
+        """Open the camera."""
+        try:
+            # Create pipeline
+            self.pipeline = self.dai.Pipeline()
+
+            # Create color camera node
+            cam_rgb = self.pipeline.create(self.dai.node.ColorCamera)
+            cam_rgb.setBoardSocket(self.dai.CameraBoardSocket.CAM_A)
+            cam_rgb.setResolution(self.dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+            cam_rgb.setVideoSize(self.width, self.height)
+            cam_rgb.setFps(self.fps)
+            cam_rgb.setInterleaved(False)
+            cam_rgb.setColorOrder(self.dai.ColorCameraProperties.ColorOrder.BGR)
+
+            # Create output
+            xout_rgb = self.pipeline.create(self.dai.node.XLinkOut)
+            xout_rgb.setStreamName("rgb")
+            cam_rgb.video.link(xout_rgb.input)
+
+            # Create depth if requested
+            if self.enable_depth:
+                # Create stereo depth node
+                mono_left = self.pipeline.create(self.dai.node.MonoCamera)
+                mono_right = self.pipeline.create(self.dai.node.MonoCamera)
+                stereo = self.pipeline.create(self.dai.node.StereoDepth)
+
+                mono_left.setResolution(self.dai.MonoCameraProperties.SensorResolution.THE_400_P)
+                mono_left.setBoardSocket(self.dai.CameraBoardSocket.CAM_B)
+                mono_right.setResolution(self.dai.MonoCameraProperties.SensorResolution.THE_400_P)
+                mono_right.setBoardSocket(self.dai.CameraBoardSocket.CAM_C)
+
+                stereo.setDefaultProfilePreset(self.dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+                stereo.setLeftRightCheck(True)
+                stereo.setDepthAlign(self.dai.CameraBoardSocket.CAM_A)
+
+                mono_left.out.link(stereo.left)
+                mono_right.out.link(stereo.right)
+
+                xout_depth = self.pipeline.create(self.dai.node.XLinkOut)
+                xout_depth.setStreamName("depth")
+                stereo.depth.link(xout_depth.input)
+
+            # Connect to device
+            if self.device_id is not None:
+                device_info = self.dai.DeviceInfo(self.device_id)
+                self.device = self.dai.Device(self.pipeline, device_info)
+            else:
+                self.device = self.dai.Device(self.pipeline)
+
+            # Get output queues
+            self.q_rgb = self.device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+            if self.enable_depth:
+                self.q_depth = self.device.getOutputQueue(name="depth", maxSize=4, blocking=False)
+
+            return True
+
+        except Exception as e:
+            print(f"Failed to open OAK-D camera: {e}")
+            return False
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """
+        Read a frame from the camera.
+
+        Returns RGB image. Use read_rgbd() for RGB+Depth.
+        """
+        if self.q_rgb is None:
+            return False, None
+
+        try:
+            in_rgb = self.q_rgb.tryGet()
+            if in_rgb is None:
+                return False, None
+
+            # Get BGR frame
+            frame = in_rgb.getCvFrame()
+            return True, frame
+
+        except Exception as e:
+            print(f"Failed to read frame: {e}")
+            return False, None
+
+    def read_rgbd(self) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
+        """
+        Read RGB and depth frames from the camera.
+
+        Returns:
+            Tuple of (success, rgb_image, depth_image)
+            - success: True if frames were read successfully
+            - rgb_image: BGR image array (H, W, 3) or None
+            - depth_image: Depth image array (H, W) in millimeters or None
+        """
+        if self.q_rgb is None:
+            return False, None, None
+
+        if not self.enable_depth:
+            ret, rgb = self.read()
+            return ret, rgb, None
+
+        try:
+            in_rgb = self.q_rgb.tryGet()
+            in_depth = self.q_depth.tryGet() if self.q_depth else None
+
+            if in_rgb is None:
+                return False, None, None
+
+            # Get frames
+            rgb_frame = in_rgb.getCvFrame()
+            depth_frame = in_depth.getFrame() if in_depth else None
+
+            return True, rgb_frame, depth_frame
+
+        except Exception as e:
+            print(f"Failed to read RGBD frames: {e}")
+            return False, None, None
+
+    def get_intrinsics(self):
+        """
+        Get camera intrinsic parameters.
+
+        Returns:
+            Camera calibration data or None if not available
+        """
+        if self.device is None:
+            return None
+
+        try:
+            calib_data = self.device.readCalibration()
+            return calib_data
+        except Exception:
+            return None
+
+    def get_camera_intrinsics(self):
+        """
+        Get camera intrinsic parameters as CameraIntrinsics object.
+
+        Returns:
+            CameraIntrinsics object or None if not available
+        """
+        calib_data = self.get_intrinsics()
+        if calib_data is None:
+            return None
+
+        # Import here to avoid circular dependency
+        from .pose_estimation import CameraIntrinsics
+
+        try:
+            # Get RGB camera intrinsics
+            intrinsics = calib_data.getCameraIntrinsics(
+                self.dai.CameraBoardSocket.CAM_A,
+                self.width,
+                self.height
+            )
+
+            # intrinsics is a list: [fx, fy, cx, cy]
+            # or a 3x3 matrix
+            if len(intrinsics) == 2:  # It's a tuple of (intrinsic_matrix, distortion)
+                K = intrinsics[0]  # 3x3 intrinsic matrix
+                fx = K[0][0]
+                fy = K[1][1]
+                cx = K[0][2]
+                cy = K[1][2]
+            else:
+                # Fallback to default values
+                fx = intrinsics[0][0] if hasattr(intrinsics[0], '__getitem__') else 500.0
+                fy = intrinsics[1][1] if hasattr(intrinsics[1], '__getitem__') else 500.0
+                cx = intrinsics[0][2] if hasattr(intrinsics[0], '__getitem__') else self.width / 2
+                cy = intrinsics[1][2] if hasattr(intrinsics[1], '__getitem__') else self.height / 2
+
+            return CameraIntrinsics(
+                fx=fx,
+                fy=fy,
+                cx=cx,
+                cy=cy,
+                width=self.width,
+                height=self.height,
+            )
+        except Exception as e:
+            print(f"Failed to get camera intrinsics: {e}")
+            return None
+
+    def release(self) -> None:
+        """Release camera resources."""
+        if self.device is not None:
+            self.device.close()
+            self.device = None
+        self.pipeline = None
+        self.q_rgb = None
+        self.q_depth = None
+
+    def is_opened(self) -> bool:
+        """Check if camera is opened."""
+        return self.device is not None
+
+    def get_fps(self) -> float:
+        """Get camera FPS."""
+        return float(self.fps)
+
+    def get_resolution(self) -> Tuple[int, int]:
+        """Get camera resolution."""
+        return (self.width, self.height)
+
+    def __repr__(self) -> str:
+        return (
+            f"OAKCamera(device_id={self.device_id}, "
+            f"resolution={self.width}x{self.height}, "
+            f"fps={self.fps}, depth={self.enable_depth})"
+        )
+
+
 def create_camera(
     backend: str = "opencv",
     device_id: int = 0,
@@ -667,12 +925,12 @@ def create_camera(
     Create a camera instance based on backend type.
 
     Args:
-        backend: Camera backend ("opencv", "realsense", or "orbbec")
-        device_id: Camera device ID (for OpenCV/Orbbec) or serial number (for RealSense)
+        backend: Camera backend ("opencv", "realsense", "orbbec", or "oak")
+        device_id: Camera device ID (for OpenCV/Orbbec/OAK) or serial number (for RealSense)
         width: Camera resolution width
         height: Camera resolution height
         fps: Camera framerate
-        enable_depth: Enable depth stream (RealSense/Orbbec only)
+        enable_depth: Enable depth stream (RealSense/Orbbec/OAK only)
 
     Returns:
         Camera instance
@@ -715,8 +973,21 @@ def create_camera(
             raise RuntimeError("Failed to open Orbbec camera")
         return camera
 
+    elif backend == "oak" or backend == "oak-d":
+        device_mxid = str(device_id) if device_id != 0 else None
+        camera = OAKCamera(
+            device_id=device_mxid,
+            width=width,
+            height=height,
+            fps=fps,
+            enable_depth=enable_depth,
+        )
+        if not camera.open():
+            raise RuntimeError("Failed to open OAK-D camera")
+        return camera
+
     else:
         raise ValueError(
             f"Unsupported camera backend: {backend}. "
-            f"Supported backends: opencv, realsense, orbbec"
+            f"Supported backends: opencv, realsense, orbbec, oak"
         )

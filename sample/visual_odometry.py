@@ -492,8 +492,8 @@ def parse_args():
         "--camera-backend",
         type=str,
         default="opencv",
-        choices=["opencv", "realsense", "orbbec"],
-        help="Camera backend (opencv, realsense, or orbbec, default: opencv)"
+        choices=["opencv", "realsense", "orbbec", "oak"],
+        help="Camera backend (opencv, realsense, orbbec, or oak, default: opencv)"
     )
     parser.add_argument(
         "--camera-width",
@@ -618,14 +618,14 @@ def main():
         reader = VideoReader(args.image_dir, is_video=False, is_camera=False)
 
     # Create camera intrinsics
-    # For RealSense/Orbbec cameras, auto-detect intrinsics if not provided
-    if args.camera is not None and args.camera_backend in ["realsense", "orbbec"]:
+    # For RealSense/Orbbec/OAK cameras, auto-detect intrinsics if not provided
+    if args.camera is not None and args.camera_backend in ["realsense", "orbbec", "oak"]:
         if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
-            print(f"\nAuto-detecting camera intrinsics from {args.camera_backend.capitalize()}...")
+            print(f"\nAuto-detecting camera intrinsics from {args.camera_backend.upper()}...")
             if hasattr(reader.camera, 'get_camera_intrinsics'):
                 camera_intrinsics = reader.camera.get_camera_intrinsics()
                 if camera_intrinsics is None:
-                    raise RuntimeError(f"Failed to get camera intrinsics from {args.camera_backend.capitalize()}")
+                    raise RuntimeError(f"Failed to get camera intrinsics from {args.camera_backend.upper()}")
                 print(f"Camera intrinsics (auto-detected): {camera_intrinsics}")
             else:
                 raise RuntimeError("Camera does not support intrinsics auto-detection")
@@ -641,7 +641,7 @@ def main():
             )
             print(f"\nCamera intrinsics (manual): {camera_intrinsics}")
     else:
-        # Non-RealSense/Orbbec: require manual specification
+        # Non-3D-camera: require manual specification
         if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
             raise ValueError(
                 "Camera intrinsics (--fx, --fy, --cx, --cy) are required for OpenCV cameras and video files. "

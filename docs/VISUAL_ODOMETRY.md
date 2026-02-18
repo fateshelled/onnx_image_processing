@@ -164,6 +164,38 @@ python sample/visual_odometry.py \
 - Camera intrinsics are automatically detected from Orbbec cameras
 - Manual specification overrides auto-detection
 
+#### From OAK-D Camera
+
+```bash
+# Auto-detect camera intrinsics (recommended)
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --camera-backend oak \
+    --camera-width 640 \
+    --camera-height 480 \
+    --display
+
+# Or specify intrinsics manually
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --camera-backend oak \
+    --fx 525.0 \
+    --fy 525.0 \
+    --cx 319.5 \
+    --cy 239.5 \
+    --camera-width 640 \
+    --camera-height 480 \
+    --display
+```
+
+**Note:**
+- Requires `depthai` package. Install with: `pip install depthai`
+- Supports Luxonis OAK-D series cameras (OAK-D, OAK-D Lite, OAK-D Pro)
+- Camera intrinsics are automatically detected from OAK-D cameras
+- Manual specification overrides auto-detection
+
 #### 3D Trajectory Visualization
 
 ```bash
@@ -186,16 +218,16 @@ python sample/visual_odometry.py \
 |--------|-------------|
 | `--model`, `-m` | Path to ONNX model file |
 | `--video`, `-v` OR `--image-dir`, `-d` OR `--camera`, `-c` | Input source: video file, image directory, or camera device ID |
-| `--fx` | Focal length in x direction (pixels). **Optional for RealSense/Orbbec** (auto-detected). |
-| `--fy` | Focal length in y direction (pixels). **Optional for RealSense/Orbbec** (auto-detected). |
-| `--cx` | Principal point x coordinate (pixels). **Optional for RealSense/Orbbec** (auto-detected). |
-| `--cy` | Principal point y coordinate (pixels). **Optional for RealSense/Orbbec** (auto-detected). |
+| `--fx` | Focal length in x direction (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
+| `--fy` | Focal length in y direction (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
+| `--cx` | Principal point x coordinate (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
+| `--cy` | Principal point y coordinate (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
 
 ### Camera Options (for --camera mode)
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--camera-backend` | opencv | Camera backend (opencv, realsense, or orbbec) |
+| `--camera-backend` | opencv | Camera backend (opencv, realsense, orbbec, or oak) |
 | `--camera-width` | 640 | Camera resolution width |
 | `--camera-height` | 480 | Camera resolution height |
 | `--camera-fps` | 30 | Camera framerate |
@@ -298,6 +330,41 @@ python sample/visual_odometry.py \
 
 **Note:** The current implementation uses RGB only. Depth support will be added for RGBD-SLAM.
 
+### OAK-D Backend
+
+Luxonis OAK-D series cameras using `depthai`:
+
+```bash
+# Install DepthAI SDK
+pip install depthai
+
+# Run VO with OAK-D (auto-detect intrinsics)
+python sample/visual_odometry.py \
+    --model matcher.onnx \
+    --camera 0 \
+    --camera-backend oak \
+    --camera-width 640 \
+    --camera-height 480 \
+    --camera-fps 30 \
+    --display
+```
+
+**Features:**
+- High-quality RGB streams from 4K color camera
+- Built-in stereo depth (for future RGBD-SLAM)
+- Hardware-accelerated stereo matching
+- On-device AI processing (Myriad X VPU)
+- **Automatic intrinsics detection** - factory-calibrated parameters
+- USB 3.0/3.1 connectivity
+
+**Supported Cameras:**
+- OAK-D (standard model with stereo depth)
+- OAK-D Lite (compact version)
+- OAK-D Pro (PoE variant with wider baseline)
+- OAK-D W (wide FOV version)
+
+**Note:** The current implementation uses RGB only. Depth support will be added for RGBD-SLAM.
+
 ### Camera Wrapper Architecture
 
 The implementation uses an abstract `BaseCamera` class with concrete implementations:
@@ -314,6 +381,9 @@ camera = create_camera(backend="realsense", device_id=0, width=640, height=480, 
 # Create Orbbec camera
 camera = create_camera(backend="orbbec", device_id=0, width=640, height=480, fps=30)
 
+# Create OAK-D camera
+camera = create_camera(backend="oak", device_id=0, width=640, height=480, fps=30)
+
 # Unified interface
 ret, frame = camera.read()
 camera.release()
@@ -323,6 +393,7 @@ camera.release()
 - **opencv**: Standard USB/webcam cameras (cv2.VideoCapture)
 - **realsense**: Intel RealSense D400/D500 series (pyrealsense2)
 - **orbbec**: Orbbec Astra/Femto/Gemini series (pyorbbecsdk)
+- **oak**: Luxonis OAK-D series (depthai)
 
 This architecture makes it easy to add support for other camera types in the future.
 
