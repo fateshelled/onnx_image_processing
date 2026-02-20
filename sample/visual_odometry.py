@@ -409,18 +409,17 @@ def run_visual_odometry(
 
             # Draw matched keypoints
             if num_matches > 0:
-                for i in range(len(matched_kpts2)):
+                for (y, x), inlier in zip(matched_kpts2, inlier_mask):
                     # Keypoints are in (y, x) format
-                    y, x = matched_kpts2[i]
                     px = int(x * scale_x)
                     py = int(y * scale_y)
 
                     # Color based on inlier/outlier status
-                    if pose_updated and inlier_mask is not None and inlier_mask[i]:
+                    if pose_updated and inlier_mask is not None and inlier:
                         # Inliers: Green
                         color = (0, 255, 0)
                         radius = base_radius + 1
-                    elif inlier_mask is not None and not inlier_mask[i]:
+                    elif inlier_mask is not None and not inlier:
                         # Outliers (RANSAC rejected): Red
                         color = (0, 0, 255)
                         radius = base_radius
