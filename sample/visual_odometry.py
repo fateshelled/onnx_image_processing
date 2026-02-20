@@ -323,9 +323,6 @@ def run_visual_odometry(
         if not ret:
             break
 
-        cv2.imwrite("curr_frame.png", curr_frame)
-        cv2.imwrite("prev_frame.png", prev_frame)
-
         frame_count += 1
 
         # Skip frames if needed
