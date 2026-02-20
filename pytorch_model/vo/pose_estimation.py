@@ -106,7 +106,6 @@ def estimate_pose_ransac(
         camera_intrinsics.K,
         mask=mask,
     )
-
     if num_inliers < 5:
         return None, None, inlier_mask
 
@@ -214,8 +213,8 @@ def matrix_to_transformation(T: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     Returns:
         Tuple of:
             - R: Rotation matrix (3, 3)
-            - t: Translation vector (3, 1)
+            - t: Translation vector (3,)
     """
     R = T[:3, :3]
-    t = T[:3, 3:4]
+    t = T[:3, 3]
     return R, t

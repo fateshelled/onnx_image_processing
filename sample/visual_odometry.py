@@ -81,6 +81,7 @@ def extract_matches(
     keypoints1: np.ndarray,
     keypoints2: np.ndarray,
     threshold: float = 0.1,
+    max_matches: int = 100,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract mutual nearest-neighbor matches from Sinkhorn probability matrix.
@@ -127,6 +128,12 @@ def extract_matches(
     match_indices_i = match_indices_i[above_threshold]
     match_indices_j = match_indices_j[above_threshold]
     scores = scores[above_threshold]
+
+    # Sort by score descending and take top matches
+    sort_order = np.argsort(scores)[::-1][:max_matches]
+    match_indices_i = match_indices_i[sort_order]
+    match_indices_j = match_indices_j[sort_order]
+    scores = scores[sort_order]
 
     matched_kpts1 = kpts1[match_indices_i]
     matched_kpts2 = kpts2[match_indices_j]
@@ -238,7 +245,10 @@ def run_visual_odometry(
     model_width: int,
     match_threshold: float = 0.1,
     ransac_threshold: float = 1.0,
+    max_matches: int = 100,
     min_matches: int = 20,
+    min_inlier_ratio: float = 0.5,
+    min_motion_pixels: float = 1.0,
     skip_frames: int = 1,
     max_frames: int = None,
     verbose: bool = True,
@@ -255,7 +265,20 @@ def run_visual_odometry(
         model_width: Model input width
         match_threshold: Minimum match probability
         ransac_threshold: RANSAC reprojection threshold
+        max_matches: Maximum number of matches
         min_matches: Minimum number of matches required
+        min_inlier_ratio: Minimum ratio of RANSAC inliers to matches (0-1).
+            Frames where inlier_count/match_count is below this threshold are
+            rejected. A low inlier ratio indicates a degenerate Essential Matrix
+            (fitted to noise), leading to large random trajectory jumps.
+            Default: 0.5 (require at least 50% inliers).
+        min_motion_pixels: Minimum RMS pixel displacement between matched
+            keypoints to attempt pose estimation (default: 1.0). When the camera
+            is stationary the optical flow is near-zero, causing findEssentialMat
+            to fit a degenerate matrix and recoverPose to give unstable inlier
+            counts (0-3 or all inliers randomly). Frames below this threshold
+            are classified as "no motion" and skipped without updating the pose.
+            The reference frame IS updated so stale references are avoided.
         skip_frames: Process every N-th frame
         max_frames: Maximum number of frames to process
         verbose: Print progress information
@@ -269,13 +292,18 @@ def run_visual_odometry(
     input_names = [inp.name for inp in session.get_inputs()]
     output_names = [out.name for out in session.get_outputs()]
 
+    # warm up
+    if reader.is_camera:
+        for _ in range(10):
+            ret, prev_frame = reader.read()
+
     # Read first frame
     ret, prev_frame = reader.read()
     if not ret:
         raise RuntimeError("Failed to read first frame")
 
     prev_image = load_image_from_array(prev_frame, model_height, model_width)
-    display_frame = prev_frame.copy() if display else None
+    # display_frame = prev_frame.copy() if display else None
 
     frame_count = 0
     processed_count = 0
@@ -294,6 +322,9 @@ def run_visual_odometry(
         ret, curr_frame = reader.read()
         if not ret:
             break
+
+        cv2.imwrite("curr_frame.png", curr_frame)
+        cv2.imwrite("prev_frame.png", prev_frame)
 
         frame_count += 1
 
@@ -321,20 +352,21 @@ def run_visual_odometry(
         matching_probs = results[2]  # (1, K+1, K+1)
 
         # Extract matches
-        matched_kpts1, matched_kpts2, scores = extract_matches(
+        matched_kpts1, matched_kpts2, _scores = extract_matches(
             matching_probs,
             keypoints1,
             keypoints2,
             threshold=match_threshold,
+            max_matches=max_matches,
         )
 
-        num_matches = len(scores)
+        num_matches = len(matched_kpts1)
         total_matches += num_matches
 
         # Initialize status for display
         status_message = None
         pose_updated = False
-        inlier_mask = None
+        inlier_mask = np.zeros(num_matches, dtype=bool)
         num_inliers = 0
 
         if num_matches < min_matches:
@@ -342,42 +374,60 @@ def run_visual_odometry(
                 print(f"Frame {frame_count}: Insufficient matches ({num_matches} < {min_matches}), skipping...")
             status_message = f"INSUFFICIENT MATCHES ({num_matches}/{min_matches})"
         else:
-            # Estimate pose using RANSAC
-            R, t, inlier_mask = estimate_pose_ransac(
-                matched_kpts1,
-                matched_kpts2,
-                camera_intrinsics,
-                ransac_threshold=ransac_threshold,
-            )
+            # Check for sufficient motion before running pose estimation.
+            # When the camera is stationary, optical flow is near-zero and
+            # findEssentialMat produces a degenerate Essential Matrix, causing
+            # recoverPose to return unstable inlier counts (0-3 or all inliers).
+            flow = matched_kpts2 - matched_kpts1  # (N, 2) in (dy, dx)
+            rms_flow = float(np.sqrt(np.mean(np.sum(flow ** 2, axis=1))))
 
-            num_inliers = np.sum(inlier_mask)
-            total_inliers += num_inliers
-
-            if R is None or num_inliers < min_matches:
+            if rms_flow < min_motion_pixels:
+                # Insufficient motion: skip pose estimation. Do NOT update
+                # prev_image here so that slow continuous motion accumulates
+                # across frames and eventually crosses the threshold.
+                status_message = f"NO MOTION (rms={rms_flow:.2f}px)"
                 if verbose:
-                    print(f"Frame {frame_count}: Pose estimation failed (inliers={num_inliers}), skipping...")
-                status_message = f"POSE ESTIMATION FAILED (inliers={num_inliers}/{min_matches})"
+                    print(f"Frame {frame_count}: No motion (rms={rms_flow:.2f}px), skipping...")
             else:
-                # Add pose to trajectory
-                trajectory.add_relative_pose(R, t)
-                pose_updated = True
+                # Estimate pose using RANSAC
+                R, t, inlier_mask = estimate_pose_ransac(
+                    matched_kpts1,
+                    matched_kpts2,
+                    camera_intrinsics,
+                    ransac_threshold=ransac_threshold,
+                )
 
-                # Update previous frame only on success
-                prev_image = curr_image
+                num_inliers = np.sum(inlier_mask)
+                total_inliers += num_inliers
 
-                if verbose and processed_count % 10 == 0:
-                    elapsed = time.time() - start_time
-                    fps = processed_count / elapsed
-                    if reader.is_camera or reader.total_frames == float('inf'):
-                        print(f"Frame {frame_count}: "
-                              f"matches={num_matches}, inliers={num_inliers}, "
-                              f"position={trajectory.get_current_position()}, "
-                              f"fps={fps:.1f}")
-                    else:
-                        print(f"Frame {frame_count}/{reader.total_frames}: "
-                              f"matches={num_matches}, inliers={num_inliers}, "
-                              f"position={trajectory.get_current_position()}, "
-                              f"fps={fps:.1f}")
+                inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0.0
+                if R is None or num_inliers < min_matches or inlier_ratio < min_inlier_ratio:
+                    if verbose:
+                        print(f"Frame {frame_count}: Pose estimation failed "
+                              f"(inliers={num_inliers}, ratio={inlier_ratio:.0%}), skipping...")
+                    status_message = (f"POSE ESTIMATION FAILED "
+                                      f"(inliers={num_inliers}, ratio={inlier_ratio:.0%})")
+                else:
+                    # Add pose to trajectory
+                    trajectory.add_relative_pose(R, t)
+                    pose_updated = True
+
+                    # Update previous frame only on success
+                    prev_image = curr_image
+
+                    if verbose and processed_count % 10 == 0:
+                        elapsed = time.time() - start_time
+                        fps = processed_count / elapsed
+                        if reader.is_camera or reader.total_frames == float('inf'):
+                            print(f"Frame {frame_count}: "
+                                  f"matches={num_matches}, inliers={num_inliers}, "
+                                  f"position={trajectory.get_current_position()}, "
+                                  f"fps={fps:.1f}")
+                        else:
+                            print(f"Frame {frame_count}/{reader.total_frames}: "
+                                  f"matches={num_matches}, inliers={num_inliers}, "
+                                  f"position={trajectory.get_current_position()}, "
+                                  f"fps={fps:.1f}")
 
         # Display frame and trajectory in real-time (always update if display is on)
         if display:
@@ -579,14 +629,36 @@ def parse_args():
     parser.add_argument(
         "--ransac-threshold",
         type=float,
-        default=1.0,
+        default=10.0,
         help="RANSAC reprojection threshold in pixels (default: 1.0)"
+    )
+    parser.add_argument(
+        "--max-matches",
+        type=int,
+        default=300,
+        help="Maximum number of matches (default: 300)"
     )
     parser.add_argument(
         "--min-matches",
         type=int,
-        default=20,
-        help="Minimum number of matches required (default: 20)"
+        default=10,
+        help="Minimum number of matches required (default: 10)"
+    )
+    parser.add_argument(
+        "--min-inlier-ratio",
+        type=float,
+        default=0.5,
+        help="Minimum RANSAC inlier ratio (inliers/matches) to accept a pose estimate. "
+             "Frames below this threshold are skipped to prevent degenerate E matrix jumps. "
+             "(default: 0.5)"
+    )
+    parser.add_argument(
+        "--min-motion-pixels",
+        type=float,
+        default=1.0,
+        help="Minimum RMS pixel displacement of matched keypoints to attempt pose estimation. "
+             "Frames below this threshold are treated as 'no motion' to avoid degenerate "
+             "Essential Matrix estimation when the camera is stationary (default: 1.0)"
     )
     parser.add_argument(
         "--skip-frames",
@@ -681,7 +753,22 @@ def main():
                 camera_intrinsics = reader.camera.get_camera_intrinsics()
                 if camera_intrinsics is None:
                     raise RuntimeError(f"Failed to get camera intrinsics from {args.camera_backend.upper()}")
-                print(f"Camera intrinsics (auto-detected): {camera_intrinsics}")
+                print(f"Camera intrinsics (auto-detected, native resolution): {camera_intrinsics}")
+                # Scale intrinsics from camera native resolution to model input resolution.
+                # Essential Matrix estimation requires intrinsics in the same coordinate
+                # space as the keypoints (model resolution), not the camera's native resolution.
+                scale_x = model_width / camera_intrinsics.width
+                scale_y = model_height / camera_intrinsics.height
+                if scale_x != 1.0 or scale_y != 1.0:
+                    camera_intrinsics = CameraIntrinsics(
+                        fx=camera_intrinsics.fx * scale_x,
+                        fy=camera_intrinsics.fy * scale_y,
+                        cx=camera_intrinsics.cx * scale_x,
+                        cy=camera_intrinsics.cy * scale_y,
+                        width=model_width,
+                        height=model_height,
+                    )
+                    print(f"Camera intrinsics (scaled to model {model_width}x{model_height}): {camera_intrinsics}")
             else:
                 raise RuntimeError("Camera does not support intrinsics auto-detection")
         else:
@@ -728,7 +815,10 @@ def main():
             model_width,
             match_threshold=args.match_threshold,
             ransac_threshold=args.ransac_threshold,
+            max_matches=args.max_matches,
             min_matches=args.min_matches,
+            min_inlier_ratio=args.min_inlier_ratio,
+            min_motion_pixels=args.min_motion_pixels,
             skip_frames=args.skip_frames,
             max_frames=args.max_frames,
             verbose=not args.quiet,
