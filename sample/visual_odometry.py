@@ -805,18 +805,18 @@ def main():
                 # Scale intrinsics from camera native resolution to model input resolution.
                 # Essential Matrix estimation requires intrinsics in the same coordinate
                 # space as the keypoints (model resolution), not the camera's native resolution.
+                # Always re-calculate to ensure consistency, even if scale factors are 1.0.
                 scale_x = model_width / camera_intrinsics.width
                 scale_y = model_height / camera_intrinsics.height
-                if scale_x != 1.0 or scale_y != 1.0:
-                    camera_intrinsics = CameraIntrinsics(
-                        fx=camera_intrinsics.fx * scale_x,
-                        fy=camera_intrinsics.fy * scale_y,
-                        cx=camera_intrinsics.cx * scale_x,
-                        cy=camera_intrinsics.cy * scale_y,
-                        width=model_width,
-                        height=model_height,
-                    )
-                    print(f"Camera intrinsics (scaled to model {model_width}x{model_height}): {camera_intrinsics}")
+                camera_intrinsics = CameraIntrinsics(
+                    fx=camera_intrinsics.fx * scale_x,
+                    fy=camera_intrinsics.fy * scale_y,
+                    cx=camera_intrinsics.cx * scale_x,
+                    cy=camera_intrinsics.cy * scale_y,
+                    width=model_width,
+                    height=model_height,
+                )
+                print(f"Camera intrinsics (scaled to model {model_width}x{model_height}): {camera_intrinsics}")
             else:
                 raise RuntimeError("Camera does not support intrinsics auto-detection")
         else:
