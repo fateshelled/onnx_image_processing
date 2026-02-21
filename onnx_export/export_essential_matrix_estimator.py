@@ -101,10 +101,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-iter",
         type=int,
-        default=50,
+        default=30,
         help=(
-            "Power-iteration steps for each eigenvector solve (default: 50). "
+            "Power-iteration steps for the 9x9 eigenvector solve (default: 30). "
             "More iterations → better accuracy but larger ONNX graph."
+        ),
+    )
+    parser.add_argument(
+        "--n-iter-manifold",
+        type=int,
+        default=10,
+        help=(
+            "Power-iteration steps for each 3x3 eigenvector solve inside the "
+            "E-manifold projection (default: 10). "
+            "3x3 matrices converge much faster than the 9x9 case."
         ),
     )
 
@@ -154,6 +164,7 @@ def main() -> None:
         image_shape=(args.image_height, args.image_width),
         top_k=args.top_k,
         n_iter=args.n_iter,
+        n_iter_manifold=args.n_iter_manifold,
     )
     model.eval()
 
@@ -197,7 +208,8 @@ def main() -> None:
     print(f"  Input P shape: ({n_points + 1}, {n_points + 1})")
     print(f"  Output E shape: (3, 3)")
     print(f"  Top-K: {args.top_k}")
-    print(f"  Power-iteration steps: {args.n_iter}")
+    print(f"  Power-iteration steps (9x9): {args.n_iter}")
+    print(f"  Power-iteration steps (3x3 manifold): {args.n_iter_manifold}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
     print(f"  Optimization: {optimization}")

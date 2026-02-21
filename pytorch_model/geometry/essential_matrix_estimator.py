@@ -50,15 +50,22 @@ class EssentialMatrixEstimator(nn.Module):
     *values* — ensuring ONNX exportability at opset 14.
 
     Args:
-        K:           Camera intrinsic matrix, shape (3, 3).
-        image_shape: (H, W) of the feature-point grid. Feature point index ``i``
-                     maps to pixel coordinate ``(i % W, i // W)``. Must satisfy
-                     ``H * W >= max(N, M)`` at inference time. Default: (32, 32).
-        top_k:       Number of top-probability entries kept per row *and* per
-                     column in the bidirectional filter. Default: 3.
-        n_iter:      Number of power-iteration steps for each eigenvector solve.
-                     More iterations → better accuracy, larger ONNX graph.
-                     Default: 50.
+        K:                Camera intrinsic matrix, shape (3, 3).
+        image_shape:      (H, W) of the feature-point grid. Feature point index
+                          ``i`` maps to pixel coordinate ``(i % W, i // W)``.
+                          Must satisfy ``H * W >= max(N, M)`` at inference time.
+                          Default: (32, 32).
+        top_k:            Number of top-probability entries kept per row *and* per
+                          column in the bidirectional filter. Default: 3.
+        n_iter:           Power-iteration steps for the 9x9 eigenvector solve
+                          (min eigenvector of the weighted normal equations).
+                          More iterations → better accuracy, larger ONNX graph.
+                          Default: 30.
+        n_iter_manifold:  Power-iteration steps for each 3x3 eigenvector solve
+                          inside the Essential Matrix manifold projection.
+                          3x3 matrices converge much faster than the 9x9 case;
+                          10 iterations is sufficient in almost all practical
+                          scenarios. Default: 10.
     """
 
     def __init__(
@@ -66,18 +73,22 @@ class EssentialMatrixEstimator(nn.Module):
         K: torch.Tensor,
         image_shape: tuple[int, int] = (32, 32),
         top_k: int = 3,
-        n_iter: int = 50,
+        n_iter: int = 30,
+        n_iter_manifold: int = 10,
     ) -> None:
         super().__init__()
 
         # Register K and K⁻¹ as persistent buffers (device-portable).
         # K_inv is computed once at construction; it becomes a constant
         # in the ONNX graph (not computed at inference time).
-        self.register_buffer("K", K.float())
-        self.register_buffer("K_inv", torch.linalg.inv(K.float()))
+        K_f = K.float()
+        K_inv = torch.linalg.inv(K_f)
+        self.register_buffer("K", K_f)
+        self.register_buffer("K_inv", K_inv)
 
         self.top_k = top_k
         self.n_iter = n_iter
+        self.n_iter_manifold = n_iter_manifold
         H, W = image_shape
         self.H = H
         self.W = W
@@ -89,6 +100,15 @@ class EssentialMatrixEstimator(nn.Module):
         py = idx // W  # y-coordinate (row index)
         pixel_coords = torch.stack([px, py], dim=-1)  # (H*W, 2)
         self.register_buffer("pixel_coords", pixel_coords)
+
+        # Precompute normalised image coordinates for every grid point.
+        # pixel_coords_n[i] = K⁻¹ · [px, py, 1]ᵀ (x, y only).
+        # Moving this from forward() eliminates two homogeneous-coordinate
+        # cat ops and two (H*W, 3)@(3, 3) GEMMs from the ONNX graph.
+        ones = torch.ones(H * W, 1)
+        pixel_coords_h = torch.cat([pixel_coords, ones], dim=-1)   # (H*W, 3)
+        pixel_coords_n = (pixel_coords_h @ K_inv.T)[:, :2]         # (H*W, 2)
+        self.register_buffer("pixel_coords_n", pixel_coords_n)
 
     # ------------------------------------------------------------------
     # Private helpers (all ONNX-safe)
@@ -172,15 +192,16 @@ class EssentialMatrixEstimator(nn.Module):
         lam = torch.einsum("ii", B)
 
         # v1 = right singular vector for the largest singular value.
+        # 3x3 matrices converge quickly; n_iter_manifold (default 10) suffices.
         v1 = B.new_ones(3) / torch.sqrt(B.new_tensor(3.0))   # 1/√3
-        for _ in range(self.n_iter):
+        for _ in range(self.n_iter_manifold):
             v1 = B @ v1
             v1 = v1 / (v1.norm() + 1e-8)
 
         # v3 = right singular vector for the smallest singular value (≈ 0 for E).
         B_s = lam * torch.eye(3, dtype=B.dtype, device=B.device) - B
         v3 = B.new_ones(3) / torch.sqrt(B.new_tensor(3.0))   # 1/√3
-        for _ in range(self.n_iter):
+        for _ in range(self.n_iter_manifold):
             v3 = B_s @ v3
             v3 = v3 / (v3.norm() + 1e-8)
 
@@ -308,25 +329,12 @@ class EssentialMatrixEstimator(nn.Module):
         # Masked probability values serve as pair weights.
         weights = P_core * mask.to(P_core.dtype)            # (N, M)
 
-        # ── Step 3: Pixel coordinates for each feature point ───────────
-        # pixel_coords[i] = (i % W, i // W); cast to current dtype/device.
-        pixel_coords = self.pixel_coords.to(P)   # (H*W, 2)
-        pts1_px = pixel_coords[:N]               # (N, 2)
-        pts2_px = pixel_coords[:M]               # (M, 2)
-
-        # ── Step 4: Convert pixel indices → normalised image coords ────
-        # [xn, yn, 1]ᵀ = K⁻¹ · [px, py, 1]ᵀ
-        K_inv = self.K_inv.to(P)   # (3, 3)
-
-        ones1 = P.new_ones(N, 1)
-        pts1_h = torch.cat([pts1_px, ones1], dim=-1)   # (N, 3)
-        pts1_cam = pts1_h @ K_inv.T                    # (N, 3)
-        pts1_n = pts1_cam[:, :2]                       # (N, 2) normalised
-
-        ones2 = P.new_ones(M, 1)
-        pts2_h = torch.cat([pts2_px, ones2], dim=-1)   # (M, 3)
-        pts2_cam = pts2_h @ K_inv.T                    # (M, 3)
-        pts2_n = pts2_cam[:, :2]                       # (M, 2) normalised
+        # ── Steps 3 & 4: Normalised image coordinates (precomputed in __init__) ─
+        # pixel_coords_n[i] = K⁻¹ · [px_i, py_i, 1]ᵀ (x, y components).
+        # This avoids two homogeneous-cat ops and two (N/M, 3)@(3,3) GEMMs.
+        pixel_coords_n = self.pixel_coords_n.to(P)   # (H*W, 2)
+        pts1_n = pixel_coords_n[:N]                  # (N, 2) normalised
+        pts2_n = pixel_coords_n[:M]                  # (M, 2) normalised
 
         # ── Step 5: Hartley normalisation ──────────────────────────────
         # Row-marginal weights for pts1, column-marginal for pts2.
@@ -340,36 +348,38 @@ class EssentialMatrixEstimator(nn.Module):
         pts1_hn = (pts1_n - c1) * s1   # (N, 2)
         pts2_hn = (pts2_n - c2) * s2   # (M, 2)
 
-        # ── Step 6: Build design matrix A (N·M, 9) ────────────────────
-        # Row for pair (i, j):  [x1·x2, x1·y2, x1, y1·x2, y1·y2, y1, x2, y2, 1]
-        x1 = pts1_hn[:, 0]   # (N,)
-        y1 = pts1_hn[:, 1]   # (N,)
-        x2 = pts2_hn[:, 0]   # (M,)
-        y2 = pts2_hn[:, 1]   # (M,)
+        # ── Steps 6 & 7: Weighted normal equations via Kronecker factorisation ─
+        #
+        # Each design-matrix row is a[i,j] = f1[i] ⊗ f2[j]  (Kronecker product)
+        # where f1 = [x1, y1, 1]ᵀ and f2 = [x2, y2, 1]ᵀ.
+        #
+        # M_mat[3p+q, 3r+s] = Σ_{i,j} w[i,j] · f1[i,p]·f1[i,r] · f2[j,q]·f2[j,s]
+        #
+        # Factored computation avoids building the (N·M, 9) design matrix
+        # (36 MB for N=M=1024); instead uses two small GEMMs:
+        #   WF2  = weights @ F2_flat        (N,M)@(M,9) → (N,9)
+        #   M_flat = F1_flat.T @ WF2        (9,N)@(N,9) → (9,9)
+        # then permute indices  (pr,qs) → (pq,rs)  on the tiny 9×9 result.
+        # Memory: O(N + M) instead of O(N·M).
 
-        # Broadcast outer products to (N, M) blocks.
-        x1x2 = x1.unsqueeze(1) * x2.unsqueeze(0)    # (N, M)
-        x1y2 = x1.unsqueeze(1) * y2.unsqueeze(0)    # (N, M)
-        x1_m = x1.unsqueeze(1).expand(-1, M)         # (N, M)
-        y1x2 = y1.unsqueeze(1) * x2.unsqueeze(0)    # (N, M)
-        y1y2 = y1.unsqueeze(1) * y2.unsqueeze(0)    # (N, M)
-        y1_m = y1.unsqueeze(1).expand(-1, M)         # (N, M)
-        x2_m = x2.unsqueeze(0).expand(N, -1)         # (N, M)
-        y2_m = y2.unsqueeze(0).expand(N, -1)         # (N, M)
-        ones_m = torch.ones_like(weights)             # (N, M)
+        # Homogeneous coordinates: f[·] = [x, y, 1].
+        f1 = torch.cat([pts1_hn, pts1_hn.new_ones(N, 1)], dim=-1)   # (N, 3)
+        f2 = torch.cat([pts2_hn, pts2_hn.new_ones(M, 1)], dim=-1)   # (M, 3)
 
-        # Stack → (N, M, 9); flatten → (N·M, 9).
-        A = torch.stack(
-            [x1x2, x1y2, x1_m, y1x2, y1y2, y1_m, x2_m, y2_m, ones_m],
-            dim=-1,
-        )                                   # (N, M, 9)
-        A_flat = A.reshape(-1, 9)           # (N·M, 9)
-        w_flat = weights.reshape(-1)        # (N·M,)
+        # Self-outer products: F[i, p, r] = f[i, p] * f[i, r].
+        # Reshaped to (·, 9) so standard matmul can be used.
+        F1_flat = (f1.unsqueeze(-1) * f1.unsqueeze(-2)).reshape(N, 9)  # (N, 9)
+        F2_flat = (f2.unsqueeze(-1) * f2.unsqueeze(-2)).reshape(M, 9)  # (M, 9)
 
-        # ── Step 7: M = Aᵀ diag(w) A (weighted normal equations) ──────
-        # Written as (A * w[:, None])ᵀ @ A to avoid an N·M x N·M matrix.
-        AW = A_flat * w_flat.unsqueeze(-1)    # (N·M, 9): weight each row
-        M_mat = AW.T @ A_flat                 # (9, 9)
+        # Weighted sum over j:  WF2[i, qs] = Σ_j w[i,j] · F2[j, qs].
+        WF2 = weights @ F2_flat                                         # (N, 9)
+
+        # Weighted sum over i:  M_flat[pr, qs] = Σ_i F1[i, pr] · WF2[i, qs].
+        M_flat = F1_flat.T @ WF2                                        # (9, 9)
+
+        # Permute from (pr, qs) to (pq, rs) index ordering:
+        # M_mat[3p+q, 3r+s] = M_flat[3p+r, 3q+s]  (same entries, reordered).
+        M_mat = M_flat.reshape(3, 3, 3, 3).permute(0, 2, 1, 3).reshape(9, 9)
 
         # ── Step 8: Minimum eigenvector of M_mat → raw E ───────────────
         # M_mat is PSD (= Aᵀ diag(w) A with w ≥ 0).
@@ -410,7 +420,8 @@ if __name__ == "__main__":
         K=K,
         image_shape=(32, 32),
         top_k=3,
-        n_iter=50,
+        n_iter=30,
+        n_iter_manifold=10,
     )
     model.eval()
 
@@ -441,13 +452,12 @@ if __name__ == "__main__":
     print(f"\nONNX model exported → {os.path.abspath(onnx_path)}")
 
     # ── Verify with onnxruntime ───────────────────────────────────────────
-    sess = ort.InferenceSession(onnx_path, providers=ort.get_available_providers())
+    sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
     outputs = sess.run(["E"], {"P": P.numpy()})
     E_ort = torch.from_numpy(outputs[0])
 
     max_diff = (E_ort - E_pt).abs().max().item()
-    print(f"\nONNX Runtime output E:")
-    print(E_ort)
+    print(f"\nONNX Runtime output E: {E_ort}")
     print(f"  Max absolute difference (PyTorch vs ORT): {max_diff:.2e}")
 
     if max_diff < 1e-4:
