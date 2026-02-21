@@ -179,8 +179,10 @@ def compose_transformation(
     t1 = t1.reshape(3, 1) if t1.ndim == 1 else t1
     t2 = t2.reshape(3, 1) if t2.ndim == 1 else t2
 
-    R = R2 @ R1
-    t = R2 @ t1 + t2
+    # Correct composition: T = T1 @ T2
+    # In block matrix form: [R|t] = [R1|t1] @ [R2|t2]
+    R = R1 @ R2
+    t = R1 @ t2 + t1
 
     return R, t
 

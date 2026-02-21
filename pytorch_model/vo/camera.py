@@ -413,7 +413,6 @@ class OrbbecCamera(BaseCamera):
         # Check if pyorbbecsdk is available
         try:
             from pyorbbecsdk import Pipeline, Config, OBSensorType, OBFormat, OBAlignMode
-            self.ob = __import__('pyorbbecsdk')
             self.Pipeline = Pipeline
             self.Config = Config
             self.OBSensorType = OBSensorType
@@ -865,12 +864,19 @@ class OAKCamera(BaseCamera):
                 fy = K[1][1]
                 cx = K[0][2]
                 cy = K[1][2]
+            elif hasattr(intrinsics, '__getitem__') and len(intrinsics) == 3:
+                # 3x3 intrinsic matrix
+                fx = intrinsics[0][0]
+                fy = intrinsics[1][1]
+                cx = intrinsics[0][2]
+                cy = intrinsics[1][2]
             else:
-                # Fallback to default values
-                fx = intrinsics[0][0] if hasattr(intrinsics[0], '__getitem__') else 500.0
-                fy = intrinsics[1][1] if hasattr(intrinsics[1], '__getitem__') else 500.0
-                cx = intrinsics[0][2] if hasattr(intrinsics[0], '__getitem__') else self.width / 2
-                cy = intrinsics[1][2] if hasattr(intrinsics[1], '__getitem__') else self.height / 2
+                raise ValueError(
+                    f"Invalid camera intrinsics format. Expected either:\n"
+                    f"  - Tuple of (3x3 intrinsic_matrix, distortion)\n"
+                    f"  - 3x3 intrinsic matrix\n"
+                    f"Got: {type(intrinsics)}"
+                )
 
             return CameraIntrinsics(
                 fx=fx,

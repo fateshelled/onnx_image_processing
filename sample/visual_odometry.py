@@ -111,12 +111,8 @@ def extract_matches(
     max_j_for_i = np.argmax(P_core, axis=1)
     max_i_for_j = np.argmax(P_core, axis=0)
 
-    # Check mutual consistency
-    mutual_mask = np.zeros(K, dtype=bool)
-    for i in range(K):
-        j = max_j_for_i[i]
-        if max_i_for_j[j] == i:
-            mutual_mask[i] = True
+    # Check mutual consistency (vectorized)
+    mutual_mask = np.arange(K) == max_i_for_j[max_j_for_i]
 
     # Get match probabilities
     match_indices_i = np.where(mutual_mask)[0]
