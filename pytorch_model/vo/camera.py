@@ -958,7 +958,10 @@ def create_camera(
         if not camera.open():
             raise RuntimeError(f"Failed to open OpenCV camera {device_id}")
         # Try to set resolution
-        camera.set_resolution(width, height)
+        if not camera.set_resolution(width, height):
+            actual_width, actual_height = camera.get_resolution()
+            logger.warning(f"Failed to set resolution to {width}x{height} for OpenCV camera {device_id}. "
+                         f"Using camera default: {actual_width}x{actual_height}")
         return camera
 
     elif backend == "realsense":
