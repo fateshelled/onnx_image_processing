@@ -620,25 +620,25 @@ def parse_args():
         "--fx",
         type=float,
         default=None,
-        help="Focal length in x direction (pixels). Auto-detected for RealSense cameras."
+        help="Focal length in x direction (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
     )
     parser.add_argument(
         "--fy",
         type=float,
         default=None,
-        help="Focal length in y direction (pixels). Auto-detected for RealSense cameras."
+        help="Focal length in y direction (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
     )
     parser.add_argument(
         "--cx",
         type=float,
         default=None,
-        help="Principal point x coordinate (pixels). Auto-detected for RealSense cameras."
+        help="Principal point x coordinate (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
     )
     parser.add_argument(
         "--cy",
         type=float,
         default=None,
-        help="Principal point y coordinate (pixels). Auto-detected for RealSense cameras."
+        help="Principal point y coordinate (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
     )
     parser.add_argument(
         "--camera-backend",

@@ -153,10 +153,10 @@ pip install torch onnx onnxruntime onnxscript numpy opencv-python matplotlib
 | `--video`, `-v` | (mutually exclusive) | Input video file path |
 | `--image-dir`, `-d` | (mutually exclusive) | Input image directory path |
 | `--camera`, `-c` | (mutually exclusive) | Webcam device ID (e.g., 0) |
-| `--fx` | (optional) | Focal length in x direction (pixels). Auto-detected for RealSense/Orbbec/OAK. |
-| `--fy` | (optional) | Focal length in y direction (pixels). Auto-detected for RealSense/Orbbec/OAK. |
-| `--cx` | (optional) | Principal point x coordinate (pixels). Auto-detected for RealSense/Orbbec/OAK. |
-| `--cy` | (optional) | Principal point y coordinate (pixels). Auto-detected for RealSense/Orbbec/OAK. |
+| `--fx` | Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK | Focal length in x direction (pixels) |
+| `--fy` | Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK | Focal length in y direction (pixels) |
+| `--cx` | Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK | Principal point x coordinate (pixels) |
+| `--cy` | Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK | Principal point y coordinate (pixels) |
 | `--camera-backend` | `opencv` | Camera backend (opencv, realsense, orbbec, or oak) |
 | `--camera-width` | `640` | Camera resolution width |
 | `--camera-height` | `480` | Camera resolution height |

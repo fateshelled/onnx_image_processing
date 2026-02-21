@@ -218,10 +218,10 @@ python sample/visual_odometry.py \
 |--------|-------------|
 | `--model`, `-m` | Path to ONNX model file |
 | `--video`, `-v` OR `--image-dir`, `-d` OR `--camera`, `-c` | Input source: video file, image directory, or camera device ID |
-| `--fx` | Focal length in x direction (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
-| `--fy` | Focal length in y direction (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
-| `--cx` | Principal point x coordinate (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
-| `--cy` | Principal point y coordinate (pixels). **Optional for RealSense/Orbbec/OAK** (auto-detected). |
+| `--fx` | Focal length in x direction (pixels). **Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK**. |
+| `--fy` | Focal length in y direction (pixels). **Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK**. |
+| `--cx` | Principal point x coordinate (pixels). **Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK**. |
+| `--cy` | Principal point y coordinate (pixels). **Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK**. |
 
 ### Camera Options (for --camera mode)
 
