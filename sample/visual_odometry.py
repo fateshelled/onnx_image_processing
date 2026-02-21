@@ -497,9 +497,8 @@ def run_visual_odometry(
             rms_flow = float(np.sqrt(np.mean(np.sum(flow ** 2, axis=1))))
 
             if rms_flow < min_motion_pixels:
-                # Insufficient motion: skip pose estimation. Do NOT update
-                # prev_image here so that slow continuous motion accumulates
-                # across frames and eventually crosses the threshold.
+                # Insufficient motion: skip pose estimation. The reference frame IS updated
+                # to avoid stale references, but the trajectory is not updated.
                 status_message = f"NO MOTION (rms={rms_flow:.2f}px)"
                 if verbose:
                     print(f"Frame {frame_count}: No motion (rms={rms_flow:.2f}px), skipping...")
@@ -527,9 +526,6 @@ def run_visual_odometry(
                     trajectory.add_relative_pose(R, t)
                     pose_updated = True
 
-                    # Update previous frame only on success
-                    prev_image = curr_image
-
                     if verbose and processed_count % 10 == 0:
                         elapsed = time.time() - start_time
                         fps = processed_count / elapsed
@@ -543,6 +539,11 @@ def run_visual_odometry(
                                   f"matches={num_matches}, inliers={num_inliers}, "
                                   f"position={trajectory.get_current_position()}, "
                                   f"fps={fps:.1f}")
+
+            # Always update previous frame to current frame to avoid stale references
+            # This ensures the reference frame is always the most recent, even if
+            # no pose update occurs (due to low motion or pose estimation failure)
+            prev_image = curr_image
 
         # Display frame and trajectory in real-time (always update if display is on)
         if display:
