@@ -127,23 +127,6 @@ class EssentialMatrixEstimator(nn.Module):
         # torch.sign is applied externally; here we only build diag(v).
         return torch.eye(3, dtype=v.dtype, device=v.device) * v.unsqueeze(1)
 
-    @staticmethod
-    def _cross3(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """3-D cross product (ONNX-safe explicit formula).
-
-        Args:
-            a: Shape (3,).
-            b: Shape (3,).
-
-        Returns:
-            a x b, shape (3,).
-        """
-        return torch.stack([
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ])
-
     def _min_eigvec9(self, M: torch.Tensor) -> torch.Tensor:
         """Minimum eigenvector of a 9x9 symmetric matrix via shifted power iteration.
 
@@ -202,7 +185,7 @@ class EssentialMatrixEstimator(nn.Module):
             v3 = v3 / (v3.norm() + 1e-8)
 
         # v2 completes the orthonormal right basis via cross product.
-        v2 = self._cross3(v3, v1)
+        v2 = torch.linalg.cross(v3, v1)
         v2 = v2 / (v2.norm() + 1e-8)
 
         # V = [v1 | v2 | v3]: columns are right singular vectors.
@@ -221,7 +204,7 @@ class EssentialMatrixEstimator(nn.Module):
 
         u1 = E @ V[:, 0] / (sigma1 + 1e-8)
         u2 = E @ V[:, 1] / (sigma2 + 1e-8)
-        u3 = self._cross3(u1, u2)   # third left singular vector
+        u3 = torch.linalg.cross(u1, u2)   # third left singular vector
 
         # U = [u1 | u2 | u3]: columns are left singular vectors.
         U = torch.stack([u1, u2, u3], dim=-1)   # (3, 3)
