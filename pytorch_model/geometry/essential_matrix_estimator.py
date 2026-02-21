@@ -172,14 +172,14 @@ class EssentialMatrixEstimator(nn.Module):
         lam = torch.einsum("ii", B)
 
         # v1 = right singular vector for the largest singular value.
-        v1 = B.new_ones(3) / 1.7320508075688772   # 1/√3
+        v1 = B.new_ones(3) / torch.sqrt(B.new_tensor(3.0))   # 1/√3
         for _ in range(self.n_iter):
             v1 = B @ v1
             v1 = v1 / (v1.norm() + 1e-8)
 
         # v3 = right singular vector for the smallest singular value (≈ 0 for E).
         B_s = lam * torch.eye(3, dtype=B.dtype, device=B.device) - B
-        v3 = B.new_ones(3) / 1.7320508075688772
+        v3 = B.new_ones(3) / torch.sqrt(B.new_tensor(3.0))   # 1/√3
         for _ in range(self.n_iter):
             v3 = B_s @ v3
             v3 = v3 / (v3.norm() + 1e-8)
@@ -249,7 +249,7 @@ class EssentialMatrixEstimator(nn.Module):
         mean_dist = torch.sqrt((weights * dist_sq).sum() / w_sum + 1e-8)
 
         # Scale so that mean distance becomes √2.
-        scale = pts.new_tensor(1.4142135623730951) / (mean_dist + 1e-8)
+        scale = torch.sqrt(pts.new_tensor(2.0)) / (mean_dist + 1e-8)
 
         # Build T = [[s, 0, -s·cx], [0, s, -s·cy], [0, 0, 1]]
         # without index-assignment (avoids ScatterND in ONNX).
