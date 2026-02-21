@@ -441,7 +441,7 @@ if __name__ == "__main__":
     print(f"\nONNX model exported → {os.path.abspath(onnx_path)}")
 
     # ── Verify with onnxruntime ───────────────────────────────────────────
-    sess = ort.InferenceSession(onnx_path, providers=["CUDAExecutionProvider"])
+    sess = ort.InferenceSession(onnx_path, providers=ort.get_available_providers())
     outputs = sess.run(["E"], {"P": P.numpy()})
     E_ort = torch.from_numpy(outputs[0])
 
