@@ -4,11 +4,15 @@ Camera wrapper classes for different camera backends.
 Provides a unified interface for OpenCV cameras and RealSense cameras.
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, Union
 
 import cv2
 import numpy as np
+
+# Set up module logger
+logger = logging.getLogger(__name__)
 
 
 class BaseCamera(ABC):
@@ -233,7 +237,7 @@ class RealSenseCamera(BaseCamera):
             return True
 
         except Exception as e:
-            print(f"Failed to open RealSense camera: {e}")
+            logger.error(f"Failed to open RealSense camera: {e}")
             return False
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
@@ -259,7 +263,7 @@ class RealSenseCamera(BaseCamera):
             return True, color_image
 
         except Exception as e:
-            print(f"Failed to read frame: {e}")
+            logger.error(f"Failed to read frame: {e}")
             return False, None
 
     def read_rgbd(self) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
@@ -301,7 +305,7 @@ class RealSenseCamera(BaseCamera):
             return True, color_image, depth_image
 
         except Exception as e:
-            print(f"Failed to read RGBD frames: {e}")
+            logger.error(f"Failed to read RGBD frames: {e}")
             return False, None, None
 
     def get_intrinsics(self):
@@ -434,17 +438,17 @@ class OrbbecCamera(BaseCamera):
             # Get device
             device_list = self.pipeline.get_device_list()
             if device_list.get_count() == 0:
-                print("No Orbbec devices found")
+                logger.warning("No Orbbec devices found")
                 return False
 
             if self.device_id >= device_list.get_count():
-                print(f"Device index {self.device_id} out of range (found {device_list.get_count()} devices)")
+                logger.warning(f"Device index {self.device_id} out of range (found {device_list.get_count()} devices)")
                 return False
 
             # Enable color stream
             color_profiles = self.pipeline.get_stream_profile_list(self.OBSensorType.COLOR_SENSOR)
             if color_profiles is None:
-                print("No color profiles found")
+                logger.warning("No color profiles found")
                 return False
 
             # Find matching profile
@@ -464,9 +468,9 @@ class OrbbecCamera(BaseCamera):
                     self.width = color_profile.get_width()
                     self.height = color_profile.get_height()
                     self.fps = color_profile.get_fps()
-                    print(f"Using available profile: {self.width}x{self.height}@{self.fps}fps")
+                    logger.info(f"Using available profile: {self.width}x{self.height}@{self.fps}fps")
                 else:
-                    print("No suitable color profile found")
+                    logger.warning("No suitable color profile found")
                     return False
 
             self.config.enable_stream(color_profile)
@@ -497,7 +501,7 @@ class OrbbecCamera(BaseCamera):
             return True
 
         except Exception as e:
-            print(f"Failed to open Orbbec camera: {e}")
+            logger.error(f"Failed to open Orbbec camera: {e}")
             return False
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
@@ -530,7 +534,7 @@ class OrbbecCamera(BaseCamera):
             return True, color_image
 
         except Exception as e:
-            print(f"Failed to read frame: {e}")
+            logger.error(f"Failed to read frame: {e}")
             return False, None
 
     def read_rgbd(self) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
@@ -573,7 +577,7 @@ class OrbbecCamera(BaseCamera):
             return True, color_image, depth_image
 
         except Exception as e:
-            print(f"Failed to read RGBD frames: {e}")
+            logger.error(f"Failed to read RGBD frames: {e}")
             return False, None, None
 
     def get_intrinsics(self):
@@ -759,7 +763,7 @@ class OAKCamera(BaseCamera):
             return True
 
         except Exception as e:
-            print(f"Failed to open OAK-D camera: {e}")
+            logger.error(f"Failed to open OAK-D camera: {e}")
             return False
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
@@ -781,7 +785,7 @@ class OAKCamera(BaseCamera):
             return True, frame
 
         except Exception as e:
-            print(f"Failed to read frame: {e}")
+            logger.error(f"Failed to read frame: {e}")
             return False, None
 
     def read_rgbd(self) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray]]:
@@ -815,7 +819,7 @@ class OAKCamera(BaseCamera):
             return True, rgb_frame, depth_frame
 
         except Exception as e:
-            print(f"Failed to read RGBD frames: {e}")
+            logger.error(f"Failed to read RGBD frames: {e}")
             return False, None, None
 
     def get_intrinsics(self):
@@ -887,7 +891,7 @@ class OAKCamera(BaseCamera):
                 height=self.height,
             )
         except Exception as e:
-            print(f"Failed to get camera intrinsics: {e}")
+            logger.error(f"Failed to get camera intrinsics: {e}")
             return None
 
     def release(self) -> None:
