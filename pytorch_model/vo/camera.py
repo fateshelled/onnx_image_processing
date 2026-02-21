@@ -121,15 +121,15 @@ class OpenCVCamera(BaseCamera):
 
     def get_fps(self) -> float:
         """Get camera FPS."""
-        if self.cap is None:
-            return 30.0
+        if self.cap is None or not self.cap.isOpened():
+            return 0.0
         fps = self.cap.get(cv2.CAP_PROP_FPS)
-        return fps if fps > 0 else 30.0
+        return fps if fps > 0 else 0.0
 
     def get_resolution(self) -> Tuple[int, int]:
         """Get camera resolution."""
-        if self.cap is None:
-            return (640, 480)
+        if self.cap is None or not self.cap.isOpened():
+            return (0, 0)
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return (width, height)
