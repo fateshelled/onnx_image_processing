@@ -32,7 +32,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
 
 # Add parent directory to path to import modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
