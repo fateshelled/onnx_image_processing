@@ -320,13 +320,13 @@ class EssentialMatrixEstimator(nn.Module):
 
         ones1 = P.new_ones(N, 1)
         pts1_h = torch.cat([pts1_px, ones1], dim=-1)   # (N, 3)
-        pts1_cam = (K_inv @ pts1_h.T).T               # (N, 3)
-        pts1_n = pts1_cam[:, :2]                      # (N, 2) normalised
+        pts1_cam = pts1_h @ K_inv.T                    # (N, 3)
+        pts1_n = pts1_cam[:, :2]                       # (N, 2) normalised
 
         ones2 = P.new_ones(M, 1)
         pts2_h = torch.cat([pts2_px, ones2], dim=-1)   # (M, 3)
-        pts2_cam = (K_inv @ pts2_h.T).T               # (M, 3)
-        pts2_n = pts2_cam[:, :2]                      # (M, 2) normalised
+        pts2_cam = pts2_h @ K_inv.T                    # (M, 3)
+        pts2_n = pts2_cam[:, :2]                       # (M, 2) normalised
 
         # ── Step 5: Hartley normalisation ──────────────────────────────
         # Row-marginal weights for pts1, column-marginal for pts2.
