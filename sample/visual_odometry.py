@@ -170,9 +170,15 @@ class VideoReader:
 
         if is_camera:
             # Open camera using wrapper
+            # Try to convert to int for numeric device IDs, otherwise keep as string
+            try:
+                device_id = int(source)
+            except (ValueError, TypeError):
+                device_id = source
+
             self.camera = create_camera(
                 backend=camera_backend,
-                device_id=int(source),
+                device_id=device_id,
                 width=camera_width,
                 height=camera_height,
                 fps=camera_fps,
@@ -551,8 +557,8 @@ def parse_args():
     )
     source_group.add_argument(
         "--camera", "-c",
-        type=int,
-        help="Webcam device ID (e.g., 0 for default camera)"
+        type=str,
+        help="Camera device ID (e.g., '0' for default, or serial number/MxID for RealSense/OAK-D)"
     )
 
     # Model and camera parameters
