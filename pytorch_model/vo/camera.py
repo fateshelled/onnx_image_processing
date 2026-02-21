@@ -5,7 +5,7 @@ Provides a unified interface for OpenCV cameras and RealSense cameras.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -921,7 +921,7 @@ class OAKCamera(BaseCamera):
 
 def create_camera(
     backend: str = "opencv",
-    device_id: int = 0,
+    device_id: Union[int, str] = 0,
     width: int = 640,
     height: int = 480,
     fps: int = 30,
@@ -932,7 +932,10 @@ def create_camera(
 
     Args:
         backend: Camera backend ("opencv", "realsense", "orbbec", or "oak")
-        device_id: Camera device ID (for OpenCV/Orbbec/OAK) or serial number (for RealSense)
+        device_id: Camera device ID (int for OpenCV, int/str for others)
+                   - OpenCV/Orbbec: integer device index
+                   - RealSense: serial number (string) or 0 for default
+                   - OAK-D: MxID (string) or 0 for default
         width: Camera resolution width
         height: Camera resolution height
         fps: Camera framerate
@@ -947,7 +950,9 @@ def create_camera(
     backend = backend.lower()
 
     if backend == "opencv":
-        camera = OpenCVCamera(device_id=device_id)
+        # OpenCV expects integer device ID
+        device_int = int(device_id) if isinstance(device_id, str) else device_id
+        camera = OpenCVCamera(device_id=device_int)
         if not camera.open():
             raise RuntimeError(f"Failed to open OpenCV camera {device_id}")
         # Try to set resolution
@@ -955,7 +960,7 @@ def create_camera(
         return camera
 
     elif backend == "realsense":
-        device_serial = str(device_id) if device_id != 0 else None
+        device_serial = str(device_id) if str(device_id) != '0' else None
         camera = RealSenseCamera(
             device_id=device_serial,
             width=width,
@@ -980,7 +985,7 @@ def create_camera(
         return camera
 
     elif backend == "oak" or backend == "oak-d":
-        device_mxid = str(device_id) if device_id != 0 else None
+        device_mxid = str(device_id) if str(device_id) != '0' else None
         camera = OAKCamera(
             device_id=device_mxid,
             width=width,
