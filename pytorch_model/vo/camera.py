@@ -438,18 +438,15 @@ class OrbbecCamera(BaseCamera):
             # Get device
             device_list = self.pipeline.get_device_list()
             if device_list.get_count() == 0:
-                logger.warning("No Orbbec devices found")
-                return False
+                raise RuntimeError("No Orbbec devices found")
 
             if self.device_id >= device_list.get_count():
-                logger.warning(f"Device index {self.device_id} out of range (found {device_list.get_count()} devices)")
-                return False
+                raise RuntimeError(f"Device index {self.device_id} out of range (found {device_list.get_count()} devices)")
 
             # Enable color stream
             color_profiles = self.pipeline.get_stream_profile_list(self.OBSensorType.COLOR_SENSOR)
             if color_profiles is None:
-                logger.warning("No color profiles found")
-                return False
+                raise RuntimeError("No color profiles found")
 
             # Find matching profile
             color_profile = None
@@ -465,13 +462,14 @@ class OrbbecCamera(BaseCamera):
                 # Try to find any profile and use it
                 if color_profiles.get_count() > 0:
                     color_profile = color_profiles.get_profile(0)
+                    requested_profile = f"{self.width}x{self.height}@{self.fps}fps"
                     self.width = color_profile.get_width()
                     self.height = color_profile.get_height()
                     self.fps = color_profile.get_fps()
-                    logger.info(f"Using available profile: {self.width}x{self.height}@{self.fps}fps")
+                    logger.warning(f"Requested profile {requested_profile} not found. "
+                                 f"Using available profile: {self.width}x{self.height}@{self.fps}fps")
                 else:
-                    logger.warning("No suitable color profile found")
-                    return False
+                    raise RuntimeError("No suitable color profile found")
 
             self.config.enable_stream(color_profile)
 
