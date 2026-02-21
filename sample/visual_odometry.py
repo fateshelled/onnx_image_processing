@@ -30,6 +30,8 @@ import time
 from pathlib import Path
 
 import cv2
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import onnxruntime as ort
 
@@ -835,9 +837,7 @@ def main():
     # Plot trajectory if requested
     if args.save_plot:
         print(f"\nGenerating trajectory plot...")
-        import matplotlib
         matplotlib.use('Agg')  # Non-interactive backend
-        import matplotlib.pyplot as plt
 
         if args.plot_3d:
             fig = plt.figure(figsize=(12, 10))
