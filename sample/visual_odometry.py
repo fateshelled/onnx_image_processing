@@ -626,7 +626,7 @@ def parse_args():
     parser.add_argument(
         "--ransac-threshold",
         type=float,
-        default=10.0,
+        default=1.0,
         help="RANSAC reprojection threshold in pixels (default: 1.0)"
     )
     parser.add_argument(
