@@ -138,6 +138,121 @@ def extract_matches(
     return matched_kpts1, matched_kpts2, scores
 
 
+def draw_display_info(
+    frame: np.ndarray,
+    trajectory,  # Trajectory type
+    frame_count: int,
+    num_matches: int,
+    num_inliers: int,
+    matched_kpts2: np.ndarray,
+    inlier_mask: np.ndarray,
+    pose_updated: bool,
+    status_message: str,
+    model_width: int,
+    model_height: int,
+) -> np.ndarray:
+    """
+    Draw visual odometry information on frame.
+
+    Args:
+        frame: Input frame to annotate
+        trajectory: Trajectory object
+        frame_count: Current frame number
+        num_matches: Number of feature matches
+        num_inliers: Number of RANSAC inliers
+        matched_kpts2: Matched keypoints in current frame (N, 2) as (y, x)
+        inlier_mask: Boolean mask indicating inliers (N,) or None
+        pose_updated: Whether pose was successfully updated
+        status_message: Error/warning message or None
+        model_width: Model input width for scaling
+        model_height: Model input height for scaling
+
+    Returns:
+        Annotated frame with trajectory info and keypoints
+    """
+    info_frame = frame.copy()
+    frame_h, frame_w = info_frame.shape[:2]
+    pos = trajectory.get_current_position()
+    dist = trajectory.get_trajectory_length()
+
+    # Auto-scale font size and thickness based on frame size
+    # Reference: 640x480 with font_scale=0.7, thickness=2
+    base_width = 640
+    base_height = 480
+    size_scale = min(frame_w / base_width, frame_h / base_height)
+    font_scale = 0.7 * size_scale
+    font_thickness = max(1, int(2 * size_scale))
+
+    # Calculate line spacing based on scaled font
+    line_height = int(30 * size_scale)
+    margin_x = int(10 * size_scale)
+    start_y = line_height
+
+    # Scale keypoints from model resolution to frame resolution
+    scale_x = frame_w / model_width
+    scale_y = frame_h / model_height
+
+    # Scale keypoint radius based on frame size
+    base_radius = max(1, int(3 * size_scale))
+
+    # Draw matched keypoints
+    if num_matches > 0:
+        for i, (y, x) in enumerate(matched_kpts2):
+            # Keypoints are in (y, x) format
+            px = int(x * scale_x)
+            py = int(y * scale_y)
+
+            # Color based on inlier/outlier status
+            if pose_updated and inlier_mask is not None and inlier_mask[i]:
+                # Inliers: Green
+                color = (0, 255, 0)
+                radius = base_radius + 1
+            elif inlier_mask is not None and not inlier_mask[i]:
+                # Outliers (RANSAC rejected): Red
+                color = (0, 0, 255)
+                radius = base_radius
+            else:
+                # No pose estimate: Yellow
+                color = (0, 255, 255)
+                radius = base_radius
+
+            cv2.circle(info_frame, (px, py), radius, color, -1)
+            cv2.circle(info_frame, (px, py), radius + 1, (0, 0, 0), 1)
+
+    # Always display the same number of lines to prevent flickering
+    # Line 1: Frame number
+    cv2.putText(info_frame, f"Frame: {frame_count}",
+               (margin_x, start_y),
+               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+    # Line 2: Status message (error or OK)
+    if status_message:
+        cv2.putText(info_frame, status_message,
+                   (margin_x, start_y + line_height),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
+    else:
+        cv2.putText(info_frame, "STATUS: OK",
+                   (margin_x, start_y + line_height),
+                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+    # Line 3: Position
+    cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]",
+               (margin_x, start_y + line_height * 2),
+               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+    # Line 4: Distance
+    cv2.putText(info_frame, f"Distance: {dist:.2f}m",
+               (margin_x, start_y + line_height * 3),
+               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+    # Line 5: Matches and Inliers
+    cv2.putText(info_frame, f"Matches: {num_matches} | Inliers: {num_inliers}",
+               (margin_x, start_y + line_height * 4),
+               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
+
+    return info_frame
+
+
 class VideoReader:
     """Read frames from video file, image sequence, or webcam."""
 
@@ -431,87 +546,19 @@ def run_visual_odometry(
 
         # Display frame and trajectory in real-time (always update if display is on)
         if display:
-            # Draw trajectory info on frame
-            info_frame = curr_frame.copy()
-            frame_h, frame_w = info_frame.shape[:2]
-            pos = trajectory.get_current_position()
-            dist = trajectory.get_trajectory_length()
-
-            # Auto-scale font size and thickness based on frame size
-            # Reference: 640x480 with font_scale=0.7, thickness=2
-            base_width = 640
-            base_height = 480
-            size_scale = min(frame_w / base_width, frame_h / base_height)
-            font_scale = 0.7 * size_scale
-            font_thickness = max(1, int(2 * size_scale))
-
-            # Calculate line spacing based on scaled font
-            line_height = int(30 * size_scale)
-            margin_x = int(10 * size_scale)
-            start_y = line_height
-
-            # Scale keypoints from model resolution to frame resolution
-            scale_x = frame_w / model_width
-            scale_y = frame_h / model_height
-
-            # Scale keypoint radius based on frame size
-            base_radius = max(1, int(3 * size_scale))
-
-            # Draw matched keypoints
-            if num_matches > 0:
-                for (y, x), inlier in zip(matched_kpts2, inlier_mask):
-                    # Keypoints are in (y, x) format
-                    px = int(x * scale_x)
-                    py = int(y * scale_y)
-
-                    # Color based on inlier/outlier status
-                    if pose_updated and inlier_mask is not None and inlier:
-                        # Inliers: Green
-                        color = (0, 255, 0)
-                        radius = base_radius + 1
-                    elif inlier_mask is not None and not inlier:
-                        # Outliers (RANSAC rejected): Red
-                        color = (0, 0, 255)
-                        radius = base_radius
-                    else:
-                        # No pose estimate: Yellow
-                        color = (0, 255, 255)
-                        radius = base_radius
-
-                    cv2.circle(info_frame, (px, py), radius, color, -1)
-                    cv2.circle(info_frame, (px, py), radius + 1, (0, 0, 0), 1)
-
-            # Always display the same number of lines to prevent flickering
-            # Line 1: Frame number
-            cv2.putText(info_frame, f"Frame: {frame_count}",
-                       (margin_x, start_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-            # Line 2: Status message (error or OK)
-            if status_message:
-                cv2.putText(info_frame, status_message,
-                           (margin_x, start_y + line_height),
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
-            else:
-                cv2.putText(info_frame, "STATUS: OK",
-                           (margin_x, start_y + line_height),
-                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-            # Line 3: Position
-            cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]",
-                       (margin_x, start_y + line_height * 2),
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-            # Line 4: Distance
-            cv2.putText(info_frame, f"Distance: {dist:.2f}m",
-                       (margin_x, start_y + line_height * 3),
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-            # Line 5: Matches and Inliers
-            cv2.putText(info_frame, f"Matches: {num_matches} | Inliers: {num_inliers}",
-                       (margin_x, start_y + line_height * 4),
-                       cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
+            info_frame = draw_display_info(
+                frame=curr_frame,
+                trajectory=trajectory,
+                frame_count=frame_count,
+                num_matches=num_matches,
+                num_inliers=num_inliers,
+                matched_kpts2=matched_kpts2,
+                inlier_mask=inlier_mask,
+                pose_updated=pose_updated,
+                status_message=status_message,
+                model_width=model_width,
+                model_height=model_height,
+            )
             cv2.imshow('Visual Odometry', info_frame)
 
             # Check for key press
