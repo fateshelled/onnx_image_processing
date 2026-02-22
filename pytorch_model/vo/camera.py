@@ -250,8 +250,8 @@ class RealSenseCamera(BaseCamera):
             return False, None
 
         try:
-            # Wait for frames
-            frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+            # Wait for frames (1s timeout to prevent UI freezing on camera failure)
+            frames = self.pipeline.wait_for_frames(timeout_ms=1000)
 
             # Get color frame
             color_frame = frames.get_color_frame()
@@ -284,8 +284,8 @@ class RealSenseCamera(BaseCamera):
             return ret, rgb, None
 
         try:
-            # Wait for frames
-            frames = self.pipeline.wait_for_frames(timeout_ms=5000)
+            # Wait for frames (1s timeout to prevent UI freezing on camera failure)
+            frames = self.pipeline.wait_for_frames(timeout_ms=1000)
 
             # Align depth to color
             if self.align is not None:
