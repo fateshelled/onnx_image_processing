@@ -150,8 +150,14 @@ def triangulate_points(
     # Triangulate
     points_4d = cv2.triangulatePoints(P1, P2, pts1, pts2)
 
-    # Convert from homogeneous to 3D coordinates
-    points_3d = points_4d[:3, :] / points_4d[3, :]
+    # Convert from homogeneous to 3D coordinates, avoiding division by zero
+    # When points lie at infinity or triangulation degenerates (zero parallax),
+    # the homogeneous coordinate w can be near-zero, causing NaN/Inf values.
+    w = points_4d[3, :]
+    mask = np.abs(w) > 1e-9  # Threshold for numerical stability
+    points_3d = np.zeros((3, points_4d.shape[1]), dtype=np.float64)
+    points_3d[:, mask] = points_4d[:3, mask] / w[mask]
+    # Points with w ≈ 0 remain at origin (degenerate cases)
 
     return points_3d.T  # (N, 3)
 
