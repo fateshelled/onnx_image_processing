@@ -416,10 +416,14 @@ def run_visual_odometry(
     input_names = [inp.name for inp in session.get_inputs()]
     output_names = [out.name for out in session.get_outputs()]
 
-    # warm up
+    # Warm up camera (allow auto-exposure/auto-focus to stabilize)
     if reader.is_camera:
         for _ in range(10):
-            ret, prev_frame = reader.read()
+            ret, _ = reader.read()
+            if not ret:
+                # Early camera initialization failure detected during warm-up
+                # Break immediately to allow subsequent error handling to catch it
+                break
 
     # Read first frame
     ret, prev_frame = reader.read()
