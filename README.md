@@ -164,6 +164,9 @@ pip install torch onnx onnxruntime onnxscript numpy opencv-python matplotlib
 | `--match-threshold`, `-t` | `0.1` | Match probability threshold |
 | `--ransac-threshold` | `1.0` | RANSAC reprojection threshold (pixels) |
 | `--min-matches` | `20` | Minimum number of matches required |
+| `--min-inlier-ratio` | `0.5` | Minimum RANSAC inlier ratio (0-1) to accept pose |
+| `--min-motion-pixels` | `1.0` | Minimum RMS pixel motion to attempt pose estimation |
+| `--max-reference-age` | `30` | Maximum frames before forced reference update |
 | `--skip-frames` | `0` | Process every N-th frame (0=all frames) |
 | `--max-frames` | `None` | Maximum number of frames to process |
 | `--display` | (flag) | Display frames and trajectory in real-time |

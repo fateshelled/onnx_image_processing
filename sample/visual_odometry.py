@@ -367,6 +367,7 @@ def run_visual_odometry(
     min_matches: int = 20,
     min_inlier_ratio: float = 0.5,
     min_motion_pixels: float = 1.0,
+    max_reference_age: int = 30,
     skip_frames: int = 1,
     max_frames: int = None,
     verbose: bool = True,
@@ -396,7 +397,12 @@ def run_visual_odometry(
             to fit a degenerate matrix and recoverPose to give unstable inlier
             counts (0-3 or all inliers randomly). Frames below this threshold
             are classified as "no motion" and skipped without updating the pose.
-            The reference frame IS updated so stale references are avoided.
+            However, slow continuous motion is accumulated by NOT updating the
+            reference frame until motion crosses the threshold or max_reference_age.
+        max_reference_age: Maximum number of frames the reference frame can age
+            before forced update (default: 30). Prevents reference frame from
+            becoming too stale during long periods of sub-threshold motion, while
+            still allowing slow continuous motion to accumulate for detection.
         skip_frames: Process every N-th frame
         max_frames: Maximum number of frames to process
         verbose: Print progress information
@@ -427,6 +433,7 @@ def run_visual_odometry(
     processed_count = 0
     total_matches = 0
     total_inliers = 0
+    frames_since_last_update = 0  # Track reference frame age
 
     if verbose:
         print(f"Processing frames (skip={skip_frames})...")
@@ -497,11 +504,23 @@ def run_visual_odometry(
             rms_flow = float(np.sqrt(np.mean(np.sum(flow ** 2, axis=1))))
 
             if rms_flow < min_motion_pixels:
-                # Insufficient motion: skip pose estimation. The reference frame IS updated
-                # to avoid stale references, but the trajectory is not updated.
-                status_message = f"NO MOTION (rms={rms_flow:.2f}px)"
+                # Insufficient motion: skip pose estimation to avoid degenerate Essential Matrix.
+                # DO NOT update reference frame yet - allow slow continuous motion to accumulate
+                # across frames until it crosses the threshold. This ensures we don't miss gradual
+                # movements (e.g., slow walking, camera drift).
+                frames_since_last_update += 1
+                status_message = f"NO MOTION (rms={rms_flow:.2f}px, age={frames_since_last_update})"
                 if verbose:
-                    print(f"Frame {frame_count}: No motion (rms={rms_flow:.2f}px), skipping...")
+                    print(f"Frame {frame_count}: No motion (rms={rms_flow:.2f}px), skipping... "
+                          f"(reference age: {frames_since_last_update} frames)")
+
+                # Safety check: if reference frame becomes too old, force update to prevent
+                # large jumps when motion eventually resumes (e.g., after long static period).
+                if frames_since_last_update >= max_reference_age:
+                    prev_image = curr_image
+                    frames_since_last_update = 0
+                    if verbose:
+                        print(f"  → Reference frame forced update (age limit reached)")
             else:
                 # Estimate pose using RANSAC
                 R, t, inlier_mask = estimate_pose_ransac(
@@ -521,10 +540,14 @@ def run_visual_odometry(
                               f"(inliers={num_inliers}, ratio={inlier_ratio:.0%}), skipping...")
                     status_message = (f"POSE ESTIMATION FAILED "
                                       f"(inliers={num_inliers}, ratio={inlier_ratio:.0%})")
+                    # Keep reference frame unchanged - may succeed on next frame with more motion
+                    frames_since_last_update += 1
                 else:
-                    # Add pose to trajectory
+                    # Success: add pose to trajectory and update reference frame
                     trajectory.add_relative_pose(R, t)
                     pose_updated = True
+                    prev_image = curr_image
+                    frames_since_last_update = 0  # Reset age counter
 
                     if verbose and processed_count % 10 == 0:
                         elapsed = time.time() - start_time
@@ -539,11 +562,6 @@ def run_visual_odometry(
                                   f"matches={num_matches}, inliers={num_inliers}, "
                                   f"position={trajectory.get_current_position()}, "
                                   f"fps={fps:.1f}")
-
-            # Always update previous frame to current frame to avoid stale references
-            # This ensures the reference frame is always the most recent, even if
-            # no pose update occurs (due to low motion or pose estimation failure)
-            prev_image = curr_image
 
         # Display frame and trajectory in real-time (always update if display is on)
         if display:
@@ -709,6 +727,14 @@ def parse_args():
              "Essential Matrix estimation when the camera is stationary (default: 1.0)"
     )
     parser.add_argument(
+        "--max-reference-age",
+        type=int,
+        default=30,
+        help="Maximum number of frames the reference frame can age before forced update. "
+             "Prevents stale references during long static periods while still allowing "
+             "slow continuous motion to accumulate for detection (default: 30)"
+    )
+    parser.add_argument(
         "--skip-frames",
         type=int,
         default=0,
@@ -867,6 +893,7 @@ def main():
             min_matches=args.min_matches,
             min_inlier_ratio=args.min_inlier_ratio,
             min_motion_pixels=args.min_motion_pixels,
+            max_reference_age=args.max_reference_age,
             skip_frames=args.skip_frames,
             max_frames=args.max_frames,
             verbose=not args.quiet,
