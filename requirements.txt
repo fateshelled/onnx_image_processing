@@ -6,3 +6,10 @@ onnxruntime>=1.15.0,<2.0.0
 onnxscript>=0.1.0
 onnxsim-prebuilt==0.4.39.post2
 onnxoptimizer>=0.3.13
+opencv-python>=4.5.0
+matplotlib>=3.3.0
+
+# Optional dependencies for camera support
+# pyrealsense2>=2.50.0  # For Intel RealSense cameras
+# pyorbbecsdk>=1.5.0    # For Orbbec cameras (Astra, Femto, Gemini)
+# depthai>=2.20.0       # For Luxonis OAK-D cameras
