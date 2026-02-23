@@ -319,6 +319,94 @@ def draw_display_info(
     return info_frame
 
 
+def draw_match_frame(
+    prev_frame: np.ndarray,
+    curr_frame: np.ndarray,
+    matched_kpts1: np.ndarray,
+    matched_kpts2: np.ndarray,
+    inlier_mask: np.ndarray,
+    model_width: int,
+    model_height: int,
+    rms_flow: float = 0.0,
+    mean_flow_mag: float = 0.0,
+    max_display_height: int = 480,
+) -> np.ndarray:
+    """
+    Draw a side-by-side keypoint match visualization for debugging.
+
+    Left half: reference (previous) frame.  Right half: current frame.
+    Connecting lines are colour-coded:
+      Green  = inliers  (chirality-passing after recoverPose)
+      Red    = outliers (chirality-failing)
+      Yellow = no pose estimate (no motion / estimation failed)
+
+    Args:
+        prev_frame: Reference frame BGR (H, W, 3)
+        curr_frame: Current frame BGR (H, W, 3)
+        matched_kpts1: Matched keypoints in reference frame (N, 2) as (y, x) in model resolution
+        matched_kpts2: Matched keypoints in current frame (N, 2) as (y, x) in model resolution
+        inlier_mask: Boolean inlier mask (N,); None or all-False = no pose
+        model_width: Model input width in pixels
+        model_height: Model input height in pixels
+        rms_flow: RMS optical-flow magnitude (pixels) shown in info text
+        mean_flow_mag: Mean optical-flow magnitude (pixels) shown in info text
+        max_display_height: Height each frame is scaled to for display
+
+    Returns:
+        Side-by-side BGR canvas ready for cv2.imshow
+    """
+    fh, fw = prev_frame.shape[:2]
+    disp_h = max_display_height
+    disp_w = max(1, int(fw * disp_h / max(fh, 1)))
+
+    prev_disp = cv2.resize(prev_frame, (disp_w, disp_h))
+    curr_disp = cv2.resize(curr_frame, (disp_w, disp_h))
+
+    canvas = np.zeros((disp_h, disp_w * 2, 3), dtype=np.uint8)
+    canvas[:, :disp_w] = prev_disp
+    canvas[:, disp_w:] = curr_disp
+
+    # Scale from model resolution to display resolution
+    sx = disp_w / max(model_width, 1)
+    sy = disp_h / max(model_height, 1)
+
+    n_inliers = int(np.sum(inlier_mask)) if inlier_mask is not None else 0
+    has_pose = inlier_mask is not None and n_inliers > 0
+
+    for i, (kp1, kp2) in enumerate(zip(matched_kpts1, matched_kpts2)):
+        y1, x1 = kp1
+        y2, x2 = kp2
+        p1 = (int(x1 * sx), int(y1 * sy))
+        p2 = (int(x2 * sx) + disp_w, int(y2 * sy))
+
+        if not has_pose:
+            color = (0, 200, 200)  # Yellow: no pose estimate
+        elif inlier_mask[i]:
+            color = (0, 210, 0)    # Green: inlier
+        else:
+            color = (0, 0, 200)    # Red: outlier
+
+        cv2.line(canvas, p1, p2, color, 1, cv2.LINE_AA)
+        cv2.circle(canvas, p1, 2, color, -1)
+        cv2.circle(canvas, p2, 2, color, -1)
+
+    # Vertical divider
+    cv2.line(canvas, (disp_w, 0), (disp_w, disp_h - 1), (160, 160, 160), 1)
+
+    # Info text
+    info = (f"Matches:{len(matched_kpts1)}  Inliers:{n_inliers}  "
+            f"RMS:{rms_flow:.1f}px  Mean:{mean_flow_mag:.2f}px")
+    cv2.putText(canvas, info, (8, 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1, cv2.LINE_AA)
+
+    cv2.putText(canvas, "Reference", (8, disp_h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "Current", (disp_w + 8, disp_h - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+
+    return canvas
+
+
 def _nice_grid_step(data_range: float) -> float:
     """Compute a human-friendly grid interval for the given data range."""
     if data_range <= 0:
@@ -866,6 +954,7 @@ def run_visual_odometry(
     max_frames: int = None,
     verbose: bool = True,
     display: bool = False,
+    show_matches: bool = False,
     plot_realtime: bool = False,
 ) -> Trajectory:
     """
@@ -901,7 +990,12 @@ def run_visual_odometry(
         skip_frames: Process every N-th frame
         max_frames: Maximum number of frames to process
         verbose: Print progress information
-        display: Display frames and trajectory in real-time
+        display: Display annotated current frame in real-time
+        show_matches: Display a side-by-side keypoint match window (Reference |
+            Current) with connecting lines colour-coded by inlier/outlier
+            status. Useful for debugging matching quality. Requires either
+            ``display`` or ``plot_realtime`` to also be True so that the
+            cv2.waitKey loop runs.
 
     Returns:
         Trajectory object containing camera poses
@@ -931,7 +1025,7 @@ def run_visual_odometry(
         raise RuntimeError("Failed to read first frame")
 
     prev_image = load_image_from_array(prev_frame, model_height, model_width)
-    # display_frame = prev_frame.copy() if display else None
+    prev_display_frame = prev_frame.copy() if show_matches else None
 
     frame_count = 0
     processed_count = 0
@@ -940,11 +1034,12 @@ def run_visual_odometry(
     frames_since_last_update = 0  # Track reference frame age
 
     traj_viewer = TrajectoryViewer() if plot_realtime else None
+    paused = False
 
     if verbose:
         print(f"Processing frames (skip={skip_frames})...")
-        if display or plot_realtime:
-            print("Press 'q' to quit, 's' to save, 't' to toggle 2D/3D trajectory")
+        if display or show_matches or plot_realtime:
+            print("Press 'q' to quit, 's' to save, 't' to toggle 2D/3D, Space to pause/resume")
 
     start_time = time.time()
 
@@ -997,6 +1092,8 @@ def run_visual_odometry(
         pose_updated = False
         inlier_mask = np.zeros(num_matches, dtype=bool)
         num_inliers = 0
+        rms_flow = 0.0
+        mean_flow_mag = 0.0
 
         if num_matches < min_matches:
             if verbose:
@@ -1016,15 +1113,20 @@ def run_visual_odometry(
                 # across frames until it crosses the threshold. This ensures we don't miss gradual
                 # movements (e.g., slow walking, camera drift).
                 frames_since_last_update += 1
-                status_message = f"NO MOTION (rms={rms_flow:.2f}px, age={frames_since_last_update})"
+                status_message = (f"NO MOTION (rms={rms_flow:.2f}px, "
+                                  f"mean={mean_flow_mag:.2f}px, "
+                                  f"age={frames_since_last_update})")
                 if verbose:
-                    print(f"Frame {frame_count}: No motion (rms={rms_flow:.2f}px), skipping... "
+                    print(f"Frame {frame_count}: No motion "
+                          f"(rms={rms_flow:.2f}px, mean={mean_flow_mag:.2f}px), skipping... "
                           f"(reference age: {frames_since_last_update} frames)")
 
                 # Safety check: if reference frame becomes too old, force update to prevent
                 # large jumps when motion eventually resumes (e.g., after long static period).
                 if frames_since_last_update >= max_reference_age:
                     prev_image = curr_image
+                    if show_matches:
+                        prev_display_frame = curr_frame.copy()
                     frames_since_last_update = 0
                     if verbose:
                         print(f"  → Reference frame forced update (age limit reached)")
@@ -1068,6 +1170,8 @@ def run_visual_odometry(
                     trajectory.add_relative_pose(R, t)
                     pose_updated = True
                     prev_image = curr_image
+                    if show_matches:
+                        prev_display_frame = curr_frame.copy()
                     frames_since_last_update = 0  # Reset age counter
 
                     if verbose and processed_count % 10 == 0:
@@ -1076,11 +1180,13 @@ def run_visual_odometry(
                         if reader.is_camera or reader.total_frames == float('inf'):
                             print(f"Frame {frame_count}: "
                                   f"matches={num_matches}, inliers={num_inliers}, "
+                                  f"rms={rms_flow:.1f}px, mean={mean_flow_mag:.2f}px, "
                                   f"position={trajectory.get_current_position()}, "
                                   f"fps={fps:.1f}")
                         else:
                             print(f"Frame {frame_count}/{reader.total_frames}: "
                                   f"matches={num_matches}, inliers={num_inliers}, "
+                                  f"rms={rms_flow:.1f}px, mean={mean_flow_mag:.2f}px, "
                                   f"position={trajectory.get_current_position()}, "
                                   f"fps={fps:.1f}")
 
@@ -1101,12 +1207,26 @@ def run_visual_odometry(
             )
             cv2.imshow('Visual Odometry', info_frame)
 
+        if show_matches and prev_display_frame is not None:
+            match_canvas = draw_match_frame(
+                prev_frame=prev_display_frame,
+                curr_frame=curr_frame,
+                matched_kpts1=matched_kpts1,
+                matched_kpts2=matched_kpts2,
+                inlier_mask=inlier_mask,
+                model_width=model_width,
+                model_height=model_height,
+                rms_flow=rms_flow,
+                mean_flow_mag=mean_flow_mag,
+            )
+            cv2.imshow('Matches', match_canvas)
+
         if traj_viewer is not None:
             traj_viewer.render(trajectory)
 
-        if display or plot_realtime:
-            # Check for key press
-            key = cv2.waitKey(1) & 0xFF
+        if display or show_matches or plot_realtime:
+            # When paused, block until any key is pressed; otherwise poll briefly.
+            key = cv2.waitKey(0 if paused else 1) & 0xFF
             if key == ord('q'):
                 print("\nQuitting...")
                 break
@@ -1118,6 +1238,10 @@ def run_visual_odometry(
                 traj_viewer.toggle_mode()
                 if verbose:
                     print(f"Trajectory view: {traj_viewer.mode.upper()}")
+            elif key == ord(' '):
+                paused = not paused
+                if verbose:
+                    print(f"{'Paused' if paused else 'Resumed'} (Space to toggle)")
 
     elapsed = time.time() - start_time
 
@@ -1297,7 +1421,14 @@ def parse_args():
     parser.add_argument(
         "--display",
         action="store_true",
-        help="Display camera frames with keypoints in real-time (press 'q' to quit, 's' to save)"
+        help="Display annotated camera frames with keypoints in real-time (press 'q' to quit)"
+    )
+    parser.add_argument(
+        "--show-matches",
+        action="store_true",
+        help="Display a side-by-side keypoint match window (Reference | Current) with "
+             "colour-coded connecting lines for debugging matching quality. "
+             "Green=inlier, Red=outlier, Yellow=no pose estimate."
     )
     parser.add_argument(
         "--plot-realtime",
@@ -1439,11 +1570,12 @@ def main():
             max_frames=args.max_frames,
             verbose=not args.quiet,
             display=args.display,
+            show_matches=args.show_matches,
             plot_realtime=args.plot_realtime,
         )
     finally:
         reader.release()
-        if args.display or args.plot_realtime:
+        if args.display or args.show_matches or args.plot_realtime:
             cv2.destroyAllWindows()
 
     # Save trajectory if requested
