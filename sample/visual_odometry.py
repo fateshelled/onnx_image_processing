@@ -2,12 +2,27 @@
 """
 Visual Odometry sample using ONNX feature matching model.
 
-Estimates camera trajectory from a video or image sequence using the
-Shi-Tomasi + Angle + Sparse BAD + Sinkhorn ONNX model for feature matching.
+Estimates camera trajectory from a video or image sequence.  Two model types
+are supported and detected automatically from the number of model outputs:
+
+  3-output model (keypoints1, keypoints2, matching_probs):
+      Shi-Tomasi + Angle + Sparse BAD + Sinkhorn
+      Pose estimation is performed with OpenCV RANSAC (findEssentialMat).
+
+  4-output model (keypoints1, keypoints2, matching_probs, E):
+      Shi-Tomasi + Angle + Sparse BAD + Sinkhorn + Essential Matrix
+      The Essential Matrix is estimated inside the ONNX model using the
+      weighted 8-point algorithm.  Pose recovery (recoverPose) is called
+      directly with the ONNX-provided E, skipping RANSAC.
 
 Usage:
-    # First, export the ONNX model:
+    # Export the 3-output model:
     python onnx_export/export_shi_tomasi_angle_sparse_bad_sinkhorn.py -o matcher.onnx -H 480 -W 640 --max-keypoints 512
+
+    # Export the 4-output combined model (Essential Matrix baked in):
+    python onnx_export/export_shi_tomasi_angle_sparse_bad_sinkhorn_essential_matrix.py \\
+        -o matcher_e.onnx -H 480 -W 640 --max-keypoints 512 \\
+        --fx 525 --fy 525 --cx 320 --cy 240
 
     # Run VO on video:
     python sample/visual_odometry.py --model matcher.onnx --video video.mp4 --fx 525 --fy 525 --cx 320 --cy 240
@@ -75,6 +90,57 @@ def load_image_from_array(
     # Convert to float32 and add batch/channel dimensions
     arr = resized.astype(np.float32)
     return arr[np.newaxis, np.newaxis, :, :]
+
+
+def estimate_pose_from_essential_matrix(
+    keypoints1: np.ndarray,
+    keypoints2: np.ndarray,
+    E: np.ndarray,
+    camera_intrinsics,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray]:
+    """
+    Recover camera pose from a pre-computed Essential Matrix.
+
+    Used with the 4-output combined ONNX model
+    (Shi-Tomasi + Angle + Sparse BAD + Sinkhorn + Essential Matrix), which
+    embeds Essential Matrix estimation inside the ONNX graph.  Unlike the
+    RANSAC-based ``estimate_pose_ransac``, this function skips
+    ``findEssentialMat`` and calls ``recoverPose`` directly with the
+    ONNX-provided E.
+
+    Args:
+        keypoints1: Matched keypoints in image 1, shape (N, 2) as (y, x).
+        keypoints2: Matched keypoints in image 2, shape (N, 2) as (y, x).
+        E: Essential Matrix from the ONNX model, shape (3, 3).
+        camera_intrinsics: Camera intrinsic parameters (CameraIntrinsics).
+
+    Returns:
+        Tuple of:
+            - R: Rotation matrix (3, 3) or None if recovery failed.
+            - t: Translation vector (3, 1) or None if recovery failed.
+            - inlier_mask: Boolean mask of chirality-passing points (N,).
+    """
+    if len(keypoints1) < 5:
+        return None, None, np.zeros(len(keypoints1), dtype=bool)
+
+    # Convert from (y, x) to (x, y) as required by OpenCV
+    pts1 = keypoints1[:, [1, 0]].astype(np.float64)
+    pts2 = keypoints2[:, [1, 0]].astype(np.float64)
+
+    E_f64 = E.astype(np.float64)
+
+    num_inliers, R, t, pose_mask = cv2.recoverPose(
+        E_f64,
+        pts1,
+        pts2,
+        camera_intrinsics.K,
+    )
+
+    if num_inliers < 5:
+        return None, None, np.zeros(len(keypoints1), dtype=bool)
+
+    inlier_mask = pose_mask.ravel() > 0
+    return R, t, inlier_mask
 
 
 def extract_matches(
@@ -416,6 +482,11 @@ def run_visual_odometry(
     input_names = [inp.name for inp in session.get_inputs()]
     output_names = [out.name for out in session.get_outputs()]
 
+    # Detect model type by number of outputs:
+    #   3 outputs → Sinkhorn-only model  (keypoints1, keypoints2, matching_probs)
+    #   4 outputs → Combined model       (keypoints1, keypoints2, matching_probs, E)
+    has_essential_matrix = len(output_names) >= 4
+
     # Warm up camera (allow auto-exposure/auto-focus to stabilize)
     if reader.is_camera:
         for _ in range(10):
@@ -473,9 +544,10 @@ def run_visual_odometry(
             {input_names[0]: prev_image, input_names[1]: curr_image},
         )
 
-        keypoints1 = results[0]  # (1, K, 2)
-        keypoints2 = results[1]  # (1, K, 2)
+        keypoints1 = results[0]      # (1, K, 2)
+        keypoints2 = results[1]      # (1, K, 2)
         matching_probs = results[2]  # (1, K+1, K+1)
+        E_onnx = results[3] if has_essential_matrix else None  # (3, 3) or None
 
         # Extract matches
         matched_kpts1, matched_kpts2, _scores = extract_matches(
@@ -526,13 +598,27 @@ def run_visual_odometry(
                     if verbose:
                         print(f"  → Reference frame forced update (age limit reached)")
             else:
-                # Estimate pose using RANSAC
-                R, t, inlier_mask = estimate_pose_ransac(
-                    matched_kpts1,
-                    matched_kpts2,
-                    camera_intrinsics,
-                    ransac_threshold=ransac_threshold,
-                )
+                # Estimate pose
+                if has_essential_matrix:
+                    # 4-output model: use the Essential Matrix from ONNX directly.
+                    # The E matrix was computed inside the model using all keypoints
+                    # weighted by Sinkhorn probabilities (weighted 8-point algorithm).
+                    # We still call recoverPose with the extracted matches to resolve
+                    # the sign ambiguity and obtain the inlier chirality mask.
+                    R, t, inlier_mask = estimate_pose_from_essential_matrix(
+                        matched_kpts1,
+                        matched_kpts2,
+                        E_onnx,
+                        camera_intrinsics,
+                    )
+                else:
+                    # 3-output model: estimate E via RANSAC then recover pose.
+                    R, t, inlier_mask = estimate_pose_ransac(
+                        matched_kpts1,
+                        matched_kpts2,
+                        camera_intrinsics,
+                        ransac_threshold=ransac_threshold,
+                    )
 
                 num_inliers = np.sum(inlier_mask)
                 total_inliers += num_inliers
@@ -797,7 +883,14 @@ def main():
     model_height = input_shape[2]
     model_width = input_shape[3]
 
+    has_essential_matrix = len(outputs) >= 4
+    model_type = (
+        "Sinkhorn + Essential Matrix (4-output)"
+        if has_essential_matrix
+        else "Sinkhorn (3-output)"
+    )
     print(f"Model input size: {model_height}x{model_width}")
+    print(f"Model type: {model_type}")
     for inp in inputs:
         print(f"  Input:  {inp.name} {inp.shape}")
     for out in outputs:
