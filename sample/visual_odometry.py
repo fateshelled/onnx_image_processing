@@ -30,8 +30,8 @@ Usage:
     # Run VO on image sequence:
     python sample/visual_odometry.py --model matcher.onnx --image-dir frames/ --fx 525 --fy 525 --cx 320 --cy 240
 
-    # Run VO on webcam:
-    python sample/visual_odometry.py --model matcher.onnx --camera 0 --fx 525 --fy 525 --cx 320 --cy 240 --display
+    # Run VO on webcam with live trajectory plot:
+    python sample/visual_odometry.py --model matcher.onnx --camera 0 --fx 525 --fy 525 --cx 320 --cy 240 --display --plot-realtime
 
     # Save trajectory and visualization:
     python sample/visual_odometry.py --model matcher.onnx --video video.mp4 --fx 525 --fy 525 --cx 320 --cy 240 --save-trajectory trajectory.npz --save-plot trajectory.png
@@ -319,6 +319,146 @@ def draw_display_info(
     return info_frame
 
 
+def _nice_grid_step(data_range: float) -> float:
+    """Compute a human-friendly grid interval for the given data range."""
+    if data_range <= 0:
+        return 1.0
+    rough = data_range / 6.0
+    exp = int(np.floor(np.log10(rough)))
+    mag = 10.0 ** exp
+    frac = rough / mag
+    if frac < 1.5:
+        return mag * 1.0
+    elif frac < 3.5:
+        return mag * 2.0
+    elif frac < 7.5:
+        return mag * 5.0
+    else:
+        return mag * 10.0
+
+
+def draw_trajectory_canvas(
+    trajectory,  # Trajectory type
+    canvas_size: int = 600,
+) -> np.ndarray:
+    """
+    Render the trajectory as a top-down (X-Z plane) OpenCV image.
+
+    The camera moves in the X-Z plane for forward motion; Y is vertical.
+
+    Args:
+        trajectory: Trajectory object
+        canvas_size: Width and height of the square output canvas in pixels
+
+    Returns:
+        BGR image of shape (canvas_size, canvas_size, 3)
+    """
+    H = W = canvas_size
+    # Plot area margins (pixels)
+    mg_top, mg_bottom, mg_left, mg_right = 30, 65, 55, 20
+    px0, py0 = mg_left, mg_top          # top-left of plot area
+    px1, py1 = W - mg_right, H - mg_bottom  # bottom-right of plot area
+    pw, ph = px1 - px0, py1 - py0
+
+    canvas = np.full((H, W, 3), 25, dtype=np.uint8)  # dark background
+
+    positions = trajectory.get_positions_array()  # (N, 3)
+    xs = positions[:, 0]
+    zs = positions[:, 2]
+
+    x_center = (xs.min() + xs.max()) / 2.0
+    z_center = (zs.min() + zs.max()) / 2.0
+    x_range = xs.max() - xs.min()
+    z_range = zs.max() - zs.min()
+
+    # Enforce a minimum view range so the origin is not zoomed in too far
+    x_view = max(x_range, 1.0)
+    z_view = max(z_range, 1.0)
+    scale = min(pw / x_view, ph / z_view) * 0.82  # px per meter
+
+    def to_canvas(x: float, z: float) -> tuple[int, int]:
+        cx = int(px0 + pw / 2 + (x - x_center) * scale)
+        cy = int(py0 + ph / 2 - (z - z_center) * scale)  # Z+ → up
+        return cx, cy
+
+    # -- Grid -----------------------------------------------------------------
+    grid_step = _nice_grid_step(max(x_view, z_view))
+
+    # visible world range of the plot area
+    x_view_min = x_center - (pw / 2) / scale
+    x_view_max = x_center + (pw / 2) / scale
+    z_view_min = z_center - (ph / 2) / scale
+    z_view_max = z_center + (ph / 2) / scale
+
+    xg = np.floor(x_view_min / grid_step) * grid_step
+    while xg <= x_view_max + grid_step:
+        cx, _ = to_canvas(xg, z_center)
+        if px0 <= cx <= px1:
+            cv2.line(canvas, (cx, py0), (cx, py1), (50, 50, 50), 1)
+            cv2.putText(canvas, f"{xg:.1f}", (cx - 14, py1 + 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1)
+        xg += grid_step
+
+    zg = np.floor(z_view_min / grid_step) * grid_step
+    while zg <= z_view_max + grid_step:
+        _, cy = to_canvas(x_center, zg)
+        if py0 <= cy <= py1:
+            cv2.line(canvas, (px0, cy), (px1, cy), (50, 50, 50), 1)
+            cv2.putText(canvas, f"{zg:.1f}", (2, cy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1)
+        zg += grid_step
+
+    # Plot border
+    cv2.rectangle(canvas, (px0, py0), (px1, py1), (80, 80, 80), 1)
+
+    # -- Trajectory path (orange) ---------------------------------------------
+    if len(positions) >= 2:
+        for i in range(1, len(positions)):
+            cv2.line(canvas, to_canvas(xs[i - 1], zs[i - 1]),
+                     to_canvas(xs[i], zs[i]), (30, 140, 255), 2)
+
+    # -- Start marker (green) -------------------------------------------------
+    cv2.circle(canvas, to_canvas(xs[0], zs[0]), 5, (0, 200, 60), -1)
+    cv2.circle(canvas, to_canvas(xs[0], zs[0]), 6, (255, 255, 255), 1)
+
+    # -- Current position marker (red) ----------------------------------------
+    cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 5, (50, 50, 230), -1)
+    cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 6, (255, 255, 255), 1)
+
+    # -- Labels ---------------------------------------------------------------
+    # Title
+    cv2.putText(canvas, "Trajectory  (Top View: X-Z)", (px0, mg_top - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1)
+
+    # Axis labels
+    cv2.putText(canvas, "X [m]", (px1 - 36, H - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+    cv2.putText(canvas, "Z [m]", (2, py0 - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+
+    # Current position text
+    pos = trajectory.get_current_position()
+    cv2.putText(canvas,
+                f"Pos: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) m",
+                (px0, H - 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+
+    # Pose count
+    cv2.putText(canvas, f"Poses: {len(trajectory)}", (px1 - 75, H - 38),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+
+    # Legend
+    lx, ly = px0, H - 18
+    cv2.circle(canvas, (lx + 4, ly), 4, (0, 200, 60), -1)
+    cv2.putText(canvas, "Start", (lx + 12, ly + 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
+    cv2.circle(canvas, (lx + 60, ly), 4, (50, 50, 230), -1)
+    cv2.putText(canvas, "Current", (lx + 68, ly + 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
+
+    return canvas
+
+
 class VideoReader:
     """Read frames from video file, image sequence, or webcam."""
 
@@ -438,6 +578,7 @@ def run_visual_odometry(
     max_frames: int = None,
     verbose: bool = True,
     display: bool = False,
+    plot_realtime: bool = False,
 ) -> Trajectory:
     """
     Run visual odometry on video/image sequence/webcam.
@@ -512,7 +653,7 @@ def run_visual_odometry(
 
     if verbose:
         print(f"Processing frames (skip={skip_frames})...")
-        if display:
+        if display or plot_realtime:
             print("Press 'q' to quit, 's' to save current trajectory")
 
     start_time = time.time()
@@ -653,7 +794,7 @@ def run_visual_odometry(
                                   f"position={trajectory.get_current_position()}, "
                                   f"fps={fps:.1f}")
 
-        # Display frame and trajectory in real-time (always update if display is on)
+        # Display frame and/or trajectory plot in real-time
         if display:
             info_frame = draw_display_info(
                 frame=curr_frame,
@@ -670,6 +811,11 @@ def run_visual_odometry(
             )
             cv2.imshow('Visual Odometry', info_frame)
 
+        if plot_realtime:
+            traj_canvas = draw_trajectory_canvas(trajectory)
+            cv2.imshow('Trajectory', traj_canvas)
+
+        if display or plot_realtime:
             # Check for key press
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
@@ -858,7 +1004,12 @@ def parse_args():
     parser.add_argument(
         "--display",
         action="store_true",
-        help="Display frames and trajectory in real-time (press 'q' to quit, 's' to save)"
+        help="Display camera frames with keypoints in real-time (press 'q' to quit, 's' to save)"
+    )
+    parser.add_argument(
+        "--plot-realtime",
+        action="store_true",
+        help="Display a live top-down trajectory plot in a separate window while processing"
     )
     parser.add_argument(
         "--quiet", "-q",
@@ -995,10 +1146,11 @@ def main():
             max_frames=args.max_frames,
             verbose=not args.quiet,
             display=args.display,
+            plot_realtime=args.plot_realtime,
         )
     finally:
         reader.release()
-        if args.display:
+        if args.display or args.plot_realtime:
             cv2.destroyAllWindows()
 
     # Save trajectory if requested
