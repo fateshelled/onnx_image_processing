@@ -337,126 +337,377 @@ def _nice_grid_step(data_range: float) -> float:
         return mag * 10.0
 
 
-def draw_trajectory_canvas(
-    trajectory,  # Trajectory type
-    canvas_size: int = 600,
-) -> np.ndarray:
+class TrajectoryViewer:
     """
-    Render the trajectory as a top-down (X-Z plane) OpenCV image.
+    Real-time trajectory visualization window using OpenCV.
 
-    The camera moves in the X-Z plane for forward motion; Y is vertical.
+    Supports two display modes toggled with the ``t`` key:
 
-    Args:
-        trajectory: Trajectory object
-        canvas_size: Width and height of the square output canvas in pixels
+    * **2D** – top-down X-Z plane view (default)
+    * **3D** – orthographic projection with configurable azimuth / elevation
 
-    Returns:
-        BGR image of shape (canvas_size, canvas_size, 3)
+    The window is created on construction and destroyed by :meth:`destroy`
+    (or implicitly when ``cv2.destroyAllWindows()`` is called).
+
+    A mouse callback is pre-registered for future pan / zoom / rotate support;
+    see :meth:`_on_mouse` for the implementation guide.
+
+    Public view-state attributes (can be set before calling :meth:`render`):
+
+    * ``mode``        – ``"2d"`` or ``"3d"``
+    * ``azimuth``     – 3-D horizontal orbit angle in degrees (default -60)
+    * ``elevation``   – 3-D tilt above horizontal in degrees (default 30)
+    * ``zoom``        – multiplicative zoom factor; >1 zooms in (default 1.0)
+    * ``pan_x``       – world-space X pan offset in metres (default 0.0)
+    * ``pan_z``       – world-space Z pan offset in metres (default 0.0)
     """
-    H = W = canvas_size
-    # Plot area margins (pixels)
-    mg_top, mg_bottom, mg_left, mg_right = 30, 65, 55, 20
-    px0, py0 = mg_left, mg_top          # top-left of plot area
-    px1, py1 = W - mg_right, H - mg_bottom  # bottom-right of plot area
-    pw, ph = px1 - px0, py1 - py0
 
-    canvas = np.full((H, W, 3), 25, dtype=np.uint8)  # dark background
+    WINDOW_NAME = "Trajectory"
 
-    positions = trajectory.get_positions_array()  # (N, 3)
-    xs = positions[:, 0]
-    zs = positions[:, 2]
+    def __init__(self, canvas_size: int = 600) -> None:
+        self.canvas_size = canvas_size
+        self.mode: str = "2d"       # "2d" | "3d"
 
-    x_center = (xs.min() + xs.max()) / 2.0
-    z_center = (zs.min() + zs.max()) / 2.0
-    x_range = xs.max() - xs.min()
-    z_range = zs.max() - zs.min()
+        # 3-D view angles (degrees)
+        self.azimuth: float = -60.0     # horizontal orbit around world Y
+        self.elevation: float = 30.0    # tilt above horizontal
 
-    # Enforce a minimum view range so the origin is not zoomed in too far
-    x_view = max(x_range, 1.0)
-    z_view = max(z_range, 1.0)
-    scale = min(pw / x_view, ph / z_view) * 0.82  # px per meter
+        # 2-D / 3-D shared pan & zoom (reserved for mouse interaction)
+        self.zoom: float = 1.0          # >1 → zoomed in; <1 → zoomed out
+        self.pan_x: float = 0.0         # world-space X offset (metres)
+        self.pan_z: float = 0.0         # world-space Z offset (metres)
 
-    def to_canvas(x: float, z: float) -> tuple[int, int]:
-        cx = int(px0 + pw / 2 + (x - x_center) * scale)
-        cy = int(py0 + ph / 2 - (z - z_center) * scale)  # Z+ → up
-        return cx, cy
+        # Internal drag state used by the mouse callback
+        self._mouse_pressed: bool = False
+        self._mouse_button: int = -1    # 0 = left, 1 = right
+        self._drag_start_x: int = 0
+        self._drag_start_y: int = 0
+        self._mouse_x: int = 0
+        self._mouse_y: int = 0
 
-    # -- Grid -----------------------------------------------------------------
-    grid_step = _nice_grid_step(max(x_view, z_view))
+        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(self.WINDOW_NAME, self._on_mouse)
 
-    # visible world range of the plot area
-    x_view_min = x_center - (pw / 2) / scale
-    x_view_max = x_center + (pw / 2) / scale
-    z_view_min = z_center - (ph / 2) / scale
-    z_view_max = z_center + (ph / 2) / scale
+    # ------------------------------------------------------------------
+    # Mouse interaction – stub; extend here to add interactivity
+    # ------------------------------------------------------------------
 
-    xg = np.floor(x_view_min / grid_step) * grid_step
-    while xg <= x_view_max + grid_step:
-        cx, _ = to_canvas(xg, z_center)
-        if px0 <= cx <= px1:
-            cv2.line(canvas, (cx, py0), (cx, py1), (50, 50, 50), 1)
-            cv2.putText(canvas, f"{xg:.1f}", (cx - 14, py1 + 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1)
-        xg += grid_step
+    def _on_mouse(
+        self, event: int, x: int, y: int, flags: int, param
+    ) -> None:
+        """
+        OpenCV mouse callback – currently a stub for future interactivity.
 
-    zg = np.floor(z_view_min / grid_step) * grid_step
-    while zg <= z_view_max + grid_step:
-        _, cy = to_canvas(x_center, zg)
-        if py0 <= cy <= py1:
-            cv2.line(canvas, (px0, cy), (px1, cy), (50, 50, 50), 1)
-            cv2.putText(canvas, f"{zg:.1f}", (2, cy + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1)
-        zg += grid_step
+        Planned behaviour (not yet active):
 
-    # Plot border
-    cv2.rectangle(canvas, (px0, py0), (px1, py1), (80, 80, 80), 1)
+        **2-D mode**
 
-    # -- Trajectory path (orange) ---------------------------------------------
-    if len(positions) >= 2:
-        for i in range(1, len(positions)):
-            cv2.line(canvas, to_canvas(xs[i - 1], zs[i - 1]),
-                     to_canvas(xs[i], zs[i]), (30, 140, 255), 2)
+          - Left-drag       pan the view   (update ``pan_x``, ``pan_z``)
+          - Scroll up/down  zoom in / out  (update ``zoom``)
+          - Double-click    reset pan & zoom to defaults
 
-    # -- Start marker (green) -------------------------------------------------
-    cv2.circle(canvas, to_canvas(xs[0], zs[0]), 5, (0, 200, 60), -1)
-    cv2.circle(canvas, to_canvas(xs[0], zs[0]), 6, (255, 255, 255), 1)
+        **3-D mode**
 
-    # -- Current position marker (red) ----------------------------------------
-    cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 5, (50, 50, 230), -1)
-    cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 6, (255, 255, 255), 1)
+          - Left-drag       orbit camera   (update ``azimuth``, ``elevation``)
+          - Right-drag      pan target     (update ``pan_x``, ``pan_z``)
+          - Scroll up/down  zoom in / out  (update ``zoom``)
+          - Double-click    reset to default view angles
 
-    # -- Labels ---------------------------------------------------------------
-    # Title
-    cv2.putText(canvas, "Trajectory  (Top View: X-Z)", (px0, mg_top - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1)
+        Implementation guide – fill in the placeholder ``pass`` statements:
 
-    # Axis labels
-    cv2.putText(canvas, "X [m]", (px1 - 36, H - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
-    cv2.putText(canvas, "Z [m]", (2, py0 - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+        1. ``EVENT_LBUTTONDOWN`` / ``EVENT_RBUTTONDOWN`` →
+           save ``_drag_start_x/y``, set ``_mouse_pressed = True``.
+        2. ``EVENT_MOUSEMOVE`` while pressed →
+           compute ``dx = x - _drag_start_x``, ``dy = y - _drag_start_y``;
+           update view state:
 
-    # Current position text
-    pos = trajectory.get_current_position()
-    cv2.putText(canvas,
-                f"Pos: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) m",
-                (px0, H - 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+           - 2-D pan:   ``pan_x -= dx / scale``,  ``pan_z += dy / scale``
+           - 3-D orbit: ``azimuth  -= dx * 0.5``,  ``elevation = clamp(elevation + dy * 0.5, -89, 89)``
 
-    # Pose count
-    cv2.putText(canvas, f"Poses: {len(trajectory)}", (px1 - 75, H - 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+           Update ``_drag_start_x/y`` to ``x, y`` so delta is incremental.
+        3. ``EVENT_LBUTTONUP`` / ``EVENT_RBUTTONUP`` →
+           clear ``_mouse_pressed``.
+        4. ``EVENT_MOUSEWHEEL`` (``flags > 0`` = scroll up = zoom in) →
+           ``zoom = clamp(zoom * (1.1 if flags > 0 else 0.9), 0.1, 50)``.
+        """
+        self._mouse_x, self._mouse_y = x, y
 
-    # Legend
-    lx, ly = px0, H - 18
-    cv2.circle(canvas, (lx + 4, ly), 4, (0, 200, 60), -1)
-    cv2.putText(canvas, "Start", (lx + 12, ly + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
-    cv2.circle(canvas, (lx + 60, ly), 4, (50, 50, 230), -1)
-    cv2.putText(canvas, "Current", (lx + 68, ly + 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._mouse_pressed = True
+            self._mouse_button = 0
+            self._drag_start_x, self._drag_start_y = x, y
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self._mouse_pressed = True
+            self._mouse_button = 1
+            self._drag_start_x, self._drag_start_y = x, y
+        elif event in (cv2.EVENT_LBUTTONUP, cv2.EVENT_RBUTTONUP):
+            self._mouse_pressed = False
+            self._mouse_button = -1
+        elif event == cv2.EVENT_MOUSEMOVE and self._mouse_pressed:
+            pass  # TODO: pan (2-D) / orbit (3-D)
+        elif event == cv2.EVENT_MOUSEWHEEL:
+            pass  # TODO: zoom (flags > 0 → zoom in, flags < 0 → zoom out)
 
-    return canvas
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    def toggle_mode(self) -> None:
+        """Toggle between '2d' and '3d' display modes."""
+        self.mode = "3d" if self.mode == "2d" else "2d"
+
+    def render(self, trajectory) -> None:
+        """Render the trajectory to the OpenCV window."""
+        if self.mode == "2d":
+            canvas = self._draw_2d(trajectory)
+        else:
+            canvas = self._draw_3d(trajectory)
+        cv2.imshow(self.WINDOW_NAME, canvas)
+
+    def destroy(self) -> None:
+        """Destroy the trajectory window."""
+        cv2.destroyWindow(self.WINDOW_NAME)
+
+    # ------------------------------------------------------------------
+    # 2-D top-down view (X-Z plane)
+    # ------------------------------------------------------------------
+
+    def _draw_2d(self, trajectory) -> np.ndarray:
+        """Render top-down X-Z plane view."""
+        H = W = self.canvas_size
+        mg_top, mg_bottom, mg_left, mg_right = 30, 65, 55, 20
+        px0, py0 = mg_left, mg_top
+        px1, py1 = W - mg_right, H - mg_bottom
+        pw, ph = px1 - px0, py1 - py0
+
+        canvas = np.full((H, W, 3), 25, dtype=np.uint8)
+
+        positions = trajectory.get_positions_array()  # (N, 3)
+        xs, zs = positions[:, 0], positions[:, 2]
+
+        x_center = (xs.min() + xs.max()) / 2.0 + self.pan_x
+        z_center = (zs.min() + zs.max()) / 2.0 + self.pan_z
+
+        # Apply zoom: larger zoom → smaller visible world range → larger scale
+        x_view = max(xs.max() - xs.min(), 1.0) / self.zoom
+        z_view = max(zs.max() - zs.min(), 1.0) / self.zoom
+        scale = min(pw / x_view, ph / z_view) * 0.82  # px / m
+
+        def to_canvas(x: float, z: float) -> tuple[int, int]:
+            cx = int(px0 + pw / 2 + (x - x_center) * scale)
+            cy = int(py0 + ph / 2 - (z - z_center) * scale)  # Z+ → up
+            return cx, cy
+
+        # Grid
+        grid_step = _nice_grid_step(max(x_view, z_view))
+        x_vmin = x_center - (pw / 2) / scale
+        x_vmax = x_center + (pw / 2) / scale
+        z_vmin = z_center - (ph / 2) / scale
+        z_vmax = z_center + (ph / 2) / scale
+
+        xg = np.floor(x_vmin / grid_step) * grid_step
+        while xg <= x_vmax + grid_step:
+            cx, _ = to_canvas(xg, z_center)
+            if px0 <= cx <= px1:
+                cv2.line(canvas, (cx, py0), (cx, py1), (50, 50, 50), 1)
+                cv2.putText(canvas, f"{xg:.1f}", (cx - 14, py1 + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1)
+            xg += grid_step
+
+        zg = np.floor(z_vmin / grid_step) * grid_step
+        while zg <= z_vmax + grid_step:
+            _, cy = to_canvas(x_center, zg)
+            if py0 <= cy <= py1:
+                cv2.line(canvas, (px0, cy), (px1, cy), (50, 50, 50), 1)
+                cv2.putText(canvas, f"{zg:.1f}", (2, cy + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (110, 110, 110), 1)
+            zg += grid_step
+
+        cv2.rectangle(canvas, (px0, py0), (px1, py1), (80, 80, 80), 1)
+
+        # Trajectory path
+        if len(positions) >= 2:
+            for i in range(1, len(positions)):
+                cv2.line(canvas,
+                         to_canvas(xs[i - 1], zs[i - 1]),
+                         to_canvas(xs[i], zs[i]),
+                         (30, 140, 255), 2)
+
+        # Markers
+        cv2.circle(canvas, to_canvas(xs[0], zs[0]), 5, (0, 200, 60), -1)
+        cv2.circle(canvas, to_canvas(xs[0], zs[0]), 6, (255, 255, 255), 1)
+        cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 5, (50, 50, 230), -1)
+        cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 6, (255, 255, 255), 1)
+
+        # Axis labels
+        cv2.putText(canvas, "X [m]", (px1 - 36, H - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+        cv2.putText(canvas, "Z [m]", (2, py0 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (150, 150, 150), 1)
+
+        self._draw_common_labels(canvas, trajectory, "2D  Top View (X-Z)",
+                                 px0, py0, px1, py1, H, W, mg_top)
+        return canvas
+
+    # ------------------------------------------------------------------
+    # 3-D orthographic view
+    # ------------------------------------------------------------------
+
+    def _draw_3d(self, trajectory) -> np.ndarray:
+        """Render 3-D orthographic projection."""
+        H = W = self.canvas_size
+        mg_top, mg_bottom, mg_left, mg_right = 30, 65, 20, 20
+        px0, py0 = mg_left, mg_top
+        px1, py1 = W - mg_right, H - mg_bottom
+        pw, ph = px1 - px0, py1 - py0
+
+        canvas = np.full((H, W, 3), 25, dtype=np.uint8)
+
+        positions = trajectory.get_positions_array()  # (N, 3)
+
+        # Rotation matrix: world → screen
+        #   Ry: orbit around world Y (azimuth)
+        #   Rx: tilt up/down (elevation)
+        az = np.radians(self.azimuth)
+        el = np.radians(self.elevation)
+        Ry = np.array([[ np.cos(az), 0, np.sin(az)],
+                       [ 0,          1, 0          ],
+                       [-np.sin(az), 0, np.cos(az)]])
+        Rx = np.array([[1, 0,             0            ],
+                       [0, np.cos(el), -np.sin(el)],
+                       [0, np.sin(el),  np.cos(el)]])
+        R = Rx @ Ry  # (3, 3)
+
+        center = positions.mean(axis=0)
+        rotated = (R @ (positions - center).T).T  # (N, 3)
+
+        # Screen scale: fit the rotated extents with zoom applied
+        rot_range = max(
+            rotated[:, 0].max() - rotated[:, 0].min(),
+            rotated[:, 1].max() - rotated[:, 1].min(),
+            1.0,
+        ) / self.zoom
+        scale = min(pw, ph) / rot_range * 0.82  # px / m
+
+        def to_canvas(rx: float, ry: float) -> tuple[int, int]:
+            cx = int(px0 + pw / 2 + rx * scale)
+            cy = int(py0 + ph / 2 - ry * scale)  # screen Y downward
+            return cx, cy
+
+        # Ground-plane grid (world Y = mean Y)
+        xs_w, zs_w = positions[:, 0], positions[:, 2]
+        x_range_w = max(xs_w.max() - xs_w.min(), 1.0)
+        z_range_w = max(zs_w.max() - zs_w.min(), 1.0)
+        grid_step = _nice_grid_step(max(x_range_w, z_range_w))
+        y_grid = center[1]
+
+        x_gmin = np.floor(xs_w.min() / grid_step) * grid_step - grid_step
+        x_gmax = np.ceil(xs_w.max()  / grid_step) * grid_step + grid_step
+        z_gmin = np.floor(zs_w.min() / grid_step) * grid_step - grid_step
+        z_gmax = np.ceil(zs_w.max()  / grid_step) * grid_step + grid_step
+
+        xg = x_gmin
+        while xg <= x_gmax:
+            p1r = R @ (np.array([xg, y_grid, z_gmin]) - center)
+            p2r = R @ (np.array([xg, y_grid, z_gmax]) - center)
+            cv2.line(canvas, to_canvas(p1r[0], p1r[1]),
+                     to_canvas(p2r[0], p2r[1]), (50, 50, 50), 1)
+            xg += grid_step
+
+        zg = z_gmin
+        while zg <= z_gmax:
+            p1r = R @ (np.array([x_gmin, y_grid, zg]) - center)
+            p2r = R @ (np.array([x_gmax, y_grid, zg]) - center)
+            cv2.line(canvas, to_canvas(p1r[0], p1r[1]),
+                     to_canvas(p2r[0], p2r[1]), (50, 50, 50), 1)
+            zg += grid_step
+
+        cv2.rectangle(canvas, (px0, py0), (px1, py1), (80, 80, 80), 1)
+
+        # Coordinate axes at start position
+        axis_len = grid_step * 0.8
+        origin_w = positions[0] - center
+        for vec, color, label in [
+            (np.array([axis_len, 0, 0]), (60,  60, 220), "X"),  # BGR: red
+            (np.array([0, axis_len, 0]), (60, 180,  60), "Y"),  # green
+            (np.array([0, 0, axis_len]), (220, 80,  60), "Z"),  # blue
+        ]:
+            o_r = R @ origin_w
+            t_r = R @ (origin_w + vec)
+            oc = to_canvas(o_r[0], o_r[1])
+            tc = to_canvas(t_r[0], t_r[1])
+            cv2.line(canvas, oc, tc, color, 2)
+            cv2.putText(canvas, label, (tc[0] + 3, tc[1] + 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, color, 1)
+
+        # Trajectory path
+        if len(positions) >= 2:
+            for i in range(1, len(positions)):
+                p1r = R @ (positions[i - 1] - center)
+                p2r = R @ (positions[i]     - center)
+                cv2.line(canvas,
+                         to_canvas(p1r[0], p1r[1]),
+                         to_canvas(p2r[0], p2r[1]),
+                         (30, 140, 255), 2)
+
+        # Markers
+        s_r = R @ (positions[0]  - center)
+        e_r = R @ (positions[-1] - center)
+        cv2.circle(canvas, to_canvas(s_r[0], s_r[1]), 5, (0, 200, 60), -1)
+        cv2.circle(canvas, to_canvas(s_r[0], s_r[1]), 6, (255, 255, 255), 1)
+        cv2.circle(canvas, to_canvas(e_r[0], e_r[1]), 5, (50, 50, 230), -1)
+        cv2.circle(canvas, to_canvas(e_r[0], e_r[1]), 6, (255, 255, 255), 1)
+
+        # View-angle info in bottom margin
+        cv2.putText(canvas,
+                    f"Az:{self.azimuth:.0f}  El:{self.elevation:.0f}",
+                    (px0, py1 + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (100, 100, 100), 1)
+
+        self._draw_common_labels(canvas, trajectory, "3D  Orthographic",
+                                 px0, py0, px1, py1, H, W, mg_top)
+        return canvas
+
+    # ------------------------------------------------------------------
+    # Shared label helpers
+    # ------------------------------------------------------------------
+
+    def _draw_common_labels(
+        self,
+        canvas: np.ndarray,
+        trajectory,
+        mode_label: str,
+        px0: int, py0: int, px1: int, py1: int,
+        H: int, W: int, mg_top: int,
+    ) -> None:
+        """Draw title, position, pose count, and legend onto the canvas."""
+        pos = trajectory.get_current_position()
+
+        # Title + mode + toggle hint
+        cv2.putText(canvas,
+                    f"Trajectory  [{mode_label}]  (t: toggle 2D/3D)",
+                    (px0, mg_top - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 200, 200), 1)
+
+        # Current position
+        cv2.putText(canvas,
+                    f"Pos: ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) m",
+                    (px0, H - 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+
+        # Pose count
+        cv2.putText(canvas, f"Poses: {len(trajectory)}",
+                    (px1 - 75, H - 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
+
+        # Legend
+        lx, ly = px0, H - 18
+        cv2.circle(canvas, (lx + 4, ly), 4, (0, 200, 60), -1)
+        cv2.putText(canvas, "Start", (lx + 12, ly + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
+        cv2.circle(canvas, (lx + 60, ly), 4, (50, 50, 230), -1)
+        cv2.putText(canvas, "Current", (lx + 68, ly + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
 
 
 class VideoReader:
@@ -651,10 +902,12 @@ def run_visual_odometry(
     total_inliers = 0
     frames_since_last_update = 0  # Track reference frame age
 
+    traj_viewer = TrajectoryViewer() if plot_realtime else None
+
     if verbose:
         print(f"Processing frames (skip={skip_frames})...")
         if display or plot_realtime:
-            print("Press 'q' to quit, 's' to save current trajectory")
+            print("Press 'q' to quit, 's' to save, 't' to toggle 2D/3D trajectory")
 
     start_time = time.time()
 
@@ -811,9 +1064,8 @@ def run_visual_odometry(
             )
             cv2.imshow('Visual Odometry', info_frame)
 
-        if plot_realtime:
-            traj_canvas = draw_trajectory_canvas(trajectory)
-            cv2.imshow('Trajectory', traj_canvas)
+        if traj_viewer is not None:
+            traj_viewer.render(trajectory)
 
         if display or plot_realtime:
             # Check for key press
@@ -825,6 +1077,10 @@ def run_visual_odometry(
                 save_path = f"trajectory_{int(time.time())}.npz"
                 trajectory.save_to_file(save_path)
                 print(f"\nTrajectory saved to: {save_path}")
+            elif key == ord('t') and traj_viewer is not None:
+                traj_viewer.toggle_mode()
+                if verbose:
+                    print(f"Trajectory view: {traj_viewer.mode.upper()}")
 
     elapsed = time.time() - start_time
 
