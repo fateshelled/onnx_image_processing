@@ -377,6 +377,11 @@ class TrajectoryViewer:
         self.pan_x: float = 0.0         # world-space X offset (metres)
         self.pan_z: float = 0.0         # world-space Z offset (metres)
 
+        # Smoothed heading direction (EMA of camera Z-axis in world frame)
+        # Lower alpha → smoother arrow but slower to react to real turns.
+        self.heading_smoothing: float = 0.15
+        self._smoothed_heading: np.ndarray = np.array([0.0, 0.0, 1.0])
+
         # Internal drag state used by the mouse callback
         self._mouse_pressed: bool = False
         self._mouse_button: int = -1    # 0 = left, 1 = right
@@ -458,6 +463,16 @@ class TrajectoryViewer:
 
     def render(self, trajectory) -> None:
         """Render the trajectory to the OpenCV window."""
+        # Update heading EMA once per frame (shared by both 2D and 3D paths)
+        fwd_raw = trajectory.get_current_pose()[:3, :3][:, 2]
+        self._smoothed_heading = (
+            self.heading_smoothing * fwd_raw
+            + (1.0 - self.heading_smoothing) * self._smoothed_heading
+        )
+        norm = np.linalg.norm(self._smoothed_heading)
+        if norm > 1e-6:
+            self._smoothed_heading /= norm
+
         if self.mode == "2d":
             canvas = self._draw_2d(trajectory)
         else:
@@ -538,6 +553,14 @@ class TrajectoryViewer:
         cv2.circle(canvas, to_canvas(xs[0], zs[0]), 6, (255, 255, 255), 1)
         cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 5, (50, 50, 230), -1)
         cv2.circle(canvas, to_canvas(xs[-1], zs[-1]), 6, (255, 255, 255), 1)
+
+        # Current camera heading arrow (EMA-smoothed camera Z-axis, X-Z plane)
+        fwd_w = self._smoothed_heading
+        arrow_len = grid_step * 0.6
+        curr_pt = to_canvas(xs[-1], zs[-1])
+        tip_pt  = to_canvas(xs[-1] + fwd_w[0] * arrow_len,
+                            zs[-1] + fwd_w[2] * arrow_len)
+        cv2.arrowedLine(canvas, curr_pt, tip_pt, (0, 220, 255), 2, tipLength=0.35)
 
         # Axis labels
         cv2.putText(canvas, "X [m]", (px1 - 36, H - 5),
@@ -658,6 +681,16 @@ class TrajectoryViewer:
         cv2.circle(canvas, to_canvas(e_r[0], e_r[1]), 5, (50, 50, 230), -1)
         cv2.circle(canvas, to_canvas(e_r[0], e_r[1]), 6, (255, 255, 255), 1)
 
+        # Current camera heading arrow (EMA-smoothed camera Z-axis, projected)
+        fwd_w = self._smoothed_heading
+        arrow_len = grid_step * 0.6
+        tip_w = positions[-1] + fwd_w * arrow_len
+        tip_r = R @ (tip_w - center)
+        cv2.arrowedLine(canvas,
+                        to_canvas(e_r[0], e_r[1]),
+                        to_canvas(tip_r[0], tip_r[1]),
+                        (0, 220, 255), 2, tipLength=0.35)
+
         # View-angle info in bottom margin
         cv2.putText(canvas,
                     f"Az:{self.azimuth:.0f}  El:{self.elevation:.0f}",
@@ -707,6 +740,10 @@ class TrajectoryViewer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
         cv2.circle(canvas, (lx + 60, ly), 4, (50, 50, 230), -1)
         cv2.putText(canvas, "Current", (lx + 68, ly + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
+        cv2.arrowedLine(canvas, (lx + 130, ly), (lx + 145, ly),
+                        (0, 220, 255), 2, tipLength=0.4)
+        cv2.putText(canvas, "Heading", (lx + 150, ly + 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.34, (150, 150, 150), 1)
 
 
