@@ -244,11 +244,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--opset-version",
         type=int,
-        default=14,
-        help=(
-            "ONNX opset version (default: 14). "
-            "Minimum required: 14 (power-iteration SVD requires opset ≥ 14)."
-        ),
+        default=17,
+        help=("ONNX opset version (default: 17). "),
     )
     parser.add_argument(
         "--dynamic-axes",
