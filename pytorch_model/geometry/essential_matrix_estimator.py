@@ -87,6 +87,9 @@ class EssentialMatrixEstimator(nn.Module):
                             Smooth, heavy-tailed; never fully rejects outliers.
                           * ``"tukey"``  – ``w = max(0, 1 − (r/σ)²)²``.
                             Hard redescending; outliers beyond σ get zero weight.
+                          * ``"geman_mcclure"`` – ``w = 1 / (1 + (r/σ)²)²``.
+                            Redescending with O(1/r⁴) decay; more aggressive
+                            than Cauchy while remaining smooth everywhere.
                           * ``"huber"``  – ``w = min(1, σ / |r|)``.
                             Linear penalty beyond σ; moderate outlier rejection.
 
@@ -125,7 +128,7 @@ class EssentialMatrixEstimator(nn.Module):
     ) -> None:
         super().__init__()
 
-        _VALID_KERNELS = ("cauchy", "tukey", "huber")
+        _VALID_KERNELS = ("cauchy", "tukey", "geman_mcclure", "huber")
         if irls_kernel not in _VALID_KERNELS:
             raise ValueError(
                 f"irls_kernel must be one of {_VALID_KERNELS}, "
@@ -480,6 +483,9 @@ class EssentialMatrixEstimator(nn.Module):
         * **Tukey** (biweight): ``w = max(0, 1 − (r / σ)²)²``
           Hard redescending; residuals with ``|r| > σ`` receive exactly
           zero weight, effectively removing gross outliers.
+        * **Geman-McClure**: ``w = 1 / (1 + (r / σ)²)²``
+          Redescending with O(1/r⁴) decay — more aggressive than Cauchy
+          (O(1/r²)) while remaining smooth and non-zero everywhere.
         * **Huber**: ``w = min(1, σ / |r|)``
           Constant weight for ``|r| ≤ σ``, decreasing as ``σ / |r|``
           beyond that; a compromise between L2 and L1 penalty.
@@ -495,6 +501,8 @@ class EssentialMatrixEstimator(nn.Module):
             return 1.0 / (1.0 + (residuals / sigma) ** 2)
         elif self.irls_kernel == "tukey":
             return torch.clamp(1.0 - (residuals / sigma) ** 2, min=0.0) ** 2
+        elif self.irls_kernel == "geman_mcclure":
+            return 1.0 / (1.0 + (residuals / sigma) ** 2) ** 2
         else:  # huber (validated in __init__)
             return torch.clamp(sigma / (residuals.abs() + 1e-8), max=1.0)
 

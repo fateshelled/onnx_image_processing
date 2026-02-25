@@ -84,7 +84,7 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
                          Default is 10.
         n_irls: Number of IRLS refinement iterations. 0 disables. Default is 5.
         irls_kernel: Robust kernel for IRLS reweighting. One of 'cauchy',
-                     'tukey', or 'huber'. Default is 'cauchy'.
+                     'tukey', 'geman_mcclure', or 'huber'. Default is 'cauchy'.
         irls_sigma: Scale parameter σ for the IRLS robust kernel.
                     Default is 0.01.
         n_sampson: Number of Sampson error refinement iterations (runs after
