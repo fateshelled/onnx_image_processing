@@ -258,32 +258,8 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         mask = mask_row & mask_col & mask_thresh
         weights = P_core * mask.to(P_core.dtype)    # (N, M)
 
-        # ── Weighted 8-point algorithm → initial E ─────────────────────
-        E = self.estimator._weighted_8point_core(weights, pts1_n, pts2_n)
-
-        # ── IRLS refinement ──────────────────────────────────────────────
-        for _ in range(self.estimator.n_irls):
-            residuals = EssentialMatrixEstimator._compute_algebraic_residuals(
-                E, pts1_n, pts2_n,
-            )
-            irls_w = self.estimator._compute_irls_weights(residuals)
-            E = self.estimator._weighted_8point_core(
-                weights * irls_w, pts1_n, pts2_n,
-            )
-
-        # ── Sampson error refinement ─────────────────────────────────────
-        for _ in range(self.estimator.n_sampson):
-            sampson_err = EssentialMatrixEstimator._compute_sampson_errors(
-                E, pts1_n, pts2_n,
-            )
-            cauchy_w = 1.0 / (
-                1.0 + sampson_err / (self.estimator.sampson_sigma ** 2)
-            )
-            E = self.estimator._weighted_8point_core(
-                weights * cauchy_w, pts1_n, pts2_n,
-            )
-
-        return E
+        # ── Initial estimate + IRLS + Sampson refinement ─────────────────
+        return self.estimator._run_estimation_pipeline(weights, pts1_n, pts2_n)
 
     # ------------------------------------------------------------------
     # Forward pass

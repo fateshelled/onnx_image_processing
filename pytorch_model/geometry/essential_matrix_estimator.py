@@ -29,6 +29,8 @@ from torch import nn
 
 
 class EssentialMatrixEstimator(nn.Module):
+    _VALID_KERNELS = ("cauchy", "tukey", "geman_mcclure", "huber")
+
     """
     Estimates the Essential Matrix from a Sinkhorn probability matrix.
 
@@ -128,10 +130,9 @@ class EssentialMatrixEstimator(nn.Module):
     ) -> None:
         super().__init__()
 
-        _VALID_KERNELS = ("cauchy", "tukey", "geman_mcclure", "huber")
-        if irls_kernel not in _VALID_KERNELS:
+        if irls_kernel not in self._VALID_KERNELS:
             raise ValueError(
-                f"irls_kernel must be one of {_VALID_KERNELS}, "
+                f"irls_kernel must be one of {self._VALID_KERNELS}, "
                 f"got {irls_kernel!r}"
             )
 
@@ -506,6 +507,42 @@ class EssentialMatrixEstimator(nn.Module):
         else:  # huber (validated in __init__)
             return torch.clamp(sigma / (residuals.abs() + 1e-8), max=1.0)
 
+    def _run_estimation_pipeline(
+        self,
+        weights: torch.Tensor,
+        pts1_n: torch.Tensor,
+        pts2_n: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the full estimation pipeline: initial 8-point + IRLS + Sampson.
+
+        This is the shared core used by both ``forward()`` (grid-based) and
+        external callers that supply their own keypoint coordinates.
+
+        Args:
+            weights: Pair weights, shape (N, M).
+            pts1_n:  Normalised image coordinates for image 1, shape (N, 2).
+            pts2_n:  Normalised image coordinates for image 2, shape (M, 2).
+
+        Returns:
+            Essential Matrix, shape (3, 3).
+        """
+        # ── Initial weighted 8-point algorithm ───────────────────────────
+        E = self._weighted_8point_core(weights, pts1_n, pts2_n)
+
+        # ── IRLS refinement (robust-kernel weighted residuals) ───────────
+        for _ in range(self.n_irls):
+            residuals = self._compute_algebraic_residuals(E, pts1_n, pts2_n)
+            irls_w = self._compute_irls_weights(residuals)
+            E = self._weighted_8point_core(weights * irls_w, pts1_n, pts2_n)
+
+        # ── Sampson error refinement ─────────────────────────────────────
+        for _ in range(self.n_sampson):
+            sampson_err = self._compute_sampson_errors(E, pts1_n, pts2_n)
+            cauchy_w = 1.0 / (1.0 + sampson_err / (self.sampson_sigma ** 2))
+            E = self._weighted_8point_core(weights * cauchy_w, pts1_n, pts2_n)
+
+        return E
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -557,32 +594,8 @@ class EssentialMatrixEstimator(nn.Module):
         pts1_n = pixel_coords_n[:N]                  # (N, 2) normalised
         pts2_n = pixel_coords_n[:M]                  # (M, 2) normalised
 
-        # ── Step 5: Weighted 8-point algorithm → initial E ───────────
-        E = self._weighted_8point_core(weights, pts1_n, pts2_n)
-
-        # ── Step 6: IRLS refinement (robust-kernel weighted residuals) ──
-        # Re-estimate E by down-weighting correspondences whose epipolar
-        # residual |x₂ᵀ E x₁| is large, using the selected robust kernel.
-        # Weights are recomputed from the base (Sinkhorn) weights each
-        # iteration: w_irls = w_base · kernel(r).
-        for _ in range(self.n_irls):
-            residuals = self._compute_algebraic_residuals(E, pts1_n, pts2_n)
-            irls_w = self._compute_irls_weights(residuals)
-            E = self._weighted_8point_core(weights * irls_w, pts1_n, pts2_n)
-
-        # ── Step 7: Sampson error refinement ───────────────────────────
-        # Further refine E using the Sampson error — a first-order
-        # approximation to the geometric reprojection error — which is
-        # more geometrically meaningful than the algebraic residual used
-        # in IRLS.  Reweighting uses the Cauchy kernel:
-        #   w_sampson = w_base / (1 + err / σ²)
-        # where err = (x₂ᵀ E x₁)² / (‖Ex₁‖₁₂² + ‖Eᵀx₂‖₁₂²).
-        for _ in range(self.n_sampson):
-            sampson_err = self._compute_sampson_errors(E, pts1_n, pts2_n)
-            cauchy_w = 1.0 / (1.0 + sampson_err / (self.sampson_sigma ** 2))
-            E = self._weighted_8point_core(weights * cauchy_w, pts1_n, pts2_n)
-
-        return E
+        # ── Step 5–7: Initial estimate + IRLS + Sampson refinement ─────
+        return self._run_estimation_pipeline(weights, pts1_n, pts2_n)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
