@@ -18,6 +18,7 @@ Pipeline:
        - Uses actual keypoint coordinates (converted to normalised image coords)
        - Invalid/padded keypoints are suppressed via a validity mask
        - Optionally refined via IRLS with Cauchy-weighted algebraic residuals
+       - Further refined via Sampson error-based reweighting
 
 Designed for ONNX export (opset 14+) with batch_size=1.
 """
@@ -85,6 +86,11 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
                 algebraic residuals. 0 disables IRLS. Default is 5.
         irls_sigma: Scale parameter σ for the Cauchy kernel used in IRLS.
                     Default is 0.01.
+        n_sampson: Number of Sampson error refinement iterations (runs after
+                   IRLS). Uses the Sampson error — a first-order approximation
+                   to the geometric reprojection error. 0 disables. Default is 3.
+        sampson_sigma: Scale parameter σ for the Cauchy kernel used in Sampson
+                       refinement. Default is 0.01.
 
     Example:
         >>> K = torch.eye(3)
@@ -125,6 +131,8 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         n_iter_manifold: int = 10,
         n_irls: int = 5,
         irls_sigma: float = 0.01,
+        n_sampson: int = 3,
+        sampson_sigma: float = 0.01,
     ) -> None:
         super().__init__()
 
@@ -179,6 +187,8 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
             n_iter_manifold=n_iter_manifold,
             n_irls=n_irls,
             irls_sigma=irls_sigma,
+            n_sampson=n_sampson,
+            sampson_sigma=sampson_sigma,
         )
 
         # K_inv buffer for normalising pixel keypoint coordinates
@@ -255,6 +265,18 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
             )
             cauchy_w = 1.0 / (
                 1.0 + (residuals / self.estimator.irls_sigma) ** 2
+            )
+            E = self.estimator._weighted_8point_core(
+                weights * cauchy_w, pts1_n, pts2_n,
+            )
+
+        # ── Sampson error refinement ─────────────────────────────────────
+        for _ in range(self.estimator.n_sampson):
+            sampson_err = EssentialMatrixEstimator._compute_sampson_errors(
+                E, pts1_n, pts2_n,
+            )
+            cauchy_w = 1.0 / (
+                1.0 + sampson_err / (self.estimator.sampson_sigma ** 2)
             )
             E = self.estimator._weighted_8point_core(
                 weights * cauchy_w, pts1_n, pts2_n,

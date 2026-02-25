@@ -2,7 +2,8 @@
 Essential Matrix Estimator from Sinkhorn assignment matrix.
 
 Implements the weighted 8-point algorithm with Hartley normalization,
-optionally refined via IRLS (Iteratively Reweighted Least Squares).
+optionally refined via IRLS (Iteratively Reweighted Least Squares)
+and Sampson error-based refinement.
 Designed for ONNX export at opset 14 with dynamic N and M axes.
 
 Key ONNX compatibility decisions
@@ -48,6 +49,9 @@ class EssentialMatrixEstimator(nn.Module):
         via power-iteration SVD with branch-free sign correction.
     9.  IRLS refinement: reweight correspondences using the Cauchy robust
         kernel on algebraic residuals and re-run steps 4–8.
+    10. Sampson error refinement: further reweight correspondences using the
+        Cauchy kernel on Sampson errors (a first-order approximation to the
+        geometric reprojection error) and re-run steps 4–8.
 
     All operations use PyTorch tensor ops only; no Python branching on tensor
     *values* — ensuring ONNX exportability at opset 14.
@@ -81,6 +85,17 @@ class EssentialMatrixEstimator(nn.Module):
                           whose algebraic residual ``|x₂ᵀ E x₁|`` is much
                           larger than σ are strongly down-weighted.
                           Default: 0.01.
+        n_sampson:        Number of Sampson-error refinement iterations that
+                          run after IRLS.  Each iteration reweights using the
+                          Cauchy kernel on Sampson errors — a first-order
+                          approximation to the geometric reprojection error —
+                          and re-solves the weighted 8-point algorithm.
+                          0 disables Sampson refinement.  Default: 3.
+        sampson_sigma:    Scale parameter σ for the Cauchy kernel used in
+                          Sampson refinement:
+                          ``w(d) = 1 / (1 + d / σ²)``  where *d* is the
+                          Sampson error (squared Sampson distance).
+                          Default: 0.01.
     """
 
     def __init__(
@@ -92,6 +107,8 @@ class EssentialMatrixEstimator(nn.Module):
         n_iter_manifold: int = 10,
         n_irls: int = 5,
         irls_sigma: float = 0.01,
+        n_sampson: int = 3,
+        sampson_sigma: float = 0.01,
     ) -> None:
         super().__init__()
 
@@ -108,6 +125,8 @@ class EssentialMatrixEstimator(nn.Module):
         self.n_iter_manifold = n_iter_manifold
         self.n_irls = n_irls
         self.irls_sigma = irls_sigma
+        self.n_sampson = n_sampson
+        self.sampson_sigma = sampson_sigma
         H, W = image_shape
         self.H = H
         self.W = W
@@ -380,6 +399,52 @@ class EssentialMatrixEstimator(nn.Module):
         f2 = torch.cat([pts2_n, pts2_n.new_ones(M, 1)], dim=-1)   # (M, 3)
         return f1 @ E.T @ f2.T   # (N, M)
 
+    @staticmethod
+    def _compute_sampson_errors(
+        E: torch.Tensor,
+        pts1_n: torch.Tensor,
+        pts2_n: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute Sampson errors for all (i, j) correspondence pairs.
+
+        The Sampson error is a first-order approximation to the geometric
+        (reprojection) error.  For pair (i, j):
+
+            r   = x₂[j]ᵀ E x₁[i]            (algebraic residual)
+            l₂  = E  x₁[i]                   (epipolar line in image 2)
+            l₁  = Eᵀ x₂[j]                   (epipolar line in image 1)
+            err = r² / (l₂[0]² + l₂[1]² + l₁[0]² + l₁[1]²)
+
+        All operations are element-wise or standard matmuls → ONNX-safe.
+
+        Args:
+            E:      Essential Matrix, shape (3, 3).
+            pts1_n: Normalised image coordinates for image 1, shape (N, 2).
+            pts2_n: Normalised image coordinates for image 2, shape (M, 2).
+
+        Returns:
+            Sampson error matrix, shape (N, M).  Each entry ≥ 0.
+        """
+        N = pts1_n.shape[0]
+        M = pts2_n.shape[0]
+        f1 = torch.cat([pts1_n, pts1_n.new_ones(N, 1)], dim=-1)   # (N, 3)
+        f2 = torch.cat([pts2_n, pts2_n.new_ones(M, 1)], dim=-1)   # (M, 3)
+
+        # Epipolar lines: l₂[i] = E x₁[i],  l₁[j] = Eᵀ x₂[j].
+        l2 = f1 @ E.T   # (N, 3)
+        l1 = f2 @ E     # (M, 3)
+
+        # Algebraic residuals: r[i, j] = x₂[j]ᵀ E x₁[i].
+        r = l2 @ f2.T   # (N, M)
+
+        # Sampson denominator: sum of squared normal components of both
+        # epipolar lines (first two elements only — the third is the offset).
+        l2_sq = (l2[:, :2] ** 2).sum(dim=-1)   # (N,)
+        l1_sq = (l1[:, :2] ** 2).sum(dim=-1)   # (M,)
+        denom = l2_sq.unsqueeze(1) + l1_sq.unsqueeze(0)   # (N, M)
+
+        return r ** 2 / (denom + 1e-8)
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -442,6 +507,18 @@ class EssentialMatrixEstimator(nn.Module):
         for _ in range(self.n_irls):
             residuals = self._compute_algebraic_residuals(E, pts1_n, pts2_n)
             cauchy_w = 1.0 / (1.0 + (residuals / self.irls_sigma) ** 2)
+            E = self._weighted_8point_core(weights * cauchy_w, pts1_n, pts2_n)
+
+        # ── Step 7: Sampson error refinement ───────────────────────────
+        # Further refine E using the Sampson error — a first-order
+        # approximation to the geometric reprojection error — which is
+        # more geometrically meaningful than the algebraic residual used
+        # in IRLS.  Reweighting uses the Cauchy kernel:
+        #   w_sampson = w_base / (1 + err / σ²)
+        # where err = (x₂ᵀ E x₁)² / (‖Ex₁‖₁₂² + ‖Eᵀx₂‖₁₂²).
+        for _ in range(self.n_sampson):
+            sampson_err = self._compute_sampson_errors(E, pts1_n, pts2_n)
+            cauchy_w = 1.0 / (1.0 + sampson_err / (self.sampson_sigma ** 2))
             E = self._weighted_8point_core(weights * cauchy_w, pts1_n, pts2_n)
 
         return E
