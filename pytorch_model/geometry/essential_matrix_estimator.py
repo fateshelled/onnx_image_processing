@@ -47,8 +47,9 @@ class EssentialMatrixEstimator(nn.Module):
     7.  Hartley denormalise: E ← T₂ᵀ E_raw T₁.
     8.  Project onto the Essential Matrix manifold (singular values → [σ,σ,0])
         via power-iteration SVD with branch-free sign correction.
-    9.  IRLS refinement: reweight correspondences using the Cauchy robust
-        kernel on algebraic residuals and re-run steps 4–8.
+    9.  IRLS refinement: reweight correspondences using a selectable robust
+        kernel (Cauchy, Tukey biweight, or Huber) on algebraic residuals
+        and re-run steps 4–8.
     10. Sampson error refinement: further reweight correspondences using the
         Cauchy kernel on Sampson errors (a first-order approximation to the
         geometric reprojection error) and re-run steps 4–8.
@@ -75,16 +76,27 @@ class EssentialMatrixEstimator(nn.Module):
                           scenarios. Default: 10.
         n_irls:           Number of IRLS (Iteratively Reweighted Least Squares)
                           refinement iterations.  Each iteration recomputes
-                          correspondence weights via the Cauchy robust kernel
-                          on algebraic residuals and re-solves the weighted
+                          correspondence weights via a robust kernel on
+                          algebraic residuals and re-solves the weighted
                           8-point algorithm.  More iterations increase the ONNX
                           graph size proportionally.  0 disables IRLS.
                           Default: 5.
-        irls_sigma:       Scale parameter σ for the Cauchy kernel used in IRLS:
-                          ``w(r) = 1 / (1 + (r / σ)²)``.  Correspondences
-                          whose algebraic residual ``|x₂ᵀ E x₁|`` is much
-                          larger than σ are strongly down-weighted.
-                          Default: 0.01.
+        irls_kernel:      Robust kernel used for IRLS reweighting.  One of:
+
+                          * ``"cauchy"`` – ``w = 1 / (1 + (r/σ)²)``.
+                            Smooth, heavy-tailed; never fully rejects outliers.
+                          * ``"tukey"``  – ``w = max(0, 1 − (r/σ)²)²``.
+                            Hard redescending; outliers beyond σ get zero weight.
+                          * ``"huber"``  – ``w = min(1, σ / |r|)``.
+                            Linear penalty beyond σ; moderate outlier rejection.
+
+                          The kernel is selected at construction time; only the
+                          chosen branch is traced into the ONNX graph.
+                          Default: ``"cauchy"``.
+        irls_sigma:       Scale parameter σ for the IRLS robust kernel.
+                          Controls the transition point between inlier / outlier
+                          treatment (interpretation varies by kernel — see
+                          ``irls_kernel``).  Default: 0.01.
         n_sampson:        Number of Sampson-error refinement iterations that
                           run after IRLS.  Each iteration reweights using the
                           Cauchy kernel on Sampson errors — a first-order
@@ -106,11 +118,19 @@ class EssentialMatrixEstimator(nn.Module):
         n_iter: int = 30,
         n_iter_manifold: int = 10,
         n_irls: int = 5,
+        irls_kernel: str = "cauchy",
         irls_sigma: float = 0.01,
         n_sampson: int = 3,
         sampson_sigma: float = 0.01,
     ) -> None:
         super().__init__()
+
+        _VALID_KERNELS = ("cauchy", "tukey", "huber")
+        if irls_kernel not in _VALID_KERNELS:
+            raise ValueError(
+                f"irls_kernel must be one of {_VALID_KERNELS}, "
+                f"got {irls_kernel!r}"
+            )
 
         # Register K and K⁻¹ as persistent buffers (device-portable).
         # K_inv is computed once at construction; it becomes a constant
@@ -124,6 +144,7 @@ class EssentialMatrixEstimator(nn.Module):
         self.n_iter = n_iter
         self.n_iter_manifold = n_iter_manifold
         self.n_irls = n_irls
+        self.irls_kernel = irls_kernel
         self.irls_sigma = irls_sigma
         self.n_sampson = n_sampson
         self.sampson_sigma = sampson_sigma
@@ -445,6 +466,38 @@ class EssentialMatrixEstimator(nn.Module):
 
         return r ** 2 / (denom + 1e-8)
 
+    def _compute_irls_weights(self, residuals: torch.Tensor) -> torch.Tensor:
+        """Compute IRLS weights from algebraic residuals using the selected kernel.
+
+        The kernel type is fixed at construction time (``self.irls_kernel``),
+        so only the chosen branch is traced into the ONNX graph — no
+        data-dependent branching on tensor values.
+
+        Supported kernels (all ONNX-safe, element-wise ops only):
+
+        * **Cauchy**: ``w = 1 / (1 + (r / σ)²)``
+          Smooth, monotonically decreasing; never fully zeros out outliers.
+        * **Tukey** (biweight): ``w = max(0, 1 − (r / σ)²)²``
+          Hard redescending; residuals with ``|r| > σ`` receive exactly
+          zero weight, effectively removing gross outliers.
+        * **Huber**: ``w = min(1, σ / |r|)``
+          Constant weight for ``|r| ≤ σ``, decreasing as ``σ / |r|``
+          beyond that; a compromise between L2 and L1 penalty.
+
+        Args:
+            residuals: Algebraic residuals, shape (N, M).
+
+        Returns:
+            Weight matrix, shape (N, M), values in [0, 1].
+        """
+        sigma = self.irls_sigma
+        if self.irls_kernel == "cauchy":
+            return 1.0 / (1.0 + (residuals / sigma) ** 2)
+        elif self.irls_kernel == "tukey":
+            return torch.clamp(1.0 - (residuals / sigma) ** 2, min=0.0) ** 2
+        else:  # huber (validated in __init__)
+            return torch.clamp(sigma / (residuals.abs() + 1e-8), max=1.0)
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -499,15 +552,15 @@ class EssentialMatrixEstimator(nn.Module):
         # ── Step 5: Weighted 8-point algorithm → initial E ───────────
         E = self._weighted_8point_core(weights, pts1_n, pts2_n)
 
-        # ── Step 6: IRLS refinement (Cauchy-weighted algebraic residuals)
+        # ── Step 6: IRLS refinement (robust-kernel weighted residuals) ──
         # Re-estimate E by down-weighting correspondences whose epipolar
-        # residual |x₂ᵀ E x₁| is large, using the Cauchy robust kernel.
+        # residual |x₂ᵀ E x₁| is large, using the selected robust kernel.
         # Weights are recomputed from the base (Sinkhorn) weights each
-        # iteration: w_irls = w_base / (1 + (r / σ)²).
+        # iteration: w_irls = w_base · kernel(r).
         for _ in range(self.n_irls):
             residuals = self._compute_algebraic_residuals(E, pts1_n, pts2_n)
-            cauchy_w = 1.0 / (1.0 + (residuals / self.irls_sigma) ** 2)
-            E = self._weighted_8point_core(weights * cauchy_w, pts1_n, pts2_n)
+            irls_w = self._compute_irls_weights(residuals)
+            E = self._weighted_8point_core(weights * irls_w, pts1_n, pts2_n)
 
         # ── Step 7: Sampson error refinement ───────────────────────────
         # Further refine E using the Sampson error — a first-order

@@ -82,9 +82,10 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         n_iter_manifold: Power-iteration steps for each 3×3 eigenvector solve
                          inside the Essential Matrix manifold projection.
                          Default is 10.
-        n_irls: Number of IRLS refinement iterations using Cauchy-weighted
-                algebraic residuals. 0 disables IRLS. Default is 5.
-        irls_sigma: Scale parameter σ for the Cauchy kernel used in IRLS.
+        n_irls: Number of IRLS refinement iterations. 0 disables. Default is 5.
+        irls_kernel: Robust kernel for IRLS reweighting. One of 'cauchy',
+                     'tukey', or 'huber'. Default is 'cauchy'.
+        irls_sigma: Scale parameter σ for the IRLS robust kernel.
                     Default is 0.01.
         n_sampson: Number of Sampson error refinement iterations (runs after
                    IRLS). Uses the Sampson error — a first-order approximation
@@ -130,6 +131,7 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         n_iter: int = 30,
         n_iter_manifold: int = 10,
         n_irls: int = 5,
+        irls_kernel: str = "cauchy",
         irls_sigma: float = 0.01,
         n_sampson: int = 3,
         sampson_sigma: float = 0.01,
@@ -186,6 +188,7 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
             n_iter=n_iter,
             n_iter_manifold=n_iter_manifold,
             n_irls=n_irls,
+            irls_kernel=irls_kernel,
             irls_sigma=irls_sigma,
             n_sampson=n_sampson,
             sampson_sigma=sampson_sigma,
@@ -263,11 +266,9 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
             residuals = EssentialMatrixEstimator._compute_algebraic_residuals(
                 E, pts1_n, pts2_n,
             )
-            cauchy_w = 1.0 / (
-                1.0 + (residuals / self.estimator.irls_sigma) ** 2
-            )
+            irls_w = self.estimator._compute_irls_weights(residuals)
             E = self.estimator._weighted_8point_core(
-                weights * cauchy_w, pts1_n, pts2_n,
+                weights * irls_w, pts1_n, pts2_n,
             )
 
         # ── Sampson error refinement ─────────────────────────────────────
