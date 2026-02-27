@@ -1,7 +1,9 @@
 """
 Essential Matrix Estimator from Sinkhorn assignment matrix.
 
-Implements the weighted 8-point algorithm with Hartley normalization.
+Implements the weighted 8-point algorithm with Hartley normalization,
+optionally refined via IRLS (Iteratively Reweighted Least Squares)
+and Sampson error-based refinement.
 Designed for ONNX export at opset 14 with dynamic N and M axes.
 
 Key ONNX compatibility decisions
@@ -27,6 +29,8 @@ from torch import nn
 
 
 class EssentialMatrixEstimator(nn.Module):
+    _VALID_KERNELS = ("cauchy", "tukey", "geman_mcclure", "huber")
+
     """
     Estimates the Essential Matrix from a Sinkhorn probability matrix.
 
@@ -45,6 +49,12 @@ class EssentialMatrixEstimator(nn.Module):
     7.  Hartley denormalise: E ← T₂ᵀ E_raw T₁.
     8.  Project onto the Essential Matrix manifold (singular values → [σ,σ,0])
         via power-iteration SVD with branch-free sign correction.
+    9.  IRLS refinement: reweight correspondences using a selectable robust
+        kernel (Cauchy, Tukey biweight, or Huber) on algebraic residuals
+        and re-run steps 4–8.
+    10. Sampson error refinement: further reweight correspondences using the
+        Cauchy kernel on Sampson errors (a first-order approximation to the
+        geometric reprojection error) and re-run steps 4–8.
 
     All operations use PyTorch tensor ops only; no Python branching on tensor
     *values* — ensuring ONNX exportability at opset 14.
@@ -66,6 +76,43 @@ class EssentialMatrixEstimator(nn.Module):
                           3x3 matrices converge much faster than the 9x9 case;
                           10 iterations is sufficient in almost all practical
                           scenarios. Default: 10.
+        n_irls:           Number of IRLS (Iteratively Reweighted Least Squares)
+                          refinement iterations.  Each iteration recomputes
+                          correspondence weights via a robust kernel on
+                          algebraic residuals and re-solves the weighted
+                          8-point algorithm.  More iterations increase the ONNX
+                          graph size proportionally.  0 disables IRLS.
+                          Default: 5.
+        irls_kernel:      Robust kernel used for IRLS reweighting.  One of:
+
+                          * ``"cauchy"`` – ``w = 1 / (1 + (r/σ)²)``.
+                            Smooth, heavy-tailed; never fully rejects outliers.
+                          * ``"tukey"``  – ``w = max(0, 1 − (r/σ)²)²``.
+                            Hard redescending; outliers beyond σ get zero weight.
+                          * ``"geman_mcclure"`` – ``w = 1 / (1 + (r/σ)²)²``.
+                            Redescending with O(1/r⁴) decay; more aggressive
+                            than Cauchy while remaining smooth everywhere.
+                          * ``"huber"``  – ``w = min(1, σ / |r|)``.
+                            Linear penalty beyond σ; moderate outlier rejection.
+
+                          The kernel is selected at construction time; only the
+                          chosen branch is traced into the ONNX graph.
+                          Default: ``"cauchy"``.
+        irls_sigma:       Scale parameter σ for the IRLS robust kernel.
+                          Controls the transition point between inlier / outlier
+                          treatment (interpretation varies by kernel — see
+                          ``irls_kernel``).  Default: 0.01.
+        n_sampson:        Number of Sampson-error refinement iterations that
+                          run after IRLS.  Each iteration reweights using the
+                          Cauchy kernel on Sampson errors — a first-order
+                          approximation to the geometric reprojection error —
+                          and re-solves the weighted 8-point algorithm.
+                          0 disables Sampson refinement.  Default: 3.
+        sampson_sigma:    Scale parameter σ for the Cauchy kernel used in
+                          Sampson refinement:
+                          ``w(d) = 1 / (1 + d / σ²)``  where *d* is the
+                          Sampson error (squared Sampson distance).
+                          Default: 0.01.
     """
 
     def __init__(
@@ -75,8 +122,19 @@ class EssentialMatrixEstimator(nn.Module):
         top_k: int = 3,
         n_iter: int = 30,
         n_iter_manifold: int = 10,
+        n_irls: int = 5,
+        irls_kernel: str = "cauchy",
+        irls_sigma: float = 0.01,
+        n_sampson: int = 3,
+        sampson_sigma: float = 0.01,
     ) -> None:
         super().__init__()
+
+        if irls_kernel not in self._VALID_KERNELS:
+            raise ValueError(
+                f"irls_kernel must be one of {self._VALID_KERNELS}, "
+                f"got {irls_kernel!r}"
+            )
 
         # Register K and K⁻¹ as persistent buffers (device-portable).
         # K_inv is computed once at construction; it becomes a constant
@@ -89,6 +147,11 @@ class EssentialMatrixEstimator(nn.Module):
         self.top_k = top_k
         self.n_iter = n_iter
         self.n_iter_manifold = n_iter_manifold
+        self.n_irls = n_irls
+        self.irls_kernel = irls_kernel
+        self.irls_sigma = irls_sigma
+        self.n_sampson = n_sampson
+        self.sampson_sigma = sampson_sigma
         H, W = image_shape
         self.H = H
         self.W = W
@@ -285,6 +348,201 @@ class EssentialMatrixEstimator(nn.Module):
 
         return T, scale, centroid
 
+    def _weighted_8point_core(
+        self,
+        weights: torch.Tensor,
+        pts1_n: torch.Tensor,
+        pts2_n: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the weighted 8-point algorithm and return the Essential Matrix.
+
+        Performs Hartley normalisation, builds the normal equations via
+        Kronecker factorisation, solves for the minimum eigenvector,
+        Hartley denormalises, and projects onto the E manifold.
+
+        Args:
+            weights: Pair weights, shape (N, M).
+            pts1_n:  Normalised image coordinates for image 1, shape (N, 2).
+            pts2_n:  Normalised image coordinates for image 2, shape (M, 2).
+
+        Returns:
+            Essential Matrix, shape (3, 3).
+        """
+        N = weights.shape[0]
+        M = weights.shape[1]
+
+        # ── Hartley normalisation ──────────────────────────────────────
+        w1 = weights.sum(dim=1)   # (N,)
+        w2 = weights.sum(dim=0)   # (M,)
+
+        T1, s1, c1 = self._hartley_normalization(pts1_n, w1)
+        T2, s2, c2 = self._hartley_normalization(pts2_n, w2)
+
+        pts1_hn = (pts1_n - c1) * s1   # (N, 2)
+        pts2_hn = (pts2_n - c2) * s2   # (M, 2)
+
+        # ── Weighted normal equations via Kronecker factorisation ──────
+        f1 = torch.cat([pts1_hn, pts1_hn.new_ones(N, 1)], dim=-1)   # (N, 3)
+        f2 = torch.cat([pts2_hn, pts2_hn.new_ones(M, 1)], dim=-1)   # (M, 3)
+
+        F1_flat = (f1.unsqueeze(-1) * f1.unsqueeze(-2)).reshape(N, 9)  # (N, 9)
+        F2_flat = (f2.unsqueeze(-1) * f2.unsqueeze(-2)).reshape(M, 9)  # (M, 9)
+
+        WF2 = weights @ F2_flat       # (N, 9)
+        M_flat = F1_flat.T @ WF2      # (9, 9)
+        M_mat = M_flat.reshape(3, 3, 3, 3).permute(0, 2, 1, 3).reshape(9, 9)
+
+        # ── Minimum eigenvector → raw E ────────────────────────────────
+        e = self._min_eigvec9(M_mat)     # (9,)
+        E_raw = e.reshape(3, 3)          # (3, 3)
+
+        # ── Hartley denormalisation ────────────────────────────────────
+        E_denorm = T2.T @ E_raw @ T1    # (3, 3)
+
+        # ── Project onto Essential Matrix manifold ─────────────────────
+        return self._project_onto_E_manifold(E_denorm)
+
+    @staticmethod
+    def _compute_algebraic_residuals(
+        E: torch.Tensor,
+        pts1_n: torch.Tensor,
+        pts2_n: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute algebraic residuals x₂ᵀ E x₁ for all (i, j) pairs.
+
+        Args:
+            E:      Essential Matrix, shape (3, 3).
+            pts1_n: Normalised image coordinates for image 1, shape (N, 2).
+            pts2_n: Normalised image coordinates for image 2, shape (M, 2).
+
+        Returns:
+            Residual matrix, shape (N, M).  Element (i, j) is x₂[j]ᵀ E x₁[i].
+        """
+        N = pts1_n.shape[0]
+        M = pts2_n.shape[0]
+        f1 = torch.cat([pts1_n, pts1_n.new_ones(N, 1)], dim=-1)   # (N, 3)
+        f2 = torch.cat([pts2_n, pts2_n.new_ones(M, 1)], dim=-1)   # (M, 3)
+        return f1 @ E.T @ f2.T   # (N, M)
+
+    @staticmethod
+    def _compute_sampson_errors(
+        E: torch.Tensor,
+        pts1_n: torch.Tensor,
+        pts2_n: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute Sampson errors for all (i, j) correspondence pairs.
+
+        The Sampson error is a first-order approximation to the geometric
+        (reprojection) error.  For pair (i, j):
+
+            r   = x₂[j]ᵀ E x₁[i]            (algebraic residual)
+            l₂  = E  x₁[i]                   (epipolar line in image 2)
+            l₁  = Eᵀ x₂[j]                   (epipolar line in image 1)
+            err = r² / (l₂[0]² + l₂[1]² + l₁[0]² + l₁[1]²)
+
+        All operations are element-wise or standard matmuls → ONNX-safe.
+
+        Args:
+            E:      Essential Matrix, shape (3, 3).
+            pts1_n: Normalised image coordinates for image 1, shape (N, 2).
+            pts2_n: Normalised image coordinates for image 2, shape (M, 2).
+
+        Returns:
+            Sampson error matrix, shape (N, M).  Each entry ≥ 0.
+        """
+        N = pts1_n.shape[0]
+        M = pts2_n.shape[0]
+        f1 = torch.cat([pts1_n, pts1_n.new_ones(N, 1)], dim=-1)   # (N, 3)
+        f2 = torch.cat([pts2_n, pts2_n.new_ones(M, 1)], dim=-1)   # (M, 3)
+
+        # Epipolar lines: l₂[i] = E x₁[i],  l₁[j] = Eᵀ x₂[j].
+        l2 = f1 @ E.T   # (N, 3)
+        l1 = f2 @ E     # (M, 3)
+
+        # Algebraic residuals: r[i, j] = x₂[j]ᵀ E x₁[i].
+        r = l2 @ f2.T   # (N, M)
+
+        # Sampson denominator: sum of squared normal components of both
+        # epipolar lines (first two elements only — the third is the offset).
+        l2_sq = (l2[:, :2] ** 2).sum(dim=-1)   # (N,)
+        l1_sq = (l1[:, :2] ** 2).sum(dim=-1)   # (M,)
+        denom = l2_sq.unsqueeze(1) + l1_sq.unsqueeze(0)   # (N, M)
+
+        return r ** 2 / (denom + 1e-8)
+
+    def _compute_irls_weights(self, residuals: torch.Tensor) -> torch.Tensor:
+        """Compute IRLS weights from algebraic residuals using the selected kernel.
+
+        The kernel type is fixed at construction time (``self.irls_kernel``),
+        so only the chosen branch is traced into the ONNX graph — no
+        data-dependent branching on tensor values.
+
+        Supported kernels (all ONNX-safe, element-wise ops only):
+
+        * **Cauchy**: ``w = 1 / (1 + (r / σ)²)``
+          Smooth, monotonically decreasing; never fully zeros out outliers.
+        * **Tukey** (biweight): ``w = max(0, 1 − (r / σ)²)²``
+          Hard redescending; residuals with ``|r| > σ`` receive exactly
+          zero weight, effectively removing gross outliers.
+        * **Geman-McClure**: ``w = 1 / (1 + (r / σ)²)²``
+          Redescending with O(1/r⁴) decay — more aggressive than Cauchy
+          (O(1/r²)) while remaining smooth and non-zero everywhere.
+        * **Huber**: ``w = min(1, σ / |r|)``
+          Constant weight for ``|r| ≤ σ``, decreasing as ``σ / |r|``
+          beyond that; a compromise between L2 and L1 penalty.
+
+        Args:
+            residuals: Algebraic residuals, shape (N, M).
+
+        Returns:
+            Weight matrix, shape (N, M), values in [0, 1].
+        """
+        sigma = self.irls_sigma
+        if self.irls_kernel == "cauchy":
+            return 1.0 / (1.0 + (residuals / sigma) ** 2)
+        elif self.irls_kernel == "tukey":
+            return torch.clamp(1.0 - (residuals / sigma) ** 2, min=0.0) ** 2
+        elif self.irls_kernel == "geman_mcclure":
+            return 1.0 / (1.0 + (residuals / sigma) ** 2) ** 2
+        else:  # huber (validated in __init__)
+            return torch.clamp(sigma / (residuals.abs() + 1e-8), max=1.0)
+
+    def _run_estimation_pipeline(
+        self,
+        weights: torch.Tensor,
+        pts1_n: torch.Tensor,
+        pts2_n: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the full estimation pipeline: initial 8-point + IRLS + Sampson.
+
+        This is the shared core used by both ``forward()`` (grid-based) and
+        external callers that supply their own keypoint coordinates.
+
+        Args:
+            weights: Pair weights, shape (N, M).
+            pts1_n:  Normalised image coordinates for image 1, shape (N, 2).
+            pts2_n:  Normalised image coordinates for image 2, shape (M, 2).
+
+        Returns:
+            Essential Matrix, shape (3, 3).
+        """
+        # ── Initial weighted 8-point algorithm ───────────────────────────
+        E = self._weighted_8point_core(weights, pts1_n, pts2_n)
+
+        # ── IRLS refinement (robust-kernel weighted residuals) ───────────
+        for _ in range(self.n_irls):
+            residuals = self._compute_algebraic_residuals(E, pts1_n, pts2_n)
+            irls_w = self._compute_irls_weights(residuals)
+            E = self._weighted_8point_core(weights * irls_w, pts1_n, pts2_n)
+
+        # ── Sampson error refinement ─────────────────────────────────────
+        for _ in range(self.n_sampson):
+            sampson_err = self._compute_sampson_errors(E, pts1_n, pts2_n)
+            cauchy_w = 1.0 / (1.0 + sampson_err / (self.sampson_sigma ** 2))
+            E = self._weighted_8point_core(weights * cauchy_w, pts1_n, pts2_n)
+
+        return E
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -336,67 +594,8 @@ class EssentialMatrixEstimator(nn.Module):
         pts1_n = pixel_coords_n[:N]                  # (N, 2) normalised
         pts2_n = pixel_coords_n[:M]                  # (M, 2) normalised
 
-        # ── Step 5: Hartley normalisation ──────────────────────────────
-        # Row-marginal weights for pts1, column-marginal for pts2.
-        w1 = weights.sum(dim=1)   # (N,)
-        w2 = weights.sum(dim=0)   # (M,)
-
-        T1, s1, c1 = self._hartley_normalization(pts1_n, w1)
-        T2, s2, c2 = self._hartley_normalization(pts2_n, w2)
-
-        # Apply Hartley transforms to both point sets.
-        pts1_hn = (pts1_n - c1) * s1   # (N, 2)
-        pts2_hn = (pts2_n - c2) * s2   # (M, 2)
-
-        # ── Steps 6 & 7: Weighted normal equations via Kronecker factorisation ─
-        #
-        # Each design-matrix row is a[i,j] = f1[i] ⊗ f2[j]  (Kronecker product)
-        # where f1 = [x1, y1, 1]ᵀ and f2 = [x2, y2, 1]ᵀ.
-        #
-        # M_mat[3p+q, 3r+s] = Σ_{i,j} w[i,j] · f1[i,p]·f1[i,r] · f2[j,q]·f2[j,s]
-        #
-        # Factored computation avoids building the (N·M, 9) design matrix
-        # (36 MB for N=M=1024); instead uses two small GEMMs:
-        #   WF2  = weights @ F2_flat        (N,M)@(M,9) → (N,9)
-        #   M_flat = F1_flat.T @ WF2        (9,N)@(N,9) → (9,9)
-        # then permute indices  (pr,qs) → (pq,rs)  on the tiny 9×9 result.
-        # Memory: O(N + M) instead of O(N·M).
-
-        # Homogeneous coordinates: f[·] = [x, y, 1].
-        f1 = torch.cat([pts1_hn, pts1_hn.new_ones(N, 1)], dim=-1)   # (N, 3)
-        f2 = torch.cat([pts2_hn, pts2_hn.new_ones(M, 1)], dim=-1)   # (M, 3)
-
-        # Self-outer products: F[i, p, r] = f[i, p] * f[i, r].
-        # Reshaped to (·, 9) so standard matmul can be used.
-        F1_flat = (f1.unsqueeze(-1) * f1.unsqueeze(-2)).reshape(N, 9)  # (N, 9)
-        F2_flat = (f2.unsqueeze(-1) * f2.unsqueeze(-2)).reshape(M, 9)  # (M, 9)
-
-        # Weighted sum over j:  WF2[i, qs] = Σ_j w[i,j] · F2[j, qs].
-        WF2 = weights @ F2_flat                                         # (N, 9)
-
-        # Weighted sum over i:  M_flat[pr, qs] = Σ_i F1[i, pr] · WF2[i, qs].
-        M_flat = F1_flat.T @ WF2                                        # (9, 9)
-
-        # Permute from (pr, qs) to (pq, rs) index ordering:
-        # M_mat[3p+q, 3r+s] = M_flat[3p+r, 3q+s]  (same entries, reordered).
-        M_mat = M_flat.reshape(3, 3, 3, 3).permute(0, 2, 1, 3).reshape(9, 9)
-
-        # ── Step 8: Minimum eigenvector of M_mat → raw E ───────────────
-        # M_mat is PSD (= Aᵀ diag(w) A with w ≥ 0).
-        # The minimum eigenvector minimises the epipolar residual.
-        e = self._min_eigvec9(M_mat)     # (9,)
-        E_raw = e.reshape(3, 3)          # (3, 3)
-
-        # ── Step 9: Hartley denormalisation ───────────────────────────
-        # E_denorm = T₂ᵀ · E_raw · T₁
-        E_denorm = T2.T @ E_raw @ T1     # (3, 3)
-
-        # ── Step 10: Project onto the Essential Matrix manifold ────────
-        # Enforces singular values [σ, σ, 0] via power-iteration SVD
-        # with branch-free sign correction using torch.sign.
-        E = self._project_onto_E_manifold(E_denorm)   # (3, 3)
-
-        return E
+        # ── Step 5–7: Initial estimate + IRLS + Sampson refinement ─────
+        return self._run_estimation_pipeline(weights, pts1_n, pts2_n)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

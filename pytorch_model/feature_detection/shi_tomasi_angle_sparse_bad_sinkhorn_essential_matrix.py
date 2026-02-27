@@ -17,6 +17,8 @@ Pipeline:
     5. Essential Matrix estimation via weighted 8-point algorithm
        - Uses actual keypoint coordinates (converted to normalised image coords)
        - Invalid/padded keypoints are suppressed via a validity mask
+       - Optionally refined via IRLS with Cauchy-weighted algebraic residuals
+       - Further refined via Sampson error-based reweighting
 
 Designed for ONNX export (opset 14+) with batch_size=1.
 """
@@ -80,6 +82,16 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         n_iter_manifold: Power-iteration steps for each 3×3 eigenvector solve
                          inside the Essential Matrix manifold projection.
                          Default is 10.
+        n_irls: Number of IRLS refinement iterations. 0 disables. Default is 5.
+        irls_kernel: Robust kernel for IRLS reweighting. One of 'cauchy',
+                     'tukey', 'geman_mcclure', or 'huber'. Default is 'cauchy'.
+        irls_sigma: Scale parameter σ for the IRLS robust kernel.
+                    Default is 0.01.
+        n_sampson: Number of Sampson error refinement iterations (runs after
+                   IRLS). Uses the Sampson error — a first-order approximation
+                   to the geometric reprojection error. 0 disables. Default is 3.
+        sampson_sigma: Scale parameter σ for the Cauchy kernel used in Sampson
+                       refinement. Default is 0.01.
 
     Example:
         >>> K = torch.eye(3)
@@ -118,6 +130,11 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         top_k: int = 3,
         n_iter: int = 30,
         n_iter_manifold: int = 10,
+        n_irls: int = 5,
+        irls_kernel: str = "cauchy",
+        irls_sigma: float = 0.01,
+        n_sampson: int = 3,
+        sampson_sigma: float = 0.01,
     ) -> None:
         super().__init__()
 
@@ -170,6 +187,11 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
             top_k=top_k,
             n_iter=n_iter,
             n_iter_manifold=n_iter_manifold,
+            n_irls=n_irls,
+            irls_kernel=irls_kernel,
+            irls_sigma=irls_sigma,
+            n_sampson=n_sampson,
+            sampson_sigma=sampson_sigma,
         )
 
         # K_inv buffer for normalising pixel keypoint coordinates
@@ -236,39 +258,8 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         mask = mask_row & mask_col & mask_thresh
         weights = P_core * mask.to(P_core.dtype)    # (N, M)
 
-        # ── Hartley normalisation (weighted centroid + scale) ───────────
-        w1 = weights.sum(dim=1)   # (N,)
-        w2 = weights.sum(dim=0)   # (M,)
-
-        T1, s1, c1 = self.estimator._hartley_normalization(pts1_n, w1)
-        T2, s2, c2 = self.estimator._hartley_normalization(pts2_n, w2)
-
-        pts1_hn = (pts1_n - c1) * s1   # (N, 2)
-        pts2_hn = (pts2_n - c2) * s2   # (M, 2)
-
-        # ── Weighted normal equations via Kronecker factorisation ───────
-        # Avoids building the full (N·M, 9) design matrix in memory.
-        f1 = torch.cat([pts1_hn, pts1_hn.new_ones(N, 1)], dim=-1)   # (N, 3)
-        f2 = torch.cat([pts2_hn, pts2_hn.new_ones(M, 1)], dim=-1)   # (M, 3)
-
-        F1_flat = (f1.unsqueeze(-1) * f1.unsqueeze(-2)).reshape(N, 9)   # (N, 9)
-        F2_flat = (f2.unsqueeze(-1) * f2.unsqueeze(-2)).reshape(M, 9)   # (M, 9)
-
-        WF2   = weights @ F2_flat    # (N, 9)
-        M_flat = F1_flat.T @ WF2    # (9, 9)
-        M_mat  = M_flat.reshape(3, 3, 3, 3).permute(0, 2, 1, 3).reshape(9, 9)
-
-        # ── Minimum eigenvector → raw E ─────────────────────────────────
-        e     = self.estimator._min_eigvec9(M_mat)
-        E_raw = e.reshape(3, 3)
-
-        # ── Hartley denormalisation ─────────────────────────────────────
-        E_denorm = T2.T @ E_raw @ T1   # (3, 3)
-
-        # ── Project onto Essential Matrix manifold ──────────────────────
-        E = self.estimator._project_onto_E_manifold(E_denorm)   # (3, 3)
-
-        return E
+        # ── Initial estimate + IRLS + Sampson refinement ─────────────────
+        return self.estimator._run_estimation_pipeline(weights, pts1_n, pts2_n)
 
     # ------------------------------------------------------------------
     # Forward pass
