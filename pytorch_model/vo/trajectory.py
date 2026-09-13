@@ -10,7 +10,6 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 from .pose_estimation import (
-    compose_transformation,
     transformation_to_matrix,
     matrix_to_transformation,
 )
@@ -37,21 +36,30 @@ class Trajectory:
         """
         Add a new pose relative to the last pose.
 
+        The relative pose (R, t) must follow the convention of
+        ``cv2.recoverPose``: a point transform expressed in the current
+        camera frame, ``x_curr = R @ x_prev + t`` (world-to-camera style).
+        It is converted here to a camera-to-world camera pose and composed
+        with the existing trajectory.
+
         Args:
             R: Rotation matrix (3, 3) from previous to current frame
             t: Translation vector (3, 1) or (3,) from previous to current frame
         """
-        # Get last pose
-        last_pose = self.poses[-1]
-        R_last, t_last = matrix_to_transformation(last_pose)
+        t = t.reshape(3) if t.ndim > 1 else t
 
-        # Compose transformation
-        R_new, t_new = compose_transformation(R_last, t_last, R, t)
+        # Last camera pose in world coordinates (camera-to-world)
+        R_last = self.poses[-1][:3, :3]
+        C_last = self.positions[-1]
 
-        # Create and store new pose
-        new_pose = transformation_to_matrix(R_new, t_new)
+        # Camera-to-world rotation: R_wc_new = R_wc_prev @ R_rel.T
+        R_new = R_last @ R.T
+        # New camera center: C_new = C_prev - R_wc_new @ t_rel
+        C_new = C_last - R_new @ t
+
+        new_pose = transformation_to_matrix(R_new, C_new)
         self.poses.append(new_pose)
-        self.positions.append(t_new.ravel())
+        self.positions.append(C_new)
 
     def get_current_pose(self) -> np.ndarray:
         """
