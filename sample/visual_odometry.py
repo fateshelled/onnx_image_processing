@@ -143,13 +143,51 @@ def estimate_pose_from_essential_matrix(
     return R, t, inlier_mask
 
 
+def _remap_pose_mask(
+    matched_kpts1: np.ndarray,
+    matched_kpts2: np.ndarray,
+    pose_kpts1: np.ndarray,
+    pose_kpts2: np.ndarray,
+    pose_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Map a chirality mask computed on the permissive pose set back to the
+    top-N match set. A top-N match is marked as inlier when its exact
+    keypoint coordinates appear in the chirality-passing pose set.
+
+    Args:
+        matched_kpts1/2: Top-N match keypoints, shape (N, 2) as (y, x).
+        pose_kpts1/2: Permissive pose-recovery keypoints, shape (M, 2).
+        pose_mask: Chirality mask over the pose set, shape (M,).
+
+    Returns:
+        Boolean inlier mask over the top-N match set, shape (N,).
+    """
+    if len(pose_kpts1) == 0:
+        return np.zeros(len(matched_kpts1), dtype=bool)
+
+    passing = pose_mask.ravel() > 0
+    if not passing.any():
+        return np.zeros(len(matched_kpts1), dtype=bool)
+
+    # Pair keys must be built from the *arrays* (order-preserving), not from
+    # per-coordinate sets — set iteration order would scramble the pairing.
+    pose1 = pose_kpts1[passing].astype(np.float64)
+    pose2 = pose_kpts2[passing].astype(np.float64)
+    passing_pairs = set(zip(map(tuple, pose1), map(tuple, pose2)))
+    all_pairs = zip(map(tuple, matched_kpts1.astype(np.float64)),
+                    map(tuple, matched_kpts2.astype(np.float64)))
+    return np.array([pair in passing_pairs for pair in all_pairs], dtype=bool)
+
+
 def extract_matches(
     matching_probs: np.ndarray,
     keypoints1: np.ndarray,
     keypoints2: np.ndarray,
     threshold: float = 0.1,
     max_matches: int = 100,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    pose_recovery_threshold: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """
     Extract mutual nearest-neighbor matches from Sinkhorn probability matrix.
 
@@ -158,12 +196,25 @@ def extract_matches(
         keypoints1: Keypoints in image1 of shape (1, K, 2) as (y, x)
         keypoints2: Keypoints in image2 of shape (1, K, 2) as (y, x)
         threshold: Minimum match probability
+        max_matches: Maximum number of matches (after threshold + sorting)
+        pose_recovery_threshold: If set, additionally return a larger,
+            more permissive match set for pose recovery (recoverPose).
+            These are mutual-NN matches above ``pose_recovery_threshold``
+            (no top-N cut). Used with the 4-output model so that the
+            chirality/sign check in recoverPose sees a point set consistent
+            with the ONNX-internal weighted 8-point estimate, which uses
+            all keypoints weighted by Sinkhorn probabilities. Reduces sign
+            flips (reverse-direction tracking) on low-texture/parallel
+            motion scenes.
 
     Returns:
         Tuple of:
             - matched_kpts1: (N, 2) matched keypoint coordinates in image1
             - matched_kpts2: (N, 2) matched keypoint coordinates in image2
             - match_scores: (N,) match probability scores
+            - pose_kpts1: (M, 2) permissive match set for pose recovery
+              (same as matched_kpts1 when pose_recovery_threshold is None)
+            - pose_kpts2: (M, 2) permissive match set for pose recovery
     """
     P = matching_probs[0]  # (K+1, K+1)
     kpts1 = keypoints1[0]  # (K, 2)
@@ -201,7 +252,19 @@ def extract_matches(
     matched_kpts1 = kpts1[match_indices_i]
     matched_kpts2 = kpts2[match_indices_j]
 
-    return matched_kpts1, matched_kpts2, scores
+    # Permissive match set for pose recovery (recoverPose chirality check)
+    if pose_recovery_threshold is not None:
+        # matched_* are already threshold-filtered and top-N cut; re-apply a
+        # looser threshold on their scores for the permissive pose set
+        pose_scores = scores
+        pose_sel = pose_scores >= pose_recovery_threshold
+        pose_kpts1 = matched_kpts1[pose_sel]
+        pose_kpts2 = matched_kpts2[pose_sel]
+    else:
+        pose_kpts1 = matched_kpts1
+        pose_kpts2 = matched_kpts2
+
+    return matched_kpts1, matched_kpts2, scores, pose_kpts1, pose_kpts2
 
 
 def draw_display_info(
@@ -307,7 +370,7 @@ def draw_display_info(
                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
 
     # Line 4: Distance
-    cv2.putText(info_frame, f"Distance: {dist:.2f}m",
+    cv2.putText(info_frame, f"Distance: {dist:.2f} (norm)",
                (margin_x, start_y + line_height * 3),
                cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
 
@@ -434,6 +497,7 @@ def run_visual_odometry(
     min_inlier_ratio: float = 0.5,
     min_motion_pixels: float = 1.0,
     max_reference_age: int = 30,
+    pose_recovery_threshold: float = 0.01,
     skip_frames: int = 1,
     max_frames: int = None,
     verbose: bool = True,
@@ -469,6 +533,11 @@ def run_visual_odometry(
             before forced update (default: 30). Prevents reference frame from
             becoming too stale during long periods of sub-threshold motion, while
             still allowing slow continuous motion to accumulate for detection.
+        pose_recovery_threshold: Match probability threshold for the permissive
+            pose-recovery match set used with the 4-output model (default: 0.01).
+            Lower than ``match_threshold`` so recoverPose's chirality check sees
+            a point set consistent with the model-internal weighted 8-point
+            Essential Matrix estimate (which uses all keypoints).
         skip_frames: Process every N-th frame
         max_frames: Maximum number of frames to process
         verbose: Print progress information
@@ -550,12 +619,13 @@ def run_visual_odometry(
         E_onnx = results[3] if has_essential_matrix else None  # (3, 3) or None
 
         # Extract matches
-        matched_kpts1, matched_kpts2, _scores = extract_matches(
+        matched_kpts1, matched_kpts2, _scores, pose_kpts1, pose_kpts2 = extract_matches(
             matching_probs,
             keypoints1,
             keypoints2,
             threshold=match_threshold,
             max_matches=max_matches,
+            pose_recovery_threshold=pose_recovery_threshold if has_essential_matrix else None,
         )
 
         num_matches = len(matched_kpts1)
@@ -603,14 +673,25 @@ def run_visual_odometry(
                     # 4-output model: use the Essential Matrix from ONNX directly.
                     # The E matrix was computed inside the model using all keypoints
                     # weighted by Sinkhorn probabilities (weighted 8-point algorithm).
-                    # We still call recoverPose with the extracted matches to resolve
-                    # the sign ambiguity and obtain the inlier chirality mask.
-                    R, t, inlier_mask = estimate_pose_from_essential_matrix(
-                        matched_kpts1,
-                        matched_kpts2,
+                    # recoverPose is called with the permissive match set
+                    # (pose_kpts, looser threshold, no top-N cut) so the chirality
+                    # check sees a point set consistent with the model-internal
+                    # estimate, reducing sign flips on ambiguous scenes.
+                    R, t, pose_mask = estimate_pose_from_essential_matrix(
+                        pose_kpts1,
+                        pose_kpts2,
                         E_onnx,
                         camera_intrinsics,
                     )
+                    if R is not None:
+                        # Remap chirality mask back to the top-N match set so
+                        # display and inlier-ratio gating use consistent indexing.
+                        # A top-N match is an inlier if its nearest pose-set
+                        # counterpart passed chirality (they share coordinates).
+                        inlier_mask = _remap_pose_mask(matched_kpts1, matched_kpts2,
+                                                       pose_kpts1, pose_kpts2, pose_mask)
+                    else:
+                        inlier_mask = np.zeros(num_matches, dtype=bool)
                 else:
                     # 3-output model: estimate E via RANSAC then recover pose.
                     R, t, inlier_mask = estimate_pose_ransac(
@@ -630,8 +711,13 @@ def run_visual_odometry(
                               f"(inliers={num_inliers}, ratio={inlier_ratio:.0%}), skipping...")
                     status_message = (f"POSE ESTIMATION FAILED "
                                       f"(inliers={num_inliers}, ratio={inlier_ratio:.0%})")
-                    # Keep reference frame unchanged - may succeed on next frame with more motion
-                    frames_since_last_update += 1
+                    # Keep reference frame unchanged - may succeed on next frame with
+                    # more motion. Do NOT increment frames_since_last_update here:
+                    # that counter tracks the *reference frame age for motion
+                    # accumulation* (no-motion case only). Pose failures are a
+                    # matching/geometry problem, not slow motion, and forcing a
+                    # reference update on age would discard the frame the pose
+                    # estimator will likely succeed on next iteration.
                 else:
                     # Success: add pose to trajectory and update reference frame
                     trajectory.add_relative_pose(R, t)
@@ -689,7 +775,8 @@ def run_visual_odometry(
         print(f"Trajectory length: {len(trajectory)} poses")
         print(f"Average matches: {total_matches / max(1, processed_count):.1f}")
         print(f"Average inliers: {total_inliers / max(1, len(trajectory) - 1):.1f}")
-        print(f"Total distance: {trajectory.get_trajectory_length():.2f} meters")
+        print(f"Total distance: {trajectory.get_trajectory_length():.2f} (normalised units, "
+              f"monocular scale ambiguity)")
         print(f"Processing time: {elapsed:.2f} seconds ({processed_count / elapsed:.1f} fps)")
 
     return trajectory
@@ -823,6 +910,15 @@ def parse_args():
         help="Maximum number of frames the reference frame can age before forced update. "
              "Prevents stale references during long static periods while still allowing "
              "slow continuous motion to accumulate for detection (default: 30)"
+    )
+    parser.add_argument(
+        "--pose-recovery-threshold",
+        type=float,
+        default=0.01,
+        help="Match probability threshold for the permissive pose-recovery match "
+             "set used with the 4-output model. Lower than --match-threshold so "
+             "recoverPose's chirality check is consistent with the model-internal "
+             "weighted 8-point Essential Matrix estimate (default: 0.01)"
     )
     parser.add_argument(
         "--skip-frames",
@@ -991,6 +1087,7 @@ def main():
             min_inlier_ratio=args.min_inlier_ratio,
             min_motion_pixels=args.min_motion_pixels,
             max_reference_age=args.max_reference_age,
+            pose_recovery_threshold=args.pose_recovery_threshold,
             skip_frames=args.skip_frames,
             max_frames=args.max_frames,
             verbose=not args.quiet,

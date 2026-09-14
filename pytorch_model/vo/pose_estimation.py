@@ -72,8 +72,14 @@ def estimate_pose_ransac(
     Returns:
         Tuple of:
             - R: Rotation matrix (3, 3) or None if estimation failed
-            - t: Translation vector (3, 1) or None if estimation failed
-            - inlier_mask: Boolean mask of inliers (N,)
+            - t: Translation vector (3, 1) or None if estimation failed.
+              Unit norm (monocular scale ambiguity) — trajectory distances
+              are in normalised units, not physical meters.
+            - inlier_mask: Boolean mask of points that passed both the
+              Essential Matrix RANSAC test AND the chirality check in
+              recoverPose. Note this is stricter than the RANSAC inlier
+              set alone: points fitting E but failing chirality are
+              excluded (they would be behind the camera).
     """
     if len(keypoints1) < 5 or len(keypoints2) < 5:
         return None, None, np.zeros(len(keypoints1), dtype=bool)

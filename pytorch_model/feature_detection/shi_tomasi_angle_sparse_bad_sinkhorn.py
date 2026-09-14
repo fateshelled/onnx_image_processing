@@ -19,6 +19,7 @@ from torch import nn
 
 from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiWithAngle
 from pytorch_model.descriptor.bad import SparseBAD
+from pytorch_model.enhance.cas import ContrastAdaptiveSharpening
 from pytorch_model.matching.sinkhorn import SinkhornMatcher, SinkhornMatcherWithFilters
 from pytorch_model.utils import apply_nms_maxpool, select_topk_keypoints
 
@@ -61,6 +62,10 @@ class ShiTomasiAngleSparseBADSinkhornMatcher(nn.Module):
                       If None, uses descriptor's max_radius to ensure valid
                       descriptor computation. Set to 0 to disable border filtering.
                       Default is None (uses max_radius).
+        cas_sharpness: Contrast Adaptive Sharpening strength in [0, 1] applied
+                       to both input images before detection/description.
+                       0 disables CAS. Useful for motion blur / defocus
+                       robustness. Default is 0.0 (disabled).
 
     Example:
         >>> model = ShiTomasiAngleSparseBADSinkhornMatcher(max_keypoints=512)
@@ -91,12 +96,20 @@ class ShiTomasiAngleSparseBADSinkhornMatcher(nn.Module):
         normalize_descriptors: bool = True,
         sampling_mode: str = "nearest",
         border_margin: int | None = None,
+        cas_sharpness: float = 0.0,
     ) -> None:
         super().__init__()
 
         self.max_keypoints = max_keypoints
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
+
+        # Blur robustness: optional Contrast Adaptive Sharpening (preprocess)
+        self.sharpener = (
+            ContrastAdaptiveSharpening(sharpness=cas_sharpness)
+            if cas_sharpness > 0.0
+            else None
+        )
 
         # Feature detector + orientation estimator
         self.detector = ShiTomasiWithAngle(
@@ -150,6 +163,11 @@ class ShiTomasiAngleSparseBADSinkhornMatcher(nn.Module):
                 - matching_probs: Matching probability matrix of shape
                   (B, K+1, K+1). The last row/column is the dustbin.
         """
+        # 0. Optional contrast adaptive sharpening (blur robustness)
+        if self.sharpener is not None:
+            image1 = self.sharpener(image1)
+            image2 = self.sharpener(image2)
+
         # 1. Detect features and compute orientations
         scores1, angles1 = self.detector(image1)  # (B, 1, H, W) each
         scores2, angles2 = self.detector(image2)
@@ -210,6 +228,9 @@ class ShiTomasiAngleSparseBADSinkhornMatcherWithFilters(nn.Module):
         sampling_mode: Sampling mode for descriptors ('nearest' or 'bilinear').
                       Default is 'nearest'.
         border_margin: Margin from image border (in pixels). Default is None.
+        cas_sharpness: Contrast Adaptive Sharpening strength in [0, 1] applied
+                       to both input images before detection/description.
+                       0 disables CAS. Default is 0.0 (disabled).
 
     Returns:
         Tuple of:
@@ -251,12 +272,20 @@ class ShiTomasiAngleSparseBADSinkhornMatcherWithFilters(nn.Module):
         normalize_descriptors: bool = True,
         sampling_mode: str = "nearest",
         border_margin: int | None = None,
+        cas_sharpness: float = 0.0,
     ) -> None:
         super().__init__()
 
         self.max_keypoints = max_keypoints
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
+
+        # Blur robustness: optional Contrast Adaptive Sharpening (preprocess)
+        self.sharpener = (
+            ContrastAdaptiveSharpening(sharpness=cas_sharpness)
+            if cas_sharpness > 0.0
+            else None
+        )
 
         # Feature detector + orientation estimator
         self.detector = ShiTomasiWithAngle(
@@ -310,6 +339,11 @@ class ShiTomasiAngleSparseBADSinkhornMatcherWithFilters(nn.Module):
                 - matching_probs: Matching probability matrix [B, K+1, K+1]
                 - valid_mask: Boolean mask [B, K] for valid matches
         """
+        # 0. Optional contrast adaptive sharpening (blur robustness)
+        if self.sharpener is not None:
+            image1 = self.sharpener(image1)
+            image2 = self.sharpener(image2)
+
         # 1. Detect features and compute orientations
         scores1, angles1 = self.detector(image1)
         scores2, angles2 = self.detector(image2)
