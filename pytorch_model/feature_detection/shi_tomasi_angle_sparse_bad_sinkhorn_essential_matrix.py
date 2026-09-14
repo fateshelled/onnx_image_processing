@@ -133,6 +133,10 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         self.top_k = top_k
 
         # Blur robustness: optional Contrast Adaptive Sharpening (preprocess)
+        if cas_sharpness < 0.0:
+            raise ValueError(
+                f"cas_sharpness must be >= 0 (0 disables CAS), got {cas_sharpness}"
+            )
         self.sharpener = (
             ContrastAdaptiveSharpening(sharpness=cas_sharpness)
             if cas_sharpness > 0.0
@@ -296,8 +300,11 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         Detect keypoints, compute matches, and estimate the Essential Matrix.
 
         Args:
-            image1: First grayscale image, shape (1, 1, H, W).
-                    Batch size must be 1 for Essential Matrix estimation.
+            image1: First grayscale image, shape (1, 1, H, W). Expected
+                range [0, 255] — required when ``cas_sharpness`` is set
+                (CAS normalizes by 255 internally); with CAS disabled the
+                pipeline is scale-invariant. Batch size must be 1 for
+                Essential Matrix estimation.
             image2: Second grayscale image, shape (1, 1, H, W).
 
         Returns:

@@ -21,13 +21,18 @@ Algorithm (3x3 neighborhood, cross-shaped kernel):
     - w = amp * peak, where peak = -1 / lerp(8, 5, sharpness)
     - out = sat((w*(b + d + f + h) + e) / (1 + 4*w))
 
-    Flat regions get amp ~ 0 (pure passthrough), so noise is not
-    amplified on textureless areas — this is what makes CAS preferable
-    to a fixed-kernel unsharp mask for VO preprocessing.
+    - Negative-lobe kernel differentiation means most flat regions are
+      algebraic passthroughs (not amp ~ 0): amp reaches ~0 only near signal
+      limits (v near 0 or 1), where mn or 1 - mx approaches 0. Flat mid-tone
+      regions have amp ~ 1 but the kernel weights cancel exactly
+      (w*(4v) + v = v(1 + 4w)), so flat noise IS amplified in proportion to
+      sharpness (up to ~4x at sharpness=1), unlike a quality-gated CAS.
+      This is still milder than a fixed unsharp mask, which also boosts
+      edge-adjacent ringing everywhere.
 
 Design notes for ONNX export (opset 14+):
-    - Only standard ops: pad, max_pool2d (as -max of negated), arithmetic.
-      No dynamic control flow.
+    - Only standard ops: pad (replicate) and tensor slicing for the
+      neighborhood, plus arithmetic. No dynamic control flow.
     - Input expected in [0, 1] (like the FidelityFX reference). Images in
       [0, 255] must be scaled by the caller or via ``input_scale``.
 
@@ -49,8 +54,10 @@ class ContrastAdaptiveSharpening(nn.Module):
     Args:
         sharpness: Sharpening strength in [0, 1]. 0 = lower ringing,
                    1 = maximum. Maps to the FidelityFX ``peak`` constant
-                   ``-1 / lerp(8, 5, sharpness)``. Use ``enabled=False``
-                   to bypass sharpening entirely. Default is 0.4.
+                   ``-1 / lerp(8, 5, sharpness)``. Note that 0 does not fully
+        disable sharpening: it still applies a mild fixed kernel
+        (peak = -1/8). Structure the caller to skip the module entirely
+        (e.g., ``cas_sharpness > 0``) to bypass CAS. Default is 0.4.
         input_scale: Divisor applied to the input before filtering.
                      Use 255.0 for images in [0, 255] range, 1.0 for
                      images already in [0, 1]. Default is 255.0.

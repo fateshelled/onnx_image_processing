@@ -105,6 +105,10 @@ class ShiTomasiAngleSparseBADSinkhornMatcher(nn.Module):
         self.score_threshold = score_threshold
 
         # Blur robustness: optional Contrast Adaptive Sharpening (preprocess)
+        if cas_sharpness < 0.0:
+            raise ValueError(
+                f"cas_sharpness must be >= 0 (0 disables CAS), got {cas_sharpness}"
+            )
         self.sharpener = (
             ContrastAdaptiveSharpening(sharpness=cas_sharpness)
             if cas_sharpness > 0.0
@@ -151,9 +155,11 @@ class ShiTomasiAngleSparseBADSinkhornMatcher(nn.Module):
         Detect keypoints and compute matches between two images.
 
         Args:
-            image1: First grayscale image of shape (B, 1, H, W).
+            image1: First grayscale image of shape (B, 1, H, W). Expected
+                range [0, 255] — required when ``cas_sharpness`` is set
+                (CAS normalizes by 255 internally); with CAS disabled the
+                pipeline is scale-invariant.
             image2: Second grayscale image of shape (B, 1, H, W).
-
         Returns:
             Tuple of:
                 - keypoints1: Detected keypoints in first image of shape
@@ -281,6 +287,10 @@ class ShiTomasiAngleSparseBADSinkhornMatcherWithFilters(nn.Module):
         self.score_threshold = score_threshold
 
         # Blur robustness: optional Contrast Adaptive Sharpening (preprocess)
+        if cas_sharpness < 0.0:
+            raise ValueError(
+                f"cas_sharpness must be >= 0 (0 disables CAS), got {cas_sharpness}"
+            )
         self.sharpener = (
             ContrastAdaptiveSharpening(sharpness=cas_sharpness)
             if cas_sharpness > 0.0
@@ -329,7 +339,10 @@ class ShiTomasiAngleSparseBADSinkhornMatcherWithFilters(nn.Module):
         Detect keypoints, compute matches, and apply outlier filters.
 
         Args:
-            image1: First grayscale image of shape (B, 1, H, W).
+            image1: First grayscale image of shape (B, 1, H, W). Expected
+                range [0, 255] — required when ``cas_sharpness`` is set
+                (CAS normalizes by 255 internally); with CAS disabled the
+                pipeline is scale-invariant.
             image2: Second grayscale image of shape (B, 1, H, W).
 
         Returns:

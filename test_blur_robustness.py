@@ -17,7 +17,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent))
 
 from pytorch_model.enhance import ContrastAdaptiveSharpening
 from pytorch_model.feature_detection.shi_tomasi_angle_sparse_bad_sinkhorn import (
@@ -79,6 +79,68 @@ class TestContrastAdaptiveSharpening:
 
         gx = lambda x: (x[:, :, :, 2:] - x[:, :, :, :-2]).abs().mean()
         assert gx(cas(blurred)) > gx(blurred)
+
+
+class TestCasOnnxExport:
+    """ONNX export smoke tests: export CAS alone and verify runtime parity.
+
+    The export path uses F.pad(replicate) + negative slicing; these tests
+    confirm it survives torch.onnx.export (opset >= 14, incl. dynamic
+    spatial axes) and reproduces the PyTorch reference in onnxruntime.
+    """
+
+    def _export_and_compare(self, dynamic_spatial: bool):
+        ort = pytest.importorskip("onnxruntime")
+        h, w = (64, 80)
+        sharpener = ContrastAdaptiveSharpening(
+            sharpness=0.5, input_scale=255.0
+        )
+        sharpener.eval()
+
+        dummy = torch.rand(1, 1, h, w) * 255.0
+        export_kwargs = dict(
+            input_names=["image"],
+            output_names=["sharpened"],
+            opset_version=14,
+            dynamo=False,
+        )
+        if dynamic_spatial:
+            export_kwargs["dynamic_axes"] = {
+                "image": {2: "H", 3: "W"},
+                "sharpened": {2: "H", 3: "W"},
+            }
+        path = Path(f"/tmp/cas_test_{'dyn' if dynamic_spatial else 'static'}.onnx")
+        torch.onnx.export(sharpener, (dummy,), str(path), **export_kwargs)
+
+        with torch.no_grad():
+            ref = sharpener(dummy)
+
+        session = ort.InferenceSession(
+            str(path), providers=["CPUExecutionProvider"]
+        )
+        out = torch.from_numpy(
+            session.run(None, {"image": dummy.numpy()})[0]
+        )
+        assert out.shape == ref.shape
+        assert torch.allclose(out.float(), ref.float(), atol=1e-3)
+
+        if dynamic_spatial:
+            # Re-run with a different spatial size to confirm the dynamic
+            # axes really are dynamic (replicate padding + slicing).
+            other = torch.rand(1, 1, 48, 110) * 255.0
+            with torch.no_grad():
+                ref2 = sharpener(other)
+            out2 = torch.from_numpy(
+                session.run(None, {"image": other.numpy()})[0]
+            )
+            assert out2.shape == ref2.shape
+            assert torch.allclose(out2.float(), ref2.float(), atol=1e-3)
+
+    def test_onnx_export_matches_torch(self):
+        self._export_and_compare(dynamic_spatial=False)
+
+    def test_onnx_export_dynamic_axes_matches_torch(self):
+        self._export_and_compare(dynamic_spatial=True)
 
 
 class TestPipelineIntegration:
