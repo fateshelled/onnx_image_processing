@@ -144,40 +144,29 @@ def estimate_pose_from_essential_matrix(
 
 
 def _remap_pose_mask(
-    matched_kpts1: np.ndarray,
-    matched_kpts2: np.ndarray,
-    pose_kpts1: np.ndarray,
-    pose_kpts2: np.ndarray,
+    pose_map: np.ndarray,
     pose_mask: np.ndarray,
+    num_matches: int,
 ) -> np.ndarray:
     """
     Map a chirality mask computed on the permissive pose set back to the
-    top-N match set. A top-N match is marked as inlier when its exact
-    keypoint coordinates appear in the chirality-passing pose set.
+    top-N match set, using the index mapping returned by ``extract_matches``.
 
     Args:
-        matched_kpts1/2: Top-N match keypoints, shape (N, 2) as (y, x).
-        pose_kpts1/2: Permissive pose-recovery keypoints, shape (M, 2).
+        pose_map: For each top-N match, the index of its counterpart in the
+            pose set, or -1 if it is not part of the pose set. Shape (N,).
         pose_mask: Chirality mask over the pose set, shape (M,).
+        num_matches: Number of top-N matches (N).
 
     Returns:
         Boolean inlier mask over the top-N match set, shape (N,).
     """
-    if len(pose_kpts1) == 0:
-        return np.zeros(len(matched_kpts1), dtype=bool)
-
-    passing = pose_mask.ravel() > 0
-    if not passing.any():
-        return np.zeros(len(matched_kpts1), dtype=bool)
-
-    # Pair keys must be built from the *arrays* (order-preserving), not from
-    # per-coordinate sets — set iteration order would scramble the pairing.
-    pose1 = pose_kpts1[passing].astype(np.float64)
-    pose2 = pose_kpts2[passing].astype(np.float64)
-    passing_pairs = set(zip(map(tuple, pose1), map(tuple, pose2)))
-    all_pairs = zip(map(tuple, matched_kpts1.astype(np.float64)),
-                    map(tuple, matched_kpts2.astype(np.float64)))
-    return np.array([pair in passing_pairs for pair in all_pairs], dtype=bool)
+    inlier_mask = np.zeros(num_matches, dtype=bool)
+    pose_map = np.asarray(pose_map, dtype=np.int64)
+    passing = np.asarray(pose_mask).ravel() > 0
+    mapped = pose_map >= 0
+    inlier_mask[mapped] = passing[pose_map[mapped]]
+    return inlier_mask
 
 
 def extract_matches(
@@ -187,7 +176,7 @@ def extract_matches(
     threshold: float = 0.1,
     max_matches: int = 100,
     pose_recovery_threshold: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract mutual nearest-neighbor matches from Sinkhorn probability matrix.
 
@@ -200,12 +189,16 @@ def extract_matches(
         pose_recovery_threshold: If set, additionally return a larger,
             more permissive match set for pose recovery (recoverPose).
             These are mutual-NN matches above ``pose_recovery_threshold``
-            (no top-N cut). Used with the 4-output model so that the
-            chirality/sign check in recoverPose sees a point set consistent
-            with the ONNX-internal weighted 8-point estimate, which uses
-            all keypoints weighted by Sinkhorn probabilities. Reduces sign
+            (no top-N cut, applied *before* ``threshold`` filtering).
+            Used with the 4-output model so that the chirality/sign check
+            in recoverPose sees a point set consistent with the
+            ONNX-internal weighted 8-point estimate, which uses all
+            keypoints weighted by Sinkhorn probabilities. Reduces sign
             flips (reverse-direction tracking) on low-texture/parallel
             motion scenes.
+            Must be ``<=`` ``threshold``; otherwise a ``ValueError`` is
+            raised. Pad keypoints (``(-1, -1)``, from ``select_topk_keypoints``)
+            are excluded from the pose set.
 
     Returns:
         Tuple of:
@@ -215,6 +208,10 @@ def extract_matches(
             - pose_kpts1: (M, 2) permissive match set for pose recovery
               (same as matched_kpts1 when pose_recovery_threshold is None)
             - pose_kpts2: (M, 2) permissive match set for pose recovery
+            - pose_map: (N,) index into the pose set for each top-N match,
+              or -1 if that match is not part of the pose set. Gives
+              consistent index-based correspondence for remapping masks
+              computed on the pose set back to the top-N match set.
     """
     P = matching_probs[0]  # (K+1, K+1)
     kpts1 = keypoints1[0]  # (K, 2)
@@ -232,16 +229,41 @@ def extract_matches(
     # Check mutual consistency (vectorized)
     mutual_mask = np.arange(K) == max_i_for_j[max_j_for_i]
 
-    # Get match probabilities
+    # Get match probabilities (pre-threshold: the permissive pose set below
+    # must be built from this broad population, before threshold + top-N cut)
     match_indices_i = np.where(mutual_mask)[0]
     match_indices_j = max_j_for_i[match_indices_i]
-    scores = P_core[match_indices_i, match_indices_j]
+    scores_full = P_core[match_indices_i, match_indices_j]
+
+    # Permissive match set for pose recovery (recoverPose chirality check)
+    if pose_recovery_threshold is not None:
+        if pose_recovery_threshold > threshold:
+            raise ValueError(
+                f"pose_recovery_threshold ({pose_recovery_threshold}) must be "
+                f"<= threshold ({threshold})"
+            )
+        pose_sel = scores_full >= pose_recovery_threshold
+        pose_idx_i = match_indices_i[pose_sel]
+        pose_idx_j = match_indices_j[pose_sel]
+        # Exclude pad keypoints (-1, -1) from the pose set
+        pose_valid = (
+            (kpts1[pose_idx_i, 0] >= 0)
+            & (kpts1[pose_idx_i, 1] >= 0)
+            & (kpts2[pose_idx_j, 0] >= 0)
+            & (kpts2[pose_idx_j, 1] >= 0)
+        )
+        pose_idx_i = pose_idx_i[pose_valid]
+        pose_idx_j = pose_idx_j[pose_valid]
+        pose_kpts1 = kpts1[pose_idx_i]
+        pose_kpts2 = kpts2[pose_idx_j]
+    else:
+        pose_idx_i = None  # filled after top-N selection below
 
     # Apply threshold
-    above_threshold = scores >= threshold
+    above_threshold = scores_full >= threshold
     match_indices_i = match_indices_i[above_threshold]
     match_indices_j = match_indices_j[above_threshold]
-    scores = scores[above_threshold]
+    scores = scores_full[above_threshold]
 
     # Sort by score descending and take top matches
     sort_order = np.argsort(scores)[::-1][:max_matches]
@@ -252,19 +274,20 @@ def extract_matches(
     matched_kpts1 = kpts1[match_indices_i]
     matched_kpts2 = kpts2[match_indices_j]
 
-    # Permissive match set for pose recovery (recoverPose chirality check)
+    # Map each top-N match to its pose-set position (index-based, robust
+    # against dtype/rounding changes: both index arrays come from the same
+    # unique mutual-NN set, so no coordinate matching is needed)
     if pose_recovery_threshold is not None:
-        # matched_* are already threshold-filtered and top-N cut; re-apply a
-        # looser threshold on their scores for the permissive pose set
-        pose_scores = scores
-        pose_sel = pose_scores >= pose_recovery_threshold
-        pose_kpts1 = matched_kpts1[pose_sel]
-        pose_kpts2 = matched_kpts2[pose_sel]
+        pose_pos = {int(k): p for p, k in enumerate(pose_idx_i)}
+        pose_map = np.array(
+            [pose_pos.get(int(k), -1) for k in match_indices_i], dtype=np.int64
+        )
     else:
         pose_kpts1 = matched_kpts1
         pose_kpts2 = matched_kpts2
+        pose_map = np.arange(len(matched_kpts1), dtype=np.int64)
 
-    return matched_kpts1, matched_kpts2, scores, pose_kpts1, pose_kpts2
+    return matched_kpts1, matched_kpts2, scores, pose_kpts1, pose_kpts2, pose_map
 
 
 def draw_display_info(
@@ -619,7 +642,7 @@ def run_visual_odometry(
         E_onnx = results[3] if has_essential_matrix else None  # (3, 3) or None
 
         # Extract matches
-        matched_kpts1, matched_kpts2, _scores, pose_kpts1, pose_kpts2 = extract_matches(
+        matched_kpts1, matched_kpts2, _scores, pose_kpts1, pose_kpts2, pose_map = extract_matches(
             matching_probs,
             keypoints1,
             keypoints2,
@@ -686,10 +709,9 @@ def run_visual_odometry(
                     if R is not None:
                         # Remap chirality mask back to the top-N match set so
                         # display and inlier-ratio gating use consistent indexing.
-                        # A top-N match is an inlier if its nearest pose-set
-                        # counterpart passed chirality (they share coordinates).
-                        inlier_mask = _remap_pose_mask(matched_kpts1, matched_kpts2,
-                                                       pose_kpts1, pose_kpts2, pose_mask)
+                        # Index-based mapping from extract_matches (pose_map),
+                        # robust against coordinate rounding changes.
+                        inlier_mask = _remap_pose_mask(pose_map, pose_mask, num_matches)
                     else:
                         inlier_mask = np.zeros(num_matches, dtype=bool)
                 else:
