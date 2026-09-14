@@ -156,6 +156,18 @@ def parse_args():
         default="nearest",
         help="Sampling mode for sparse BAD descriptor extraction (default: nearest)"
     )
+    # --- Blur robustness (Contrast Adaptive Sharpening) ---
+    parser.add_argument(
+        "--cas-sharpness",
+        type=float,
+        default=0.0,
+        help=(
+            "Contrast Adaptive Sharpening strength in [0, 1] applied to "
+            "both input images before detection/description. 0 disables "
+            "CAS (default: 0.0). Recommended 0.3-0.7 for motion blur / "
+            "defocus robustness."
+        ),
+    )
     # --- Match extraction options ---
     parser.add_argument(
         "--with-extraction",
@@ -223,6 +235,7 @@ def main():
         score_threshold=args.score_threshold,
         normalize_descriptors=args.normalize_descriptors,
         sampling_mode=args.sampling_mode,
+        cas_sharpness=args.cas_sharpness,
     )
 
     # Wrap with match extraction if requested
@@ -321,6 +334,7 @@ def main():
     print(f"  Unused score: {args.unused_score}")
     print(f"  Distance type: {args.distance_type}")
     print(f"  Sampling mode: {args.sampling_mode}")
+    print(f"  CAS sharpness (blur robustness): {args.cas_sharpness}")
     print(f"  Normalize descriptors: {args.normalize_descriptors}")
     print(f"  NMS radius: {args.nms_radius}")
     print(f"  Score threshold: {args.score_threshold}")

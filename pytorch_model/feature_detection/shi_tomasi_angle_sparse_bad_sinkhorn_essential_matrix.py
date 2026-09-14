@@ -26,6 +26,7 @@ from torch import nn
 
 from pytorch_model.feature_detection.shi_tomasi_angle import ShiTomasiWithAngle
 from pytorch_model.descriptor.bad import SparseBAD
+from pytorch_model.enhance.cas import ContrastAdaptiveSharpening
 from pytorch_model.matching.sinkhorn import SinkhornMatcher
 from pytorch_model.geometry.essential_matrix_estimator import EssentialMatrixEstimator
 from pytorch_model.utils import apply_nms_maxpool, select_topk_keypoints
@@ -80,6 +81,10 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         n_iter_manifold: Power-iteration steps for each 3×3 eigenvector solve
                          inside the Essential Matrix manifold projection.
                          Default is 10.
+        cas_sharpness: Contrast Adaptive Sharpening strength in [0, 1] applied
+                       to both input images before detection/description.
+                       0 disables CAS. Useful for motion blur / defocus
+                       robustness. Default is 0.0 (disabled).
 
     Example:
         >>> K = torch.eye(3)
@@ -118,6 +123,7 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         top_k: int = 3,
         n_iter: int = 30,
         n_iter_manifold: int = 10,
+        cas_sharpness: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -125,6 +131,17 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         self.nms_radius = nms_radius
         self.score_threshold = score_threshold
         self.top_k = top_k
+
+        # Blur robustness: optional Contrast Adaptive Sharpening (preprocess)
+        if cas_sharpness < 0.0:
+            raise ValueError(
+                f"cas_sharpness must be >= 0 (0 disables CAS), got {cas_sharpness}"
+            )
+        self.sharpener = (
+            ContrastAdaptiveSharpening(sharpness=cas_sharpness)
+            if cas_sharpness > 0.0
+            else None
+        )
 
         # Feature detector + orientation estimator
         self.detector = ShiTomasiWithAngle(
@@ -283,8 +300,11 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
         Detect keypoints, compute matches, and estimate the Essential Matrix.
 
         Args:
-            image1: First grayscale image, shape (1, 1, H, W).
-                    Batch size must be 1 for Essential Matrix estimation.
+            image1: First grayscale image, shape (1, 1, H, W). Expected
+                range [0, 255] — required when ``cas_sharpness`` is set
+                (CAS normalizes by 255 internally); with CAS disabled the
+                pipeline is scale-invariant. Batch size must be 1 for
+                Essential Matrix estimation.
             image2: Second grayscale image, shape (1, 1, H, W).
 
         Returns:
@@ -297,6 +317,11 @@ class ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix(nn.Module):
                   Last row/column are dustbin entries.
                 - E: Estimated Essential Matrix, shape (3, 3).
         """
+        # ── Step 0: Optional contrast adaptive sharpening (blur robustness) ─
+        if self.sharpener is not None:
+            image1 = self.sharpener(image1)
+            image2 = self.sharpener(image2)
+
         # ── Step 1: Detect features and compute orientations ───────────
         scores1, angles1 = self.detector(image1)   # (1, 1, H, W) each
         scores2, angles2 = self.detector(image2)

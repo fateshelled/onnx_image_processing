@@ -33,10 +33,23 @@ def test_edge_case_single_point():
     print("✓ Single point edge case test passed")
 
 def test_large_scale():
-    """Test with larger matrix to verify vectorization works"""
+    """Test with larger matrix to verify vectorization works.
+
+    Purely random rows have a best/second-best ratio that concentrates
+    tightly around 1.0 for large K (order statistics of ~K uniform
+    samples), so the ratio test would deterministically reject every
+    point — a property of the data, not a filter bug. Mix in dominant
+    unambiguous rows so the test verifies the filter's behavior on a
+    realistic mixture of confident and ambiguous matches.
+    """
     np.random.seed(42)
     K = 1000
-    P = np.random.rand(K, K)
+    P = np.random.rand(K, K) + 1e-12
+
+    # Make half the rows unambiguously peaked on the diagonal
+    n_dominant = 500
+    idx = np.arange(n_dominant)
+    P[idx, idx] += 20.0
 
     # Normalize rows to sum to 1 (valid probability distribution)
     P = P / P.sum(axis=1, keepdims=True)
@@ -47,9 +60,23 @@ def test_large_scale():
     assert mask.shape == (K,), f"Expected shape ({K},), got {mask.shape}"
     assert mask.dtype == bool, f"Expected dtype bool, got {mask.dtype}"
 
-    # Verify at least some points pass and some fail
+    # Verify mixed passes/fails
     num_passed = mask.sum()
     assert 0 < num_passed < K, f"Expected some passes and fails, got {num_passed}/{K}"
+
+    # The dominant rows must all pass; the rest are ambiguous by
+    # construction and must all fail
+    assert mask[idx].all(), f"Dominant rows should all pass, {mask[idx].sum()}/{n_dominant} passed"
+    assert not mask[n_dominant:].any(), \
+        f"Ambiguous rows should all fail, {mask[n_dominant:].sum()} passed"
+
+    # Cross-check against the direct loop reference for a subset
+    for i in range(0, K, 100):
+        row = P[i]
+        best2 = np.sort(row)[-2:]
+        # best is the largest; ratio = best / second-best
+        expect = best2[1] / best2[0] >= 2.0
+        assert mask[i] == expect, f"Row {i}: filter says {mask[i]}, reference says {expect}"
 
     print(f"✓ Large scale test passed: {num_passed}/{K} points passed filter")
 

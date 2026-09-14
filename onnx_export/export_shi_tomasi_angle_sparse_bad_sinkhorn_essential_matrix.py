@@ -240,6 +240,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    # ── Blur robustness (Contrast Adaptive Sharpening) ───────────────────
+    parser.add_argument(
+        "--cas-sharpness",
+        type=float,
+        default=0.0,
+        help=(
+            "Contrast Adaptive Sharpening strength in [0, 1] applied to "
+            "both input images before detection/description. 0 disables "
+            "CAS (default: 0.0). Recommended 0.3-0.7 for motion blur / "
+            "defocus robustness."
+        ),
+    )
+
     # ── ONNX export options ──────────────────────────────────────────────
     parser.add_argument(
         "--opset-version",
@@ -297,6 +310,7 @@ def main() -> None:
         top_k=args.top_k,
         n_iter=args.n_iter,
         n_iter_manifold=args.n_iter_manifold,
+        cas_sharpness=args.cas_sharpness,
     )
     model.eval()
 
@@ -370,6 +384,7 @@ def main() -> None:
     print(f"  Top-K (E estimation): {args.top_k}")
     print(f"  Power-iteration steps (9×9): {args.n_iter}")
     print(f"  Power-iteration steps (3×3 manifold): {args.n_iter_manifold}")
+    print(f"  CAS sharpness (blur robustness): {args.cas_sharpness}")
     print(f"  Opset version: {args.opset_version}")
     print(f"  Dynamic axes: {args.dynamic_axes}")
     print(f"  Optimization: {optimization}")

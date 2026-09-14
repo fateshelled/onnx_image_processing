@@ -92,8 +92,12 @@ class Trajectory:
         """
         Calculate total trajectory length.
 
+        Note: VO from monocular Essential Matrix has a scale ambiguity —
+        translation magnitudes are normalised (unit norm per frame step),
+        so this length is in normalised units, not physical meters.
+
         Returns:
-            Total distance traveled by the camera
+            Total distance traveled by the camera (normalised units)
         """
         positions = self.get_positions_array()
         if len(positions) < 2:
