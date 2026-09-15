@@ -29,6 +29,34 @@ ONNX exportable pytorch model for image processing.
   - Trajectory management and visualization
   - ONNX-based feature matching for VO
 
+## Export Scripts
+
+All models are exported by scripts under `onnx_export/`. Common options:
+`-H`/`-W` (image size, default 480/640), `-k`/`--max-keypoints`,
+`--num-pairs` (BAD pairs), `--binarization` (none/soft/hard), `--epsilon`,
+`--distance-type` (l1/l2). Run any script with `-h` for the full list.
+
+| Script | Produces | Notes |
+|---|---|---|
+| `export_shi_tomasi.py` | Shi-Tomasi corner score map | detection score only |
+| `export_shi_tomasi_bad.py` | Shi-Tomasi + BAD detector | used in Sample: Feature Detection |
+| `export_akaze.py` | AKAZE detector | multi-scale |
+| `export_dog.py` | DoG (Difference of Gaussians) detector | |
+| `export_fast.py` | FAST corner score map | |
+| `export_bad.py` | BAD (Box Average Difference) descriptor | |
+| `export_shi_tomasi_angle_sparse_bad.py` | Shi-Tomasi + Angle + Sparse BAD descriptor | rotation-invariant |
+| `export_sinkhorn.py` | Sinkhorn matcher | consumes descriptors |
+| `export_shi_tomasi_bad_sinkhorn.py` | Shi-Tomasi + BAD + Sinkhorn matcher | dense BAD |
+| `export_shi_tomasi_sparse_bad_sinkhorn.py` | Shi-Tomasi + Sparse BAD + Sinkhorn matcher | |
+| `export_akaze_sparse_bad_sinkhorn.py` | AKAZE + Sparse BAD + Sinkhorn matcher | |
+| `export_shi_tomasi_angle_sparse_bad_sinkhorn.py` | Shi-Tomasi + Angle + Sparse BAD + Sinkhorn matcher | used in Sample: Visual Odometry |
+| `export_shi_tomasi_angle_sparse_bad_sinkhorn_pyramid.py` | multi-scale pyramid variant | |
+| `export_shi_tomasi_angle_sparse_bad_sinkhorn_with_filters.py` | same + outlier filters (ratio / dustbin) | |
+| `export_shi_tomasi_angle_sparse_bad_sinkhorn_essential_matrix.py` | matcher with E baked in (4-output) | |
+| `export_akaze_sparse_bad_sinkhorn_essential_matrix.py` | AKAZE variant with E baked in | |
+| `export_essential_matrix_estimator.py` | standalone EssentialMatrixEstimator | |
+| `export_voxel_downsampling.py` | Voxel Downsampling | |
+
 ## Sample: Feature Detection (Shi-Tomasi + BAD)
 
 Detect feature points from an image using the Shi-Tomasi + BAD ONNX model and visualize the results.
