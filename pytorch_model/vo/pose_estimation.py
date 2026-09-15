@@ -103,7 +103,7 @@ def estimate_pose_ransac(
         threshold=ransac_threshold,
     )
 
-    if E is None or mask is None:
+    if E is None or mask is None or E.size == 0 or E.shape != (3, 3):
         return None, None, np.zeros(len(keypoints1), dtype=bool)
 
     inlier_mask = mask.ravel().astype(bool)
