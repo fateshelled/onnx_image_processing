@@ -114,6 +114,19 @@ Estimate camera trajectory from video or image sequence using the ONNX feature m
 python onnx_export/export_shi_tomasi_angle_sparse_bad_sinkhorn.py -o matcher.onnx -H 480 -W 640 --max-keypoints 512
 ```
 
+A multi-scale (image pyramid) variant is available:
+
+```bash
+python onnx_export/export_shi_tomasi_angle_sparse_bad_sinkhorn_pyramid.py \
+    -o pyramid_matcher.onnx --max-keypoints 512 --num-levels 2
+```
+
+It detects keypoints independently at each pyramid level (area-proportional
+keypoint budget) and performs a single Sinkhorn matching pass, reporting
+full-resolution coordinates. All other parameters are identical to the
+single-scale export above. See `eval/eval_tum_vo.py` for a TUM RGB-D VO
+evaluation harness (RANSAC / MAGSAC / guided-Sampson modes).
+
 ### 2. Run visual odometry
 
 ```bash
