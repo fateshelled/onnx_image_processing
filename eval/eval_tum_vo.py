@@ -5,12 +5,14 @@ matcher (incl. pyramid variant).
 
 Modes:
   vo      : end-to-end VO -> trajectory -> Umeyama(SE3, scaled) align to GT -> ATE/RPE.
-            method = ransac | magsac, threshold configurable, optional guided Sampson retry.
+            pose-source = essential uses monocular RANSAC/MAGSAC;
+            pose-source = rgbd-pnp uses registered depth for metric PnP-RANSAC.
   gtcheck : per-pair Sampson residual of extracted matches vs GT-derived fundamental matrix.
             Used to verify geometric consistency on long-baseline pairs (stride sweep).
 
 Usage:
-  python eval_tum_vo.py vo --model pyramid.onnx --seq all --stride 2 --method magsac --threshold 2.0
+  python eval_tum_vo.py vo --model pyramid.onnx --seq all --stride 2 --method magsac --threshold 1.4
+  python eval_tum_vo.py vo --model pyramid.onnx --seq all --stride 2 --pose-source rgbd-pnp --threshold 1.4
   python eval_tum_vo.py gtcheck --model pyramid.onnx --seq desk --stride 8
 """
 
@@ -30,7 +32,12 @@ import cv2  # noqa: E402
 import onnxruntime as ort  # noqa: E402
 
 from pytorch_model.matching.outlier_filters import dustbin_margin_filter  # noqa: E402
-from pytorch_model.vo.pose_estimation import estimate_pose_ransac, CameraIntrinsics  # noqa: E402
+from pytorch_model.vo.pose_estimation import (  # noqa: E402
+    estimate_pose_ransac,
+    estimate_pose_rgbd_pnp,
+    CameraIntrinsics,
+)
+from pytorch_model.vo.trajectory import Trajectory  # noqa: E402
 from eval.sampson_all import sampson_all, build_F_from_pose  # noqa: E402
 
 
@@ -51,6 +58,35 @@ def read_tum_file(path):
             vals = [float(x) for x in parts[1:8]]
             rows.append((t, vals))
     return rows
+
+
+def read_path_file(path):
+    """Read a TUM timestamp/path index such as rgb.txt or depth.txt."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                rows.append((float(parts[0]), parts[1]))
+    return rows
+
+
+def nearest_timestamp(rows, timestamp, max_diff):
+    """Return the nearest ``(timestamp, value)`` row within ``max_diff``."""
+    if not rows:
+        return None
+    timestamps = np.fromiter((row[0] for row in rows), dtype=np.float64)
+    pos = int(np.searchsorted(timestamps, timestamp))
+    candidates = []
+    if pos < len(rows):
+        candidates.append(rows[pos])
+    if pos > 0:
+        candidates.append(rows[pos - 1])
+    best = min(candidates, key=lambda row: abs(row[0] - timestamp))
+    return best if abs(best[0] - timestamp) <= max_diff else None
 
 
 def associate(rgb_rows, gt_rows, max_diff=0.02):
@@ -111,8 +147,8 @@ def extract_matches(kpts1, kpts2, P, threshold, max_matches, dbin_margin):
 # --------------------------------------------------------------------------
 # Umeyama alignment (rigid + uniform scale), numpy
 # --------------------------------------------------------------------------
-def umeyama(X, Y):
-    """Align X (N,3) onto Y (N,3): Y ~ s R X + t. Returns (s, R, t)."""
+def umeyama(X, Y, with_scale=True):
+    """Align X onto Y: ``Y ~ s R X + t``. Optionally fix ``s=1``."""
     mu_x = X.mean(axis=0)
     mu_y = Y.mean(axis=0)
     var_x = np.mean(np.sum((X - mu_x) ** 2, axis=1))
@@ -124,7 +160,7 @@ def umeyama(X, Y):
     if np.linalg.det(Vt.T @ U.T) < 0:
         S[2, 2] = -1
     R = Vt.T @ S @ U.T
-    s = np.trace(np.diag(D) @ S) / var_x
+    s = np.trace(np.diag(D) @ S) / var_x if with_scale else 1.0
     t = mu_y - s * (R @ mu_x)
     return s, R, t
 
@@ -132,7 +168,7 @@ def umeyama(X, Y):
 # --------------------------------------------------------------------------
 # Pose accumulation / ATE
 # --------------------------------------------------------------------------
-def estimate_pair(model, session, img_path1, img_path2, cam, args, prev_E=None):
+def estimate_pair(session, img_path1, img_path2, cam, args, depth_path1=None):
     """Run model on a pair, extract matches, estimate pose. Returns dict."""
     a = cv2.imread(img_path1, cv2.IMREAD_GRAYSCALE)
     b = cv2.imread(img_path2, cv2.IMREAD_GRAYSCALE)
@@ -149,10 +185,35 @@ def estimate_pair(model, session, img_path1, img_path2, cam, args, prev_E=None):
     if len(mk1) < 5:
         return res
 
-    method = cv2.USAC_MAGSAC if args.method == "magsac" else cv2.RANSAC
-    R, t, mask = estimate_pose_ransac(mk1, mk2, cam,
-                                      ransac_threshold=args.threshold,
-                                      method=method)
+    if args.pose_source == "rgbd-pnp":
+        if depth_path1 is None:
+            return res
+        depth = cv2.imread(str(depth_path1), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            return res
+        if depth.shape != (cam.height, cam.width):
+            depth = cv2.resize(
+                depth, (cam.width, cam.height), interpolation=cv2.INTER_NEAREST
+            )
+        R, t, mask = estimate_pose_rgbd_pnp(
+            mk1,
+            mk2,
+            depth,
+            cam,
+            depth_scale=args.depth_scale,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            ransac_threshold=args.threshold,
+        )
+    else:
+        method = cv2.USAC_MAGSAC if args.method == "magsac" else cv2.RANSAC
+        R, t, mask = estimate_pose_ransac(
+            mk1,
+            mk2,
+            cam,
+            ransac_threshold=args.threshold,
+            method=method,
+        )
     if R is None:
         return res
 
@@ -161,7 +222,11 @@ def estimate_pair(model, session, img_path1, img_path2, cam, args, prev_E=None):
                 "inlier_ratio": inlier_ratio, "n_inliers": int(np.sum(mask))})
 
     # Guided retry: low inlier ratio -> Sampson re-selection with R1's E
-    if args.guided and inlier_ratio < args.guided_inlier_thresh:
+    if (
+        args.pose_source == "essential"
+        and args.guided
+        and inlier_ratio < args.guided_inlier_thresh
+    ):
         K = cam.K
         E = _cross(t.ravel()) @ R
         F = np.linalg.inv(K).T @ E @ np.linalg.inv(K)
@@ -200,53 +265,56 @@ def run_vo(args):
     summary = []
     for seq in seqs:
         base = Path(args.dataset_root) / f"rgbd_dataset_freiburg1_{seq}"
-        rgb_rows = read_tum_file(base / "rgb.txt")
         gt_rows = read_tum_file(base / "groundtruth.txt")
-        # Build ordered frames with valid GT association by re-reading rgb.txt
-        # (rgb.txt format: timestamp <unused> <unused> <unused> path)
-        frame_list = []
-        with open(base / "rgb.txt") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                p = line.split()
-                if len(p) < 2:
-                    continue
-                frame_list.append((float(p[0]), base / p[1]))
-        gt_by_ts = {}
-        for (ts, vals) in gt_rows:
-            gt_by_ts[ts] = quat_to_se3(vals[:3], vals[3:7])
+        frame_list = read_path_file(base / "rgb.txt")
+        depth_rows = (
+            read_path_file(base / "depth.txt")
+            if args.pose_source == "rgbd-pnp"
+            else []
+        )
+        gt_poses = [
+            (ts, quat_to_se3(vals[:3], vals[3:7])) for ts, vals in gt_rows
+        ]
         frames = []
-        for ts, path in frame_list:
-            gi = min(gt_by_ts, key=lambda k: abs(k - ts))
-            if abs(gi - ts) <= 0.05:
-                frames.append((ts, path, gt_by_ts[gi]))
+        for ts, relative_path in frame_list:
+            gt_match = nearest_timestamp(gt_poses, ts, 0.05)
+            if gt_match is None:
+                continue
+            depth_path = None
+            if args.pose_source == "rgbd-pnp":
+                depth_match = nearest_timestamp(depth_rows, ts, args.depth_max_diff)
+                if depth_match is None:
+                    continue
+                depth_path = base / depth_match[1]
+            frames.append((ts, base / relative_path, depth_path, gt_match[1]))
 
         # process pairs at given stride
-        C = np.eye(4)  # estimated abs pose
-        est_pos = [C[:3, 3].copy()]
-        gt_pos = [frames[0][2][:3, 3].copy()]
+        trajectory = Trajectory()
+        est_pos = [trajectory.get_current_position().copy()]
+        gt_pos = [frames[0][3][:3, 3].copy()]
         n_pairs = 0
         n_ok = 0
         inlier_ratios = []
         for i in range(0, len(frames) - args.stride, args.stride):
-            ts_a, pa, gta = frames[i]
-            ts_b, pb, gtb = frames[i + args.stride]
-            res = estimate_pair(model=None, session=session, img_path1=str(pa),
-                                img_path2=str(pb), cam=cam, args=args)
+            ts_a, pa, da, gta = frames[i]
+            ts_b, pb, db, gtb = frames[i + args.stride]
+            res = estimate_pair(
+                session=session,
+                img_path1=str(pa),
+                img_path2=str(pb),
+                cam=cam,
+                args=args,
+                depth_path1=da,
+            )
             n_pairs += 1
             if res is None or not res.get("ok"):
                 # no pose update -> keep previous C (skip)
-                est_pos.append(C[:3, 3].copy())
+                est_pos.append(trajectory.get_current_position().copy())
                 gt_pos.append(gtb[:3, 3].copy())
                 continue
             R, t = res["R"], res["t"]
-            rel = np.eye(4)
-            rel[:3, :3] = R
-            rel[:3, 3] = t.ravel()
-            C = C @ rel
-            est_pos.append(C[:3, 3].copy())
+            trajectory.add_relative_pose(R, t)
+            est_pos.append(trajectory.get_current_position().copy())
             gt_pos.append(gtb[:3, 3].copy())
             n_ok += 1
             inlier_ratios.append(res["inlier_ratio"])
@@ -255,28 +323,43 @@ def run_vo(args):
         gt_pos = np.array(gt_pos)
         # Align
         if len(est_pos) >= 3:
-            s, R_align, t_align = umeyama(est_pos, gt_pos)
+            s, R_align, t_align = umeyama(est_pos, gt_pos, with_scale=True)
             aligned = s * (est_pos @ R_align.T) + t_align
-            err = np.linalg.norm(aligned - gt_pos, axis=1)
-            ate_rmse = float(np.sqrt(np.mean(err ** 2)))
-            ate_mean = float(np.mean(err))
-            ate_median = float(np.median(err))
+            sim3_err = np.linalg.norm(aligned - gt_pos, axis=1)
+            ate_rmse = float(np.sqrt(np.mean(sim3_err ** 2)))
+            ate_mean = float(np.mean(sim3_err))
+            ate_median = float(np.median(sim3_err))
+
+            _, R_metric, t_metric = umeyama(est_pos, gt_pos, with_scale=False)
+            metric_aligned = est_pos @ R_metric.T + t_metric
+            metric_err = np.linalg.norm(metric_aligned - gt_pos, axis=1)
+            metric_rmse = float(np.sqrt(np.mean(metric_err ** 2)))
+            metric_mean = float(np.mean(metric_err))
+            metric_median = float(np.median(metric_err))
         else:
             ate_rmse = ate_mean = ate_median = float("nan")
+            metric_rmse = metric_mean = metric_median = float("nan")
+            s = float("nan")
 
         row = {
-            "seq": seq, "method": args.method, "threshold": args.threshold,
+            "seq": seq, "pose_source": args.pose_source,
+            "method": args.method, "threshold": args.threshold,
             "stride": args.stride, "dbin": args.dbin,
             "guided": args.guided, "max_matches": args.max_matches,
             "n_pairs": n_pairs, "n_ok": n_ok,
             "ok_rate": n_ok / n_pairs if n_pairs else 0.0,
             "mean_inlier_ratio": float(np.mean(inlier_ratios)) if inlier_ratios else 0.0,
             "ATE_RMSE": ate_rmse, "ATE_mean": ate_mean, "ATE_median": ate_median,
+            "ATE_metric_RMSE": metric_rmse,
+            "ATE_metric_mean": metric_mean,
+            "ATE_metric_median": metric_median,
+            "alignment_scale": float(s),
         }
         summary.append(row)
         print(f"[{seq}] pairs={n_pairs} ok={n_ok} ok_rate={row['ok_rate']:.2f} "
               f"inl={row['mean_inlier_ratio']:.2f} ATE_RMSE={ate_rmse:.3f}m "
-              f"ATE_med={ate_median:.3f}m")
+              f"ATE_sim3_med={ate_median:.3f}m "
+              f"ATE_metric_med={metric_median:.3f}m scale={s:.3f}")
     return summary
 
 
@@ -373,13 +456,22 @@ def main():
     ap.add_argument("--seq", default="all")
     ap.add_argument("--stride", type=int, default=2)
     ap.add_argument("--method", choices=["ransac", "magsac"], default="ransac")
-    ap.add_argument("--threshold", type=float, default=1.0)
-    ap.add_argument("--dbin", type=float, default=0.3)
+    ap.add_argument(
+        "--pose-source",
+        choices=["essential", "rgbd-pnp"],
+        default="essential",
+    )
+    ap.add_argument("--threshold", type=float, default=1.4)
+    ap.add_argument("--dbin", type=float, default=0.1)
     ap.add_argument("--match-threshold", type=float, default=0.1)
     ap.add_argument("--max-matches", type=int, default=1024)
     ap.add_argument("--guided", action="store_true")
     ap.add_argument("--guided-inlier-thresh", type=float, default=0.35)
     ap.add_argument("--guided-sampson", type=float, default=2.0)
+    ap.add_argument("--depth-scale", type=float, default=5000.0)
+    ap.add_argument("--depth-max-diff", type=float, default=0.02)
+    ap.add_argument("--min-depth", type=float, default=0.1)
+    ap.add_argument("--max-depth", type=float, default=10.0)
     ap.add_argument("--fx", type=float, default=525.0)
     ap.add_argument("--fy", type=float, default=525.0)
     ap.add_argument("--cx", type=float, default=320.0)

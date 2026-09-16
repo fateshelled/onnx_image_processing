@@ -514,7 +514,7 @@ def run_visual_odometry(
     model_height: int,
     model_width: int,
     match_threshold: float = 0.1,
-    ransac_threshold: float = 1.0,
+    ransac_threshold: float = 1.4,
     max_matches: int = 100,
     min_matches: int = 20,
     min_inlier_ratio: float = 0.5,
@@ -894,8 +894,8 @@ def parse_args():
     parser.add_argument(
         "--ransac-threshold",
         type=float,
-        default=1.0,
-        help="RANSAC reprojection threshold in pixels (default: 1.0)"
+        default=1.4,
+        help="RANSAC reprojection threshold in pixels (default: 1.4)"
     )
     parser.add_argument(
         "--max-matches",

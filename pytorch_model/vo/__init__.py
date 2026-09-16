@@ -3,6 +3,7 @@
 from .pose_estimation import (
     CameraIntrinsics,
     estimate_pose_ransac,
+    estimate_pose_rgbd_pnp,
     triangulate_points,
     compose_transformation,
     transformation_to_matrix,
@@ -21,6 +22,7 @@ from .camera import (
 __all__ = [
     "CameraIntrinsics",
     "estimate_pose_ransac",
+    "estimate_pose_rgbd_pnp",
     "triangulate_points",
     "compose_transformation",
     "transformation_to_matrix",

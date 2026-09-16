@@ -54,7 +54,7 @@ def estimate_pose_ransac(
     keypoints1: np.ndarray,
     keypoints2: np.ndarray,
     camera_intrinsics: CameraIntrinsics,
-    ransac_threshold: float = 1.0,
+    ransac_threshold: float = 1.4,
     ransac_confidence: float = 0.999,
     method: int = cv2.RANSAC,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
@@ -123,6 +123,134 @@ def estimate_pose_ransac(
     inlier_mask = (mask.ravel() != 0) & (pose_mask.ravel() > 0)
 
     return R, t, inlier_mask
+
+
+def estimate_pose_rgbd_pnp(
+    keypoints1: np.ndarray,
+    keypoints2: np.ndarray,
+    depth1: np.ndarray,
+    camera_intrinsics: CameraIntrinsics,
+    depth_scale: float = 5000.0,
+    min_depth: float = 0.1,
+    max_depth: float = 10.0,
+    ransac_threshold: float = 2.0,
+    ransac_confidence: float = 0.999,
+    ransac_iterations: int = 1000,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
+    """Estimate metric relative pose from RGB matches and frame-1 depth.
+
+    Matched pixels in the first frame are back-projected with ``depth1`` and
+    registered against their second-frame pixels with PnP-RANSAC.  The return
+    convention matches :func:`estimate_pose_ransac` and ``cv2.recoverPose``::
+
+        x_current = R @ x_previous + t
+
+    Unlike monocular Essential Matrix recovery, ``t`` is expressed in meters
+    when ``depth1 / depth_scale`` is in meters.
+
+    Args:
+        keypoints1: First-frame keypoints, shape (N, 2), in (y, x) order.
+        keypoints2: Second-frame keypoints, shape (N, 2), in (y, x) order.
+        depth1: Registered first-frame depth image. Its dimensions must match
+            the camera intrinsics/model image dimensions.
+        camera_intrinsics: Camera calibration for both images.
+        depth_scale: Raw depth units per meter (TUM RGB-D uses 5000).
+        min_depth: Minimum accepted depth in meters.
+        max_depth: Maximum accepted depth in meters.
+        ransac_threshold: PnP reprojection threshold in pixels.
+        ransac_confidence: PnP-RANSAC confidence.
+        ransac_iterations: Maximum PnP-RANSAC iterations.
+
+    Returns:
+        ``(R, t, inlier_mask)``. The mask is indexed like the input matches
+        and excludes both invalid-depth points and PnP outliers.
+    """
+    n = len(keypoints1)
+    empty_mask = np.zeros(n, dtype=bool)
+    if (
+        n < 4
+        or len(keypoints2) != n
+        or depth1.ndim != 2
+        or depth_scale <= 0
+        or min_depth < 0
+        or max_depth <= min_depth
+    ):
+        return None, None, empty_mask
+
+    height, width = depth1.shape
+    y = keypoints1[:, 0].astype(np.float64)
+    x = keypoints1[:, 1].astype(np.float64)
+    sample_y = np.rint(y).astype(np.int64)
+    sample_x = np.rint(x).astype(np.int64)
+    inside = (
+        np.isfinite(x)
+        & np.isfinite(y)
+        & (sample_x >= 0)
+        & (sample_x < width)
+        & (sample_y >= 0)
+        & (sample_y < height)
+    )
+
+    depth_m = np.full(n, np.nan, dtype=np.float64)
+    valid_indices = np.flatnonzero(inside)
+    depth_m[valid_indices] = (
+        depth1[sample_y[valid_indices], sample_x[valid_indices]].astype(np.float64)
+        / depth_scale
+    )
+    valid_depth = (
+        inside
+        & np.isfinite(depth_m)
+        & (depth_m >= min_depth)
+        & (depth_m <= max_depth)
+    )
+    valid_indices = np.flatnonzero(valid_depth)
+    if len(valid_indices) < 4:
+        return None, None, empty_mask
+
+    z = depth_m[valid_indices]
+    object_points = np.column_stack([
+        (x[valid_indices] - camera_intrinsics.cx) * z / camera_intrinsics.fx,
+        (y[valid_indices] - camera_intrinsics.cy) * z / camera_intrinsics.fy,
+        z,
+    ]).astype(np.float64)
+    image_points = keypoints2[valid_indices][:, [1, 0]].astype(np.float64)
+
+    try:
+        ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+            object_points,
+            image_points,
+            camera_intrinsics.K,
+            None,
+            iterationsCount=ransac_iterations,
+            reprojectionError=ransac_threshold,
+            confidence=ransac_confidence,
+            flags=cv2.SOLVEPNP_EPNP,
+        )
+    except cv2.error:
+        return None, None, empty_mask
+
+    if not ok or inliers is None or len(inliers) < 4:
+        return None, None, empty_mask
+
+    local_inliers = inliers.ravel().astype(np.int64)
+    # Refine only the consensus pose. Keep the RANSAC result if refinement is
+    # unavailable or numerically fails on a degenerate point configuration.
+    try:
+        rvec, tvec = cv2.solvePnPRefineLM(
+            object_points[local_inliers],
+            image_points[local_inliers],
+            camera_intrinsics.K,
+            None,
+            rvec,
+            tvec,
+        )
+    except (cv2.error, AttributeError):
+        pass
+
+    R, _ = cv2.Rodrigues(rvec)
+    inlier_mask = np.zeros(n, dtype=bool)
+    inlier_mask[valid_indices[local_inliers]] = True
+    return R, tvec.reshape(3, 1), inlier_mask
 
 
 def triangulate_points(
