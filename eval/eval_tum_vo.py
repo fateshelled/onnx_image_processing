@@ -38,6 +38,7 @@ from pytorch_model.vo.pose_estimation import (  # noqa: E402
     CameraIntrinsics,
 )
 from pytorch_model.vo.trajectory import Trajectory  # noqa: E402
+from pytorch_model.vo.se3_window import SlidingWindowOptimizer  # noqa: E402
 from eval.sampson_all import sampson_all, build_F_from_pose  # noqa: E402
 
 
@@ -288,8 +289,12 @@ def run_vo(args):
                 depth_path = base / depth_match[1]
             frames.append((ts, base / relative_path, depth_path, gt_match[1]))
 
+        n_loop = 0
         # process pairs at given stride
         trajectory = Trajectory()
+        node_poses: dict[int, np.ndarray] = {0: trajectory.get_current_pose().copy()}
+        frame_img: dict[int, str] = {0: str(frames[0][1])}
+        odom: list[tuple] = []  # (i, j, R, t) for successful odometry edges
         est_pos = [trajectory.get_current_position().copy()]
         gt_pos = [frames[0][3][:3, 3].copy()]
         n_pairs = 0
@@ -311,6 +316,8 @@ def run_vo(args):
                 # no pose update -> keep previous C (skip)
                 est_pos.append(trajectory.get_current_position().copy())
                 gt_pos.append(gtb[:3, 3].copy())
+                node_poses[i + args.stride] = trajectory.get_current_pose().copy()
+                frame_img[i + args.stride] = str(pb)
                 continue
             R, t = res["R"], res["t"]
             trajectory.add_relative_pose(R, t)
@@ -318,6 +325,64 @@ def run_vo(args):
             gt_pos.append(gtb[:3, 3].copy())
             n_ok += 1
             inlier_ratios.append(res["inlier_ratio"])
+            node_poses[i + args.stride] = trajectory.get_current_pose().copy()
+            frame_img[i + args.stride] = str(pb)
+            odom.append((i, i + args.stride, R, t))
+
+        # Loop closure: build the full pose graph, detect loop edges by
+        # re-matching keyframe pairs, and re-optimize. Appearance-based
+        # detection (matcher inlier ratio) is used instead of a position
+        # gate, because the monocular estimate has already drifted and a
+        # position gate would miss true loops on these return-trajectories.
+        if args.loop_closure:
+            opt = SlidingWindowOptimizer(
+                window_size=None,
+                max_iterations=args.loop_iterations,
+                huber=args.loop_huber,
+            )
+            for idx, T in node_poses.items():
+                opt.add_node(idx, T)
+            for (i, j, R, t) in odom:
+                M = np.eye(4)
+                M[:3, :3] = R
+                M[:3, 3] = np.asarray(t, float).reshape(3)
+                opt.add_edge(i, j, M)
+
+            keys = sorted(node_poses.keys())
+            kf = keys[:: max(1, args.keyframe_decim)]
+            n_loop = 0
+            for ai in range(len(kf)):
+                for bi in range(ai + 1, len(kf)):
+                    a, b = kf[ai], kf[bi]
+                    if b - a < args.loop_min_gap:
+                        continue
+                    lres = estimate_pair(
+                        session=session,
+                        img_path1=frame_img[a],
+                        img_path2=frame_img[b],
+                        cam=cam,
+                        args=args,
+                        depth_path1=None,
+                    )
+                    if lres is None or not lres.get("ok"):
+                        continue
+                    if lres["inlier_ratio"] < args.loop_min_inlier:
+                        continue
+                    M = np.eye(4)
+                    M[:3, :3] = lres["R"]
+                    M[:3, 3] = np.asarray(lres["t"], float).reshape(3)
+                    opt.add_edge(a, b, M)
+                    n_loop += 1
+            opt.optimize(verbose=args.loop_verbose)
+            for idx in node_poses:
+                node_poses[idx] = opt.get_pose(idx)
+            # Rebuild est_pos from the optimized node poses, aligned to the
+            # original pair endpoints (frame 0 plus one per pair).
+            est_pos = [node_poses[0][:3, 3].copy()]
+            est_pos += [
+                node_poses[(p + 1) * args.stride][:3, 3].copy()
+                for p in range(n_pairs)
+            ]
 
         est_pos = np.array(est_pos)
         gt_pos = np.array(gt_pos)
@@ -346,6 +411,7 @@ def run_vo(args):
             "method": args.method, "threshold": args.threshold,
             "stride": args.stride, "dbin": args.dbin,
             "guided": args.guided, "max_matches": args.max_matches,
+            "loop_closure": args.loop_closure, "n_loop": n_loop,
             "n_pairs": n_pairs, "n_ok": n_ok,
             "ok_rate": n_ok / n_pairs if n_pairs else 0.0,
             "mean_inlier_ratio": float(np.mean(inlier_ratios)) if inlier_ratios else 0.0,
@@ -359,7 +425,8 @@ def run_vo(args):
         print(f"[{seq}] pairs={n_pairs} ok={n_ok} ok_rate={row['ok_rate']:.2f} "
               f"inl={row['mean_inlier_ratio']:.2f} ATE_RMSE={ate_rmse:.3f}m "
               f"ATE_sim3_med={ate_median:.3f}m "
-              f"ATE_metric_med={metric_median:.3f}m scale={s:.3f}")
+              f"ATE_metric_med={metric_median:.3f}m scale={s:.3f}"
+              + (f" loops={n_loop}" if args.loop_closure else ""))
     return summary
 
 
@@ -472,6 +539,22 @@ def main():
     ap.add_argument("--depth-max-diff", type=float, default=0.02)
     ap.add_argument("--min-depth", type=float, default=0.1)
     ap.add_argument("--max-depth", type=float, default=10.0)
+    # Loop closure (pose-graph): appearance-based loop detection + full-graph GN.
+    ap.add_argument("--loop-closure", action="store_true",
+                    help="Enable loop closure: detect loop edges by re-matching "
+                         "keyframe pairs and re-optimize the full pose graph.")
+    ap.add_argument("--keyframe-decim", type=int, default=8,
+                    help="Keyframe stride for loop candidates (every Nth node).")
+    ap.add_argument("--loop-min-gap", type=int, default=30,
+                    help="Minimum node-index gap between loop candidates.")
+    ap.add_argument("--loop-min-inlier", type=float, default=0.4,
+                    help="Minimum inlier ratio to accept a loop edge.")
+    ap.add_argument("--loop-iterations", type=int, default=60,
+                    help="Gauss-Newton iterations for the full-graph optimize.")
+    ap.add_argument("--loop-huber", type=float, default=1.0,
+                    help="Huber threshold for pose-graph edge reweighting.")
+    ap.add_argument("--loop-verbose", action="store_true",
+                    help="Print loop-closure optimize progress.")
     ap.add_argument("--fx", type=float, default=525.0)
     ap.add_argument("--fy", type=float, default=525.0)
     ap.add_argument("--cx", type=float, default=320.0)
