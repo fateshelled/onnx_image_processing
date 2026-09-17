@@ -460,12 +460,20 @@ def run_vo(args):
                     img_path2=frame_img[b], cam=cam, args=args,
                     depth_path1=None)
 
+            # Per-edge scale: monocular translations are unit-norm, so allow
+            # the optimizer to estimate each edge's translation magnitude
+            # (relative to the first edge by default). --scale-loop-only keeps
+            # only loop edges free (much smaller problem).
+            odom_scale_free = args.edge_scale and not args.scale_loop_only
             opt = SlidingWindowOptimizer(
                 window_size=None,
                 max_iterations=args.loop_iterations,
                 huber=args.loop_huber,
                 step_scale_t=args.step_scale_t,
                 step_scale_r=args.step_scale_r,
+                optimize_scale=args.edge_scale,
+                scale_prior_sigma=(args.scale_prior_sigma
+                                   if args.edge_scale else 0.0),
             )
             for idx, T in node_poses.items():
                 opt.add_node(idx, T)
@@ -474,7 +482,7 @@ def run_vo(args):
                 M = np.eye(4)
                 M[:3, :3] = R
                 M[:3, 3] = np.asarray(t, float).reshape(3)
-                opt.add_edge(i, j, M)
+                opt.add_edge(i, j, M, scale_free=odom_scale_free)
                 added_edges.add(edge_key(i, j))
 
             keys = sorted(node_poses.keys())
@@ -556,7 +564,7 @@ def run_vo(args):
                         M = np.eye(4)
                         M[:3, :3] = R_c
                         M[:3, 3] = t_c
-                        opt.add_edge(a, b, M, **sig)
+                        opt.add_edge(a, b, M, scale_free=args.edge_scale, **sig)
                         added_edges.add(edge_key(a, b))
                         n_loop += 1
                         loop_edges.append(
@@ -578,7 +586,7 @@ def run_vo(args):
                 M = np.eye(4)
                 M[:3, :3] = np.asarray(lres["R"], float)
                 M[:3, 3] = np.asarray(lres["t"], float).reshape(3)
-                opt.add_edge(a, b, M)
+                opt.add_edge(a, b, M, scale_free=odom_scale_free)
                 added_edges.add(edge_key(a, b))
                 n_local += 1
                 local_edges.append(_edge_diag(
@@ -632,6 +640,9 @@ def run_vo(args):
             "n_cycle_reject": n_cycle_reject if args.loop_closure else 0,
             "cycle_threshold_deg": args.cycle_threshold_deg,
             "loop_rot_only": bool(args.loop_rot_only),
+            "edge_scale": bool(args.edge_scale),
+            "scale_prior_sigma": args.scale_prior_sigma,
+            "scale_loop_only": bool(args.scale_loop_only),
             **({"loop_edges": loop_edges, "local_edges": local_edges}
                if args.loop_closure else {}),
             "desc_model": bool(args.desc_model),
@@ -794,6 +805,16 @@ def main():
                     help="Constrain loop edges by rotation only (ignore their "
                          "unit-norm monocular translation, which conflicts with "
                          "the odometry chain scale).")
+    ap.add_argument("--edge-scale", action="store_true", default=False,
+                    help="Optimize a per-edge translation scale (similarity "
+                         "pose graph) instead of fixing all translations to "
+                         "unit norm. First free edge is the scale gauge.")
+    ap.add_argument("--scale-prior-sigma", type=float, default=0.5,
+                    help="Std of the log-scale prior pulling edge scales "
+                         "toward 1 (only with --edge-scale).")
+    ap.add_argument("--scale-loop-only", action="store_true", default=False,
+                    help="With --edge-scale, keep odometry edges at unit scale "
+                         "and free only loop/refinement edges.")
     ap.add_argument("--loop-iterations", type=int, default=60,
                     help="Gauss-Newton iterations for the full-graph optimize.")
     ap.add_argument("--loop-huber", type=float, default=1.0,
