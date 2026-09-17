@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import cv2  # noqa: E402
 
 from rustuna_tune import load_all_cache, eval_seq  # noqa: E402
-from pytorch_model.vo.pose_estimation import CameraIntrinsics  # noqa: E402
+from vo.pose_estimation import CameraIntrinsics  # noqa: E402
 
 BASE = {"method": "magsac", "threshold": 1.4294175439754488, "dbin": 0.11538520396791509,
         "guided_inlier_thresh": 0.0, "guided_sampson": 4.0}

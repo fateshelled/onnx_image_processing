@@ -2,7 +2,7 @@
 """Test vectorized probability_ratio_filter implementation"""
 
 import numpy as np
-from pytorch_model.matching.outlier_filters import probability_ratio_filter
+from vo.outlier_filters import probability_ratio_filter
 
 def test_basic_functionality():
     """Test basic functionality with the example from docstring"""

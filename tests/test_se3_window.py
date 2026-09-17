@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from pytorch_model.vo.se3 import se3_ad, se3_exp, se3_log
-from pytorch_model.vo.se3_window import SlidingWindowOptimizer, _edge_residual
+from vo.se3 import se3_ad, se3_exp, se3_log
+from vo.se3_window import SlidingWindowOptimizer, _edge_residual
 
 
 def rand_T(rng, max_t=1.0, max_rot=0.5):

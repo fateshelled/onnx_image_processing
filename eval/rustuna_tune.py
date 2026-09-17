@@ -37,8 +37,8 @@ from eval_tum_vo import (  # noqa: E402
     read_tum_file,
     umeyama,
 )
-from pytorch_model.vo.pose_estimation import CameraIntrinsics, estimate_pose_ransac  # noqa: E402
-from pytorch_model.vo.trajectory import Trajectory  # noqa: E402
+from vo.pose_estimation import CameraIntrinsics, estimate_pose_ransac  # noqa: E402
+from vo.trajectory import Trajectory  # noqa: E402
 from eval.sampson_all import sampson_all  # noqa: E402
 
 

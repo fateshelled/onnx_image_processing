@@ -23,6 +23,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from pytorch_model.feature_detection.shi_tomasi_angle_sparse_bad_sinkhorn_pyramid import (
     ShiTomasiAngleSparseBADSinkhornMatcherPyramid,
 )
+from pytorch_model.feature_detection.single_image_pyramid_features import (
+    SingleImagePyramidFeatures,
+    PairWithDescriptors,
+)
 from pytorch_model.feature_detection.match_extraction_wrapper import MatchExtractionWrapper
 from onnx_export.optimize import optimize_onnx_model, remove_external_data
 
@@ -57,6 +61,14 @@ def parse_args():
     p.add_argument("--sampling-mode", type=str, choices=["nearest", "bilinear"], default="nearest")
     p.add_argument("--cas-sharpness", type=float, default=0.0)
     p.add_argument("--with-extraction", action="store_true")
+    p.add_argument("--single-image", action="store_true",
+                   help="Export a single-image wrapper that returns "
+                        "(keypoints, descriptors) for feature caching.")
+    p.add_argument("--with-descriptors", action="store_true",
+                   help="Export the standard pair model with the internally "
+                        "computed descriptors added as outputs "
+                        "(keypoints1, keypoints2, descriptors1, "
+                        "descriptors2, matching_probs).")
     p.add_argument("--max-matches", type=int, default=100)
     p.add_argument("--match-threshold", type=float, default=0.1)
     p.add_argument("--opset-version", type=int, default=18)
@@ -95,7 +107,11 @@ def main():
 
     base_model = ShiTomasiAngleSparseBADSinkhornMatcherPyramid(**pyramid_kwargs)
 
-    if args.with_extraction:
+    if args.single_image:
+        model = SingleImagePyramidFeatures(base_model)
+    elif args.with_descriptors:
+        model = PairWithDescriptors(base_model)
+    elif args.with_extraction:
         model = MatchExtractionWrapper(
             feature_matcher=base_model,
             max_matches=args.max_matches,
@@ -106,30 +122,46 @@ def main():
 
     model.eval()
 
+    single_image = args.single_image
     dummy1 = torch.randn(1, 1, args.height, args.width)
     dummy2 = torch.randn(1, 1, args.height, args.width)
 
-    if args.with_extraction:
-        output_names = ["matched_kpts1", "matched_kpts2", "scores", "valid_mask"]
+    if single_image:
+        output_names = ["keypoints", "descriptors"]
+        sample_inputs = (dummy1,)
+        input_names = ["image"]
+        dynamic_axes = None
+        if args.dynamic_axes:
+            dynamic_axes = {
+                "image": {0: "batch", 2: "height", 3: "width"},
+            }
     else:
-        output_names = ["keypoints1", "keypoints2", "matching_probs"]
+        if args.with_descriptors:
+            output_names = ["keypoints1", "keypoints2", "descriptors1",
+                            "descriptors2", "matching_probs"]
+        elif args.with_extraction:
+            output_names = ["matched_kpts1", "matched_kpts2", "scores", "valid_mask"]
+        else:
+            output_names = ["keypoints1", "keypoints2", "matching_probs"]
+        sample_inputs = (dummy1, dummy2)
+        input_names = ["image1", "image2"]
+        dynamic_axes = None
+        if args.dynamic_axes:
+            dynamic_axes = {
+                "image1": {0: "batch", 2: "height", 3: "width"},
+                "image2": {0: "batch", 2: "height", 3: "width"},
+            }
 
-    dynamic_axes = None
-    if args.dynamic_axes:
-        dynamic_axes = {
-            "image1": {0: "batch", 2: "height", 3: "width"},
-            "image2": {0: "batch", 2: "height", 3: "width"},
-        }
-
-    print(f"Exporting pyramid matcher to ONNX (levels={args.num_levels})...")
+    print(f"Exporting pyramid matcher to ONNX (levels={args.num_levels}, "
+          f"single_image={single_image}, with_descriptors={args.with_descriptors})...")
     torch.onnx.export(
         model,
-        (dummy1, dummy2),
+        sample_inputs,
         args.output,
         export_params=True,
         opset_version=args.opset_version,
         do_constant_folding=True,
-        input_names=["image1", "image2"],
+        input_names=input_names,
         output_names=output_names,
         dynamic_axes=dynamic_axes,
         dynamo=not args.disable_dynamo,

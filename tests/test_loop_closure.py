@@ -1,9 +1,19 @@
-"""Synthetic tests for full-graph (window_size=None) pose optimization + loop edges."""
+"""Synthetic tests for full-graph (window_size=None) pose optimization + loop edges.
+
+Also covers the numpy-only integrated keyframe-matching / loop-closure edge
+selection logic in ``vo.loop_closure``.
+"""
 
 import numpy as np
 
-from pytorch_model.vo.se3 import se3_exp, se3_log
-from pytorch_model.vo.se3_window import SlidingWindowOptimizer, _edge_residual
+from vo.se3 import se3_exp, se3_log
+from vo.se3_window import SlidingWindowOptimizer, _edge_residual
+from vo.loop_closure import (
+    confirmed_loop_hits,
+    edge_key,
+    local_candidate,
+    temporal_confirmed,
+)
 
 
 def _chain(n, seed=0, step=0.1):
@@ -68,7 +78,65 @@ def test_loop_closure_corrects_drift():
     assert loop_res < 0.1, f"loop edge residual should be small, got {loop_res}"
 
 
+# --------------------------------------------------------------------------
+# Integrated keyframe matching / loop-closure edge selection
+# --------------------------------------------------------------------------
+def _hit(a, inl=0.5, n=100):
+    return (int(a), np.eye(3), np.zeros(3), float(inl), int(n))
+
+
+def test_edge_key_is_undirected():
+    assert edge_key(3, 7) == edge_key(7, 3) == (3, 7)
+
+
+def test_temporal_gate_requires_consecutive_history():
+    # need=1 -> gate off
+    assert temporal_confirmed(0, 2, [[], [_hit(0)], [_hit(2)]], 1, margin=4)
+    # need=3 -> keyframe 0 has no hit, so the chain is broken
+    assert not temporal_confirmed(0, 2, [[], [_hit(0)], [_hit(2)]], 3, margin=4)
+    # full chain confirms
+    assert temporal_confirmed(0, 2, [[_hit(1)], [_hit(0)], [_hit(2)]], 3, margin=4)
+
+
+def test_temporal_gate_margin():
+    hits_per_kf = [[], [_hit(0)], []]
+    assert temporal_confirmed(3, 2, hits_per_kf, 2, margin=4)
+    assert not temporal_confirmed(3, 2, hits_per_kf, 2, margin=2)
+
+
+def test_confirmed_loop_hits_skips_duplicates():
+    hits = [_hit(0), _hit(8)]
+    out = confirmed_loop_hits(16, hits, 1, [[], []], need=1, margin=4,
+                              added_edges={edge_key(0, 16)})
+    assert [int(h[0]) for h in out] == [8]
+
+
+def test_local_candidate_branches():
+    kf = [0, 16, 32]
+    assert local_candidate(kf, 0, set()) is None
+    assert local_candidate(kf, 2, set()) == 16
+    assert local_candidate(kf, 2, {edge_key(16, 32)}) is None
+
+
+def test_integrated_loop_preferred_then_local_fallback():
+    kf = [0, 16, 32, 48]
+    hits_per_kf = [[], [_hit(0, inl=0.9)], [_hit(0, inl=0.9)], []]
+    # Keyframe 32: the previous keyframe saw the same loop spot -> loop path.
+    confirmed = confirmed_loop_hits(32, [_hit(0, inl=0.9)], 2, hits_per_kf,
+                                    need=2, margin=16, added_edges=set())
+    assert len(confirmed) == 1 and int(confirmed[0][0]) == 0
+    # Keyframe 48: no loop hit -> local fallback to kf[2] == 32.
+    assert confirmed_loop_hits(48, [], 3, hits_per_kf, 2, 16, set()) == []
+    assert local_candidate(kf, 3, set()) == 32
+
+
 if __name__ == "__main__":
     test_full_graph_keeps_all_nodes()
     test_loop_closure_corrects_drift()
+    test_edge_key_is_undirected()
+    test_temporal_gate_requires_consecutive_history()
+    test_temporal_gate_margin()
+    test_confirmed_loop_hits_skips_duplicates()
+    test_local_candidate_branches()
+    test_integrated_loop_preferred_then_local_fallback()
     print("loop closure tests passed")

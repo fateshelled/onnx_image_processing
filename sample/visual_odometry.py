@@ -53,7 +53,7 @@ import onnxruntime as ort
 # Add parent directory to path to import modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.vo import (
+from vo import (
     CameraIntrinsics,
     estimate_pose_ransac,
     Trajectory,

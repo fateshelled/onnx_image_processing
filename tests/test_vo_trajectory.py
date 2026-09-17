@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from pytorch_model.vo import Trajectory, CameraIntrinsics
+from vo import Trajectory, CameraIntrinsics
 
 
 def _rotation_y(angle_rad: float) -> np.ndarray:

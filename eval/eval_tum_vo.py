@@ -31,14 +31,24 @@ sys.path.insert(0, str(ROOT))
 import cv2  # noqa: E402
 import onnxruntime as ort  # noqa: E402
 
-from pytorch_model.matching.outlier_filters import dustbin_margin_filter  # noqa: E402
-from pytorch_model.vo.pose_estimation import (  # noqa: E402
+from vo.outlier_filters import dustbin_margin_filter  # noqa: E402
+from vo.sinkhorn_numpy import NumpySinkhornMatcher  # noqa: E402
+from vo.pose_estimation import (  # noqa: E402
     estimate_pose_ransac,
     estimate_pose_rgbd_pnp,
     CameraIntrinsics,
 )
-from pytorch_model.vo.trajectory import Trajectory  # noqa: E402
-from pytorch_model.vo.se3_window import SlidingWindowOptimizer  # noqa: E402
+from vo.trajectory import Trajectory  # noqa: E402
+from vo.se3_window import SlidingWindowOptimizer  # noqa: E402
+from vo.loop_closure import (  # noqa: E402
+    confirmed_loop_hits,
+    edge_key,
+    local_candidate,
+)
+from vo.cycle_consistency import (  # noqa: E402
+    chain_residual_deg,
+    cumulative_rotations,
+)
 from eval.sampson_all import sampson_all, build_F_from_pose  # noqa: E402
 
 
@@ -169,8 +179,15 @@ def umeyama(X, Y, with_scale=True):
 # --------------------------------------------------------------------------
 # Pose accumulation / ATE
 # --------------------------------------------------------------------------
-def estimate_pair(session, img_path1, img_path2, cam, args, depth_path1=None):
-    """Run model on a pair, extract matches, estimate pose. Returns dict."""
+def estimate_pair(session, img_path1, img_path2, cam, args, depth_path1=None,
+                  feature_cache=None, frame_a=None, frame_b=None):
+    """Run model on a pair, extract matches, estimate pose. Returns dict.
+
+    If the model also outputs per-image descriptors (export
+    --with-descriptors: keypoints1, keypoints2, descriptors1, descriptors2,
+    matching_probs), they are stored into feature_cache[frame_a] /
+    feature_cache[frame_b] so loop closure can re-match without re-detection.
+    """
     a = cv2.imread(img_path1, cv2.IMREAD_GRAYSCALE)
     b = cv2.imread(img_path2, cv2.IMREAD_GRAYSCALE)
     if a is None or b is None:
@@ -178,10 +195,22 @@ def estimate_pair(session, img_path1, img_path2, cam, args, depth_path1=None):
     a = cv2.resize(a, (cam.width, cam.height)).astype(np.float32)[None, None]
     b = cv2.resize(b, (cam.width, cam.height)).astype(np.float32)[None, None]
 
-    k1, k2, P = session.run(None, {"image1": a, "image2": b})
+    outs = session.run(None, {"image1": a, "image2": b})
+    if len(outs) == 5:
+        k1, k2, d1, d2, P = outs
+        if feature_cache is not None:
+            feature_cache[frame_a] = (k1, d1)
+            feature_cache[frame_b] = (k2, d2)
+    else:
+        k1, k2, P = outs
     mk1, mk2, sc = extract_matches(k1, k2, P, args.match_threshold,
                                    args.max_matches, args.dbin)
+    return estimate_pose_from_matches(mk1, mk2, cam, args, depth_path1)
 
+
+def estimate_pose_from_matches(mk1, mk2, cam, args, depth_path1=None):
+    """Pose estimation from extracted matches (shared by pair model and
+    descriptor-cache paths). Returns the estimate_pair result dict."""
     res = {"n_matches": len(mk1), "ok": False}
     if len(mk1) < 5:
         return res
@@ -255,6 +284,36 @@ def relative_from_gt(gt_se3_a, gt_se3_b):
     return np.linalg.inv(gt_se3_a) @ gt_se3_b
 
 
+def _edge_diag(frames, a, b, R_c, t_c, inlier, n_matches, cum_rot=None):
+    """Diagnostics for a closure edge (evaluation only, never used to accept
+    the edge). ``R_err_deg`` is against GT; ``R_odom_err_deg`` is the rotation
+    disagreement with the odometry chain (the runtime gate signal)."""
+    diag = {"a": int(a), "b": int(b),
+            "inlier": float(inlier), "n_matches": int(n_matches),
+            "R": np.asarray(R_c, float).tolist()}
+    R_c = np.asarray(R_c, float)
+    t_c = np.asarray(t_c, float).reshape(3)
+    if cum_rot is not None and a in cum_rot and b in cum_rot:
+        try:
+            diag["R_odom_err_deg"] = chain_residual_deg(a, b, R_c, cum_rot)
+        except Exception:
+            pass
+    try:
+        T_a_gt = frames[a][3]
+        T_b_gt = frames[b][3]
+        # M_ab = inv(T_b) T_a (matches the recoverPose R convention used for
+        # the loop edge): R_ab = R_b^T R_a, t_ab = R_b^T (t_a - t_b).
+        R_gt = T_b_gt[:3, :3].T @ T_a_gt[:3, :3]
+        t_gt = T_b_gt[:3, :3].T @ (T_a_gt[:3, 3] - T_b_gt[:3, 3])
+        c = (np.trace(R_gt @ R_c.T) - 1.0) / 2.0
+        diag["R_err_deg"] = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+        diag["t_err_m"] = float(np.linalg.norm(t_c - t_gt))
+        diag["t_gt_norm_m"] = float(np.linalg.norm(t_gt))
+    except Exception:
+        pass
+    return diag
+
+
 # --------------------------------------------------------------------------
 # VO mode
 # --------------------------------------------------------------------------
@@ -290,6 +349,10 @@ def run_vo(args):
             frames.append((ts, base / relative_path, depth_path, gt_match[1]))
 
         n_loop = 0
+        # Descriptor cache: filled by the odometry pass itself when the pair
+        # model emits descriptors (--with-descriptors export), so loop
+        # re-matching needs no extra detection.
+        feature_cache: dict[int, tuple] = {}
         # process pairs at given stride
         trajectory = Trajectory()
         node_poses: dict[int, np.ndarray] = {0: trajectory.get_current_pose().copy()}
@@ -310,6 +373,9 @@ def run_vo(args):
                 cam=cam,
                 args=args,
                 depth_path1=da,
+                feature_cache=feature_cache,
+                frame_a=i,
+                frame_b=i + args.stride,
             )
             n_pairs += 1
             if res is None or not res.get("ok"):
@@ -329,50 +395,200 @@ def run_vo(args):
             frame_img[i + args.stride] = str(pb)
             odom.append((i, i + args.stride, R, t))
 
-        # Loop closure: build the full pose graph, detect loop edges by
-        # re-matching keyframe pairs, and re-optimize. Appearance-based
-        # detection (matcher inlier ratio) is used instead of a position
-        # gate, because the monocular estimate has already drifted and a
-        # position gate would miss true loops on these return-trajectories.
+        # Integrated keyframe matching + loop closure: build the full pose
+        # graph, then walk the keyframes once. Each new keyframe first tries
+        # loop closure against older keyframes in the recent window; if no
+        # loop is confirmed it falls back to a local refinement edge with the
+        # immediately preceding keyframe. The loop/local stages are exclusive
+        # and every added edge is recorded so no constraint is duplicated.
+        # Appearance-based detection (matcher inlier ratio) is used instead of
+        # a position gate, because the monocular estimate has already drifted
+        # and a position gate would miss true loops on these return-trajectories.
         if args.loop_closure:
+            single_sess = None
+
+            def lazy_features(idx: int):
+                # feature_cache is filled either by the odometry pass
+                # (descriptor-emitting pair model) or --desc-model
+                # (single-image keypoints+descriptors model).
+                if idx in feature_cache:
+                    return feature_cache[idx]
+                if single_sess is None:
+                    return None  # frame not covered by any odometry pair
+                img = cv2.imread(frame_img[idx], cv2.IMREAD_GRAYSCALE)
+                img = cv2.resize(
+                    img, (cam.width, cam.height)).astype(np.float32)[None, None]
+                kp, desc = single_sess.run(None, {"image": img})
+                feature_cache[idx] = (kp, desc)
+                return feature_cache[idx]
+
+            # feature_cache is filled by the odometry pass itself when the
+            # pair model emits descriptors; --desc-model only adds lazy
+            # detection for frames the odometry pass never touched.
+            desc_matcher = NumpySinkhornMatcher(
+                iterations=args.sink_iterations,
+                epsilon=args.sink_epsilon,
+                unused_score=args.unused_score,
+                distance_type="l2",
+            )
+            if args.desc_model and args.pose_source == "essential":
+                single_sess = ort.InferenceSession(
+                    args.desc_model, providers=["CPUExecutionProvider"])
+
+            n_cached_match = 0
+            n_pair_match = 0
+
+            def match_keyframes(a: int, b: int):
+                """Shared matcher for loop and local refinement edges: uses the
+                per-frame descriptor cache (numpy Sinkhorn) when both keyframes
+                have cached features, otherwise the pair model on the images."""
+                nonlocal n_cached_match, n_pair_match
+                fa, fb = lazy_features(a), lazy_features(b)
+                if fa is not None and fb is not None:
+                    n_cached_match += 1
+                    kp_a, desc_a = fa
+                    kp_b, desc_b = fb
+                    P = desc_matcher.match_probs(desc_a[0], desc_b[0])
+                    mk1, mk2, _ = extract_matches(
+                        kp_a, kp_b, P[None], args.match_threshold,
+                        args.max_matches, args.dbin)
+                    return estimate_pose_from_matches(
+                        mk1, mk2, cam, args, depth_path1=None)
+                n_pair_match += 1
+                return estimate_pair(
+                    session=session, img_path1=frame_img[a],
+                    img_path2=frame_img[b], cam=cam, args=args,
+                    depth_path1=None)
+
             opt = SlidingWindowOptimizer(
                 window_size=None,
                 max_iterations=args.loop_iterations,
                 huber=args.loop_huber,
+                step_scale_t=args.step_scale_t,
+                step_scale_r=args.step_scale_r,
             )
             for idx, T in node_poses.items():
                 opt.add_node(idx, T)
+            added_edges = set()
             for (i, j, R, t) in odom:
                 M = np.eye(4)
                 M[:3, :3] = R
                 M[:3, 3] = np.asarray(t, float).reshape(3)
                 opt.add_edge(i, j, M)
+                added_edges.add(edge_key(i, j))
 
             keys = sorted(node_poses.keys())
             kf = keys[:: max(1, args.keyframe_decim)]
+            kf_step = args.stride * max(1, args.keyframe_decim)
+            # Odometry-chain cumulative rotation: the reference path for the
+            # rotation cycle-consistency gate. It is independent of any loop
+            # decision, and available for every candidate pair.
+            odom_rot = {edge_key(i, j): np.asarray(R, float)
+                        for (i, j, R, t) in odom}
+            cum_rot = cumulative_rotations(keys, odom_rot)
+            # Temporal consistency: a loop edge (a, b) is accepted only if the
+            # previous --loop-temporal-k keyframes also matched nearly the same
+            # old keyframe a' (|a' - a| <= margin). Isolated hits are rejected.
+            margin = max(int(args.kf_margin * kf_step), kf_step)
+            need = max(1, args.loop_temporal_k)
+            window = args.loop_window if args.loop_window > 0 else len(kf)
             n_loop = 0
-            for ai in range(len(kf)):
-                for bi in range(ai + 1, len(kf)):
-                    a, b = kf[ai], kf[bi]
+            n_local = 0
+            n_cycle_reject = 0
+            loop_edges = []
+            local_edges = []
+            hits_per_kf: list[list] = [[] for _ in kf]
+
+            for bi, b in enumerate(kf):
+                # Loop stage: match older keyframes in the recent window
+                # (bounded so the search stays local and cheap).
+                hits = []
+                for ai in range(max(0, bi - window), bi):
+                    a = kf[ai]
                     if b - a < args.loop_min_gap:
                         continue
-                    lres = estimate_pair(
-                        session=session,
-                        img_path1=frame_img[a],
-                        img_path2=frame_img[b],
-                        cam=cam,
-                        args=args,
-                        depth_path1=None,
-                    )
+                    lres = match_keyframes(a, b)
                     if lres is None or not lres.get("ok"):
                         continue
                     if lres["inlier_ratio"] < args.loop_min_inlier:
                         continue
-                    M = np.eye(4)
-                    M[:3, :3] = lres["R"]
-                    M[:3, 3] = np.asarray(lres["t"], float).reshape(3)
-                    opt.add_edge(a, b, M)
-                    n_loop += 1
+                    hits.append((
+                        int(a),
+                        np.asarray(lres["R"], float),
+                        np.asarray(lres["t"], float).reshape(3),
+                        float(lres["inlier_ratio"]),
+                        int(lres.get("n_matches", -1)),
+                    ))
+                hits_per_kf[bi] = hits
+
+                accepted = confirmed_loop_hits(
+                    b, hits, bi, hits_per_kf, need, margin, added_edges)
+                # Rotation cycle-consistency gate: the loop edge must agree on
+                # rotation (scale-free) with the odometry chain between the same
+                # nodes. This is the cycle formed by the loop edge and the
+                # odometry path, so it is available for every candidate.
+                final = []
+                for hit in accepted:
+                    a_hit, R_hit = int(hit[0]), np.asarray(hit[1], float)
+                    if args.cycle_threshold_deg > 0:
+                        res = chain_residual_deg(a_hit, b, R_hit, cum_rot)
+                        if res > args.cycle_threshold_deg:
+                            n_cycle_reject += 1
+                            continue
+                    final.append(hit)
+                if final:
+                    sig = {"sigma_t": None, "sigma_r": None}
+                    if args.loop_rot_only:
+                        # Monocular recoverPose translations are unit-norm per
+                        # step, so a long-baseline loop edge's translation is
+                        # inconsistent with the odometry chain scale. Constrain
+                        # rotation only; let the sim3 evaluation handle scale.
+                        sig = {"sigma_t": 1e6, "sigma_r": None}
+                        if args.loop_sigma_scale > 0:
+                            sig["sigma_r"] = (
+                                args.step_scale_r * args.loop_sigma_scale)
+                    elif args.loop_sigma_scale > 0:
+                        sig = {
+                            "sigma_t": args.step_scale_t * args.loop_sigma_scale,
+                            "sigma_r": args.step_scale_r * args.loop_sigma_scale,
+                        }
+                    for (a, R_c, t_c, inl, n_m) in final:
+                        M = np.eye(4)
+                        M[:3, :3] = R_c
+                        M[:3, 3] = t_c
+                        opt.add_edge(a, b, M, **sig)
+                        added_edges.add(edge_key(a, b))
+                        n_loop += 1
+                        loop_edges.append(
+                            _edge_diag(frames, a, b, R_c, t_c, inl, n_m,
+                                       cum_rot=cum_rot))
+                    continue  # exclusive: loop confirmed for this keyframe
+
+                # No loop: local refinement vs the nearest keyframe.
+                if not args.local_refine:
+                    continue
+                a = local_candidate(kf, bi, added_edges)
+                if a is None:
+                    continue
+                lres = match_keyframes(a, b)
+                if lres is None or not lres.get("ok"):
+                    continue
+                if lres["inlier_ratio"] < args.local_min_inlier:
+                    continue
+                M = np.eye(4)
+                M[:3, :3] = np.asarray(lres["R"], float)
+                M[:3, 3] = np.asarray(lres["t"], float).reshape(3)
+                opt.add_edge(a, b, M)
+                added_edges.add(edge_key(a, b))
+                n_local += 1
+                local_edges.append(_edge_diag(
+                    frames, a, b, lres["R"], lres["t"],
+                    float(lres["inlier_ratio"]), int(lres.get("n_matches", -1)),
+                    cum_rot=cum_rot))
+
+            print(f"[loop] matched via cache: {n_cached_match}, pair model: "
+                  f"{n_pair_match}, loops: {n_loop}, local: {n_local}, "
+                  f"cycle-reject: {n_cycle_reject}")
             opt.optimize(verbose=args.loop_verbose)
             for idx in node_poses:
                 node_poses[idx] = opt.get_pose(idx)
@@ -412,6 +628,13 @@ def run_vo(args):
             "stride": args.stride, "dbin": args.dbin,
             "guided": args.guided, "max_matches": args.max_matches,
             "loop_closure": args.loop_closure, "n_loop": n_loop,
+            "n_local": n_local if args.loop_closure else 0,
+            "n_cycle_reject": n_cycle_reject if args.loop_closure else 0,
+            "cycle_threshold_deg": args.cycle_threshold_deg,
+            "loop_rot_only": bool(args.loop_rot_only),
+            **({"loop_edges": loop_edges, "local_edges": local_edges}
+               if args.loop_closure else {}),
+            "desc_model": bool(args.desc_model),
             "n_pairs": n_pairs, "n_ok": n_ok,
             "ok_rate": n_ok / n_pairs if n_pairs else 0.0,
             "mean_inlier_ratio": float(np.mean(inlier_ratios)) if inlier_ratios else 0.0,
@@ -426,7 +649,8 @@ def run_vo(args):
               f"inl={row['mean_inlier_ratio']:.2f} ATE_RMSE={ate_rmse:.3f}m "
               f"ATE_sim3_med={ate_median:.3f}m "
               f"ATE_metric_med={metric_median:.3f}m scale={s:.3f}"
-              + (f" loops={n_loop}" if args.loop_closure else ""))
+              + (f" loops={n_loop} local={n_local} cyclo={n_cycle_reject}"
+                 if args.loop_closure else ""))
     return summary
 
 
@@ -549,12 +773,59 @@ def main():
                     help="Minimum node-index gap between loop candidates.")
     ap.add_argument("--loop-min-inlier", type=float, default=0.4,
                     help="Minimum inlier ratio to accept a loop edge.")
+    ap.add_argument("--loop-window", type=int, default=40,
+                    help="Search loop candidates among this many recent "
+                         "keyframes (0 = all previous keyframes).")
+    ap.add_argument("--local-refine", action="store_true", default=False,
+                    help="When no loop is confirmed, also add a refinement edge "
+                         "to the nearest keyframe (off by default: it hurt ATE "
+                         "on desk/desk2).")
+    ap.add_argument("--local-min-inlier", type=float, default=0.4,
+                    help="Minimum inlier ratio to accept a local refinement edge.")
+    # Rotation cycle-consistency gate: a loop edge must agree (in rotation)
+    # with an alternative path through other accepted closure edges, where
+    # such a path exists. Scale-free, so it works before RGB-D depth.
+    ap.add_argument("--cycle-threshold-deg", type=float, default=0.0,
+                    help="Max rotation disagreement (deg) between a loop edge "
+                         "and the odometry chain (0 = disable). Off by default: "
+                         "on desk it rejects good loops (residual is uncorrelated "
+                         "with GT error).")
+    ap.add_argument("--loop-rot-only", action="store_true",
+                    help="Constrain loop edges by rotation only (ignore their "
+                         "unit-norm monocular translation, which conflicts with "
+                         "the odometry chain scale).")
     ap.add_argument("--loop-iterations", type=int, default=60,
                     help="Gauss-Newton iterations for the full-graph optimize.")
     ap.add_argument("--loop-huber", type=float, default=1.0,
                     help="Huber threshold for pose-graph edge reweighting.")
     ap.add_argument("--loop-verbose", action="store_true",
                     help="Print loop-closure optimize progress.")
+    # Temporal consistency: an edge is added only when the previous
+    # --loop-temporal-k keyframes also matched (nearly) the same old keyframe.
+    ap.add_argument("--loop-temporal-k", type=int, default=1,
+                    help="Require this many consecutive keyframes to see the "
+                         "same old loop spot (1 = off).")
+    ap.add_argument("--kf-margin", type=float, default=1.5,
+                    help="Old-keyframe matching tolerance in kf-steps for "
+                         "temporal consistency.")
+    # Edge weighting: loop edges get sigma = odom_scale * this factor
+    # (>1 = weaker constraint; 0 = same weight as odometry edges).
+    ap.add_argument("--loop-sigma-scale", type=float, default=0.0,
+                    help="If >0, loop edge sigma = odometry sigma * scale.")
+    ap.add_argument("--step-scale-t", type=float, default=0.05)
+    ap.add_argument("--step-scale-r", type=float, default=0.05)
+    # Descriptor-cache path: per-frame keypoint+descriptor ONNX model
+    # (export with --single-image). NumPy sinkhorn params default to the
+    # pyramid_k512_l2 export settings.
+    ap.add_argument("--desc-model", default=None,
+                    help="Single-image ONNX model outputting keypoints+descriptors "
+                         "(export_shi_tomasi_angle_sparse_bad_sinkhorn_pyramid "
+                         "--single-image). Uses cached per-frame features for "
+                         "loop re-matching (numpy Sinkhorn instead of the pair "
+                         "model).")
+    ap.add_argument("--sink-epsilon", type=float, default=0.05)
+    ap.add_argument("--sink-iterations", type=int, default=20)
+    ap.add_argument("--unused-score", type=float, default=1.0)
     ap.add_argument("--fx", type=float, default=525.0)
     ap.add_argument("--fy", type=float, default=525.0)
     ap.add_argument("--cx", type=float, default=320.0)

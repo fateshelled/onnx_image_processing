@@ -3,7 +3,7 @@
 import cv2
 import numpy as np
 
-from pytorch_model.vo import CameraIntrinsics, estimate_pose_rgbd_pnp
+from vo import CameraIntrinsics, estimate_pose_rgbd_pnp
 
 
 def _make_correspondences():
