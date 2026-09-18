@@ -314,6 +314,36 @@ def _edge_diag(frames, a, b, R_c, t_c, inlier, n_matches, cum_rot=None):
     return diag
 
 
+def select_keyframes(keys, node_poses, args):
+    """Pick keyframe node ids.
+
+    ``decim``: fixed decimation (every --keyframe-decim-th node), as before.
+    ``motion``: promote a node to keyframe when the transform from the last
+    keyframe exceeds a translation (normalized units; ~step count) or
+    rotation threshold, bounded by --kf-min-gap / --kf-max-gap. This adapts
+    the keyframe spacing to the motion instead of the frame index.
+    """
+    if args.kf_mode == "decim":
+        return keys[:: max(1, args.keyframe_decim)]
+    kf = [keys[0]]
+    last = keys[0]
+    for k in keys[1:]:
+        gap = k - last
+        promote = gap >= args.kf_max_gap
+        if not promote and gap >= args.kf_min_gap:
+            dT = np.linalg.inv(node_poses[k]) @ node_poses[last]
+            trans = float(np.linalg.norm(dT[:3, 3]))
+            c = (np.trace(dT[:3, :3]) - 1.0) / 2.0
+            rot = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+            promote = trans >= args.kf_trans_thresh or rot >= args.kf_rot_thresh
+        if promote:
+            kf.append(k)
+            last = k
+    if kf[-1] != keys[-1]:
+        kf.append(keys[-1])
+    return kf
+
+
 # --------------------------------------------------------------------------
 # VO mode
 # --------------------------------------------------------------------------
@@ -350,22 +380,101 @@ def run_vo(args):
 
         n_loop = 0
         # Descriptor cache: filled by the odometry pass itself when the pair
-        # model emits descriptors (--with-descriptors export), so loop
+        # model emits descriptors (--with-descriptors export), so keyframe
         # re-matching needs no extra detection.
         feature_cache: dict[int, tuple] = {}
+        single_sess = None
+        desc_matcher = NumpySinkhornMatcher(
+            iterations=args.sink_iterations,
+            epsilon=args.sink_epsilon,
+            unused_score=args.unused_score,
+            distance_type="l2",
+        )
+        if args.desc_model and args.pose_source == "essential":
+            single_sess = ort.InferenceSession(
+                args.desc_model, providers=["CPUExecutionProvider"])
+        n_cached_match = 0
+        n_pair_match = 0
+
+        def lazy_features(idx: int):
+            # feature_cache is filled either by the odometry pass (descriptor-
+            # emitting pair model) or --desc-model (single-image model).
+            if idx in feature_cache:
+                return feature_cache[idx]
+            if single_sess is None:
+                return None  # frame not covered by any odometry pair
+            img = cv2.imread(frame_img[idx], cv2.IMREAD_GRAYSCALE)
+            img = cv2.resize(
+                img, (cam.width, cam.height)).astype(np.float32)[None, None]
+            kp, desc = single_sess.run(None, {"image": img})
+            feature_cache[idx] = (kp, desc)
+            return feature_cache[idx]
+
+        def match_keyframes(a: int, b: int):
+            # Shared by the additive keyframe edges and loop closure: use the
+            # per-frame descriptor cache (numpy Sinkhorn) when both frames have
+            # cached features, otherwise the pair model on the two images.
+            nonlocal n_cached_match, n_pair_match
+            fa, fb = lazy_features(a), lazy_features(b)
+            if fa is not None and fb is not None:
+                n_cached_match += 1
+                kp_a, desc_a = fa
+                kp_b, desc_b = fb
+                P = desc_matcher.match_probs(desc_a[0], desc_b[0])
+                mk1, mk2, _ = extract_matches(
+                    kp_a, kp_b, P[None], args.match_threshold,
+                    args.max_matches, args.dbin)
+                return estimate_pose_from_matches(
+                    mk1, mk2, cam, args, depth_path1=None)
+            n_pair_match += 1
+            return estimate_pair(
+                session=session, img_path1=frame_img[a],
+                img_path2=frame_img[b], cam=cam, args=args,
+                depth_path1=None)
+
         # process pairs at given stride
         trajectory = Trajectory()
         node_poses: dict[int, np.ndarray] = {0: trajectory.get_current_pose().copy()}
         frame_img: dict[int, str] = {0: str(frames[0][1])}
-        odom: list[tuple] = []  # (i, j, R, t) for successful odometry edges
+        odom: list[tuple] = []  # (i, j, R, t) odometry edges
         est_pos = [trajectory.get_current_position().copy()]
         gt_pos = [frames[0][3][:3, 3].copy()]
         n_pairs = 0
         n_ok = 0
         inlier_ratios = []
-        for i in range(0, len(frames) - args.stride, args.stride):
-            ts_a, pa, da, gta = frames[i]
-            ts_b, pb, db, gtb = frames[i + args.stride]
+        # Additive keyframe edges (--odom-ref kf): keep the consecutive chain
+        # and additionally add, for every frame, an edge to the last keyframe
+        # (longer baseline, better translation conditioning). The redundancy
+        # keeps the pose graph and per-edge scale well constrained.
+        kf_nodes = [0]
+        last_kf = 0
+
+        def kf_additive(i: int):
+            nonlocal last_kf
+            if args.odom_ref != "kf":
+                return
+            if last_kf != i - args.stride:
+                kres = match_keyframes(last_kf, i)
+                if (kres is not None and kres.get("ok")
+                        and kres.get("inlier_ratio", 0.0)
+                        >= args.kf_edge_min_inlier):
+                    odom.append((last_kf, i, kres["R"], kres["t"]))
+            dT = np.linalg.inv(node_poses[i]) @ node_poses[last_kf]
+            trans = float(np.linalg.norm(dT[:3, 3]))
+            c = (np.trace(dT[:3, :3]) - 1.0) / 2.0
+            rot = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+            gap = i - last_kf
+            if (gap >= args.kf_max_gap
+                    or (gap >= args.kf_min_gap
+                        and (trans >= args.kf_trans_thresh
+                             or rot >= args.kf_rot_thresh))):
+                last_kf = i
+                kf_nodes.append(i)
+
+        for i in range(args.stride, len(frames), args.stride):
+            a = i - args.stride
+            _, pa, da, gta = frames[a]
+            _, pb, db, gtb = frames[i]
             res = estimate_pair(
                 session=session,
                 img_path1=str(pa),
@@ -374,26 +483,29 @@ def run_vo(args):
                 args=args,
                 depth_path1=da,
                 feature_cache=feature_cache,
-                frame_a=i,
-                frame_b=i + args.stride,
+                frame_a=a,
+                frame_b=i,
             )
             n_pairs += 1
             if res is None or not res.get("ok"):
-                # no pose update -> keep previous C (skip)
-                est_pos.append(trajectory.get_current_position().copy())
+                # no pose update -> keep the previous pose (skip)
+                node_poses[i] = node_poses[a].copy()
+                est_pos.append(node_poses[i][:3, 3].copy())
                 gt_pos.append(gtb[:3, 3].copy())
-                node_poses[i + args.stride] = trajectory.get_current_pose().copy()
-                frame_img[i + args.stride] = str(pb)
+                frame_img[i] = str(pb)
+                kf_additive(i)
                 continue
             R, t = res["R"], res["t"]
             trajectory.add_relative_pose(R, t)
-            est_pos.append(trajectory.get_current_position().copy())
+            T_i = trajectory.get_current_pose().copy()
+            est_pos.append(T_i[:3, 3].copy())
             gt_pos.append(gtb[:3, 3].copy())
             n_ok += 1
             inlier_ratios.append(res["inlier_ratio"])
-            node_poses[i + args.stride] = trajectory.get_current_pose().copy()
-            frame_img[i + args.stride] = str(pb)
-            odom.append((i, i + args.stride, R, t))
+            node_poses[i] = T_i
+            frame_img[i] = str(pb)
+            odom.append((a, i, R, t))
+            kf_additive(i)
 
         # Integrated keyframe matching + loop closure: build the full pose
         # graph, then walk the keyframes once. Each new keyframe first tries
@@ -404,62 +516,9 @@ def run_vo(args):
         # Appearance-based detection (matcher inlier ratio) is used instead of
         # a position gate, because the monocular estimate has already drifted
         # and a position gate would miss true loops on these return-trajectories.
-        if args.loop_closure:
-            single_sess = None
-
-            def lazy_features(idx: int):
-                # feature_cache is filled either by the odometry pass
-                # (descriptor-emitting pair model) or --desc-model
-                # (single-image keypoints+descriptors model).
-                if idx in feature_cache:
-                    return feature_cache[idx]
-                if single_sess is None:
-                    return None  # frame not covered by any odometry pair
-                img = cv2.imread(frame_img[idx], cv2.IMREAD_GRAYSCALE)
-                img = cv2.resize(
-                    img, (cam.width, cam.height)).astype(np.float32)[None, None]
-                kp, desc = single_sess.run(None, {"image": img})
-                feature_cache[idx] = (kp, desc)
-                return feature_cache[idx]
-
-            # feature_cache is filled by the odometry pass itself when the
-            # pair model emits descriptors; --desc-model only adds lazy
-            # detection for frames the odometry pass never touched.
-            desc_matcher = NumpySinkhornMatcher(
-                iterations=args.sink_iterations,
-                epsilon=args.sink_epsilon,
-                unused_score=args.unused_score,
-                distance_type="l2",
-            )
-            if args.desc_model and args.pose_source == "essential":
-                single_sess = ort.InferenceSession(
-                    args.desc_model, providers=["CPUExecutionProvider"])
-
-            n_cached_match = 0
-            n_pair_match = 0
-
-            def match_keyframes(a: int, b: int):
-                """Shared matcher for loop and local refinement edges: uses the
-                per-frame descriptor cache (numpy Sinkhorn) when both keyframes
-                have cached features, otherwise the pair model on the images."""
-                nonlocal n_cached_match, n_pair_match
-                fa, fb = lazy_features(a), lazy_features(b)
-                if fa is not None and fb is not None:
-                    n_cached_match += 1
-                    kp_a, desc_a = fa
-                    kp_b, desc_b = fb
-                    P = desc_matcher.match_probs(desc_a[0], desc_b[0])
-                    mk1, mk2, _ = extract_matches(
-                        kp_a, kp_b, P[None], args.match_threshold,
-                        args.max_matches, args.dbin)
-                    return estimate_pose_from_matches(
-                        mk1, mk2, cam, args, depth_path1=None)
-                n_pair_match += 1
-                return estimate_pair(
-                    session=session, img_path1=frame_img[a],
-                    img_path2=frame_img[b], cam=cam, args=args,
-                    depth_path1=None)
-
+        # With --odom-ref kf the pose graph is needed even without loop
+        # closure (the additive keyframe edges are optimized jointly).
+        if args.loop_closure or args.odom_ref == "kf":
             # Per-edge scale: monocular translations are unit-norm, so allow
             # the optimizer to estimate each edge's translation magnitude
             # (relative to the first edge by default). --scale-loop-only keeps
@@ -486,8 +545,18 @@ def run_vo(args):
                 added_edges.add(edge_key(i, j))
 
             keys = sorted(node_poses.keys())
-            kf = keys[:: max(1, args.keyframe_decim)]
-            kf_step = args.stride * max(1, args.keyframe_decim)
+            if args.odom_ref == "kf":
+                kf = list(kf_nodes)
+            else:
+                kf = select_keyframes(keys, node_poses, args)
+            n_keyframes = len(kf)
+            # Keyframe matching runs only with --loop-closure; with
+            # --odom-ref kf alone the pose graph is simply optimized.
+            if not args.loop_closure:
+                kf = []
+            gaps = [kf[i + 1] - kf[i] for i in range(len(kf) - 1)]
+            kf_step = (max(gaps) if gaps
+                       else args.stride * max(1, args.keyframe_decim))
             # Odometry-chain cumulative rotation: the reference path for the
             # rotation cycle-consistency gate. It is independent of any loop
             # decision, and available for every candidate pair.
@@ -643,6 +712,11 @@ def run_vo(args):
             "edge_scale": bool(args.edge_scale),
             "scale_prior_sigma": args.scale_prior_sigma,
             "scale_loop_only": bool(args.scale_loop_only),
+            "kf_mode": args.kf_mode,
+            "n_keyframes": (n_keyframes
+                            if (args.loop_closure or args.odom_ref == "kf")
+                            else 0),
+            "odom_ref": args.odom_ref,
             **({"loop_edges": loop_edges, "local_edges": local_edges}
                if args.loop_closure else {}),
             "desc_model": bool(args.desc_model),
@@ -780,6 +854,31 @@ def main():
                          "keyframe pairs and re-optimize the full pose graph.")
     ap.add_argument("--keyframe-decim", type=int, default=8,
                     help="Keyframe stride for loop candidates (every Nth node).")
+    ap.add_argument("--kf-mode", choices=["decim", "motion"], default="decim",
+                    help="Keyframe selection: fixed decimation, or motion-based "
+                         "(translation/rotation since the last keyframe).")
+    ap.add_argument("--kf-trans-thresh", type=float, default=8.0,
+                    help="Motion mode: promote when the translation from the "
+                         "last keyframe (normalized units, ~step count) exceeds "
+                         "this.")
+    ap.add_argument("--kf-rot-thresh", type=float, default=10.0,
+                    help="Motion mode: promote when the rotation from the last "
+                         "keyframe (degrees) exceeds this.")
+    ap.add_argument("--kf-min-gap", type=int, default=4,
+                    help="Motion mode: minimum frame-index gap between keyframes.")
+    ap.add_argument("--kf-max-gap", type=int, default=16,
+                    help="Motion mode: force a keyframe at this frame-index gap "
+                         "(matches --keyframe-decim=8 at stride 2).")
+    ap.add_argument("--kf-edge-min-inlier", type=float, default=0.0,
+                    help="With --odom-ref kf, minimum inlier ratio to add the "
+                         "additive edge to the last keyframe (0 = no gate; "
+                         "gating at 0.3 hurt desk, so it is off by default).")
+    ap.add_argument("--odom-ref", choices=["prev", "kf"], default="prev",
+                    help="prev: consecutive-pair chain only. kf: additive - "
+                         "keep the chain and also add, for every frame, an edge "
+                         "to the last keyframe (longer baseline, better "
+                         "translation conditioning). The pose graph is "
+                         "optimized even without --loop-closure.")
     ap.add_argument("--loop-min-gap", type=int, default=30,
                     help="Minimum node-index gap between loop candidates.")
     ap.add_argument("--loop-min-inlier", type=float, default=0.4,
