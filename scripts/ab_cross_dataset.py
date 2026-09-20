@@ -93,6 +93,8 @@ for seq in SEQ:
         p["scale_kf"] = kf
         p["scale_kf_adapt_loop_ratio"] = lr
         p["tsvd_ratio"] = 1e-3
+        p["graph_mode"] = "stride"  # batch baseline (not the sequential default)
+        p["nl_reg"] = False
         diag = {}
         t = time.perf_counter()
         r = rtl.eval_seq(cache, p, cam, matcher, mc, diag=diag)

@@ -103,6 +103,7 @@ for seq in SEQ:
     p["graph_mode"] = "kf_prior"
     p["max_keyframes"] = 3
     p["seq_tsvd_ratio"] = 0.1
+    p["nl_reg"] = False  # legacy TSVD variant (kept for reference)
     run(seq, "seq_opt1", p)
 
 print("wrote", OUT, flush=True)
