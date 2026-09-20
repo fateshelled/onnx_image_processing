@@ -24,10 +24,14 @@ Optional per-edge scale (monocular scale drift):
   through loops); a soft prior ``scale_prior_sigma`` on log-scale keeps
   unobserved edges near 1.
 
-Runs on CPU with numpy only. Not ONNX-related.
+Large graphs switch to a sparse (scipy) normal-equation solve so the memory
+scales with the number of nonzeros instead of the square of the variables;
+the dense LM path is kept for small windows. Runs on CPU. Not ONNX-related.
 """
 
 import numpy as np
+from scipy import sparse as sp
+from scipy.sparse.linalg import splu
 
 from .se3 import (
     se3_ad,
@@ -61,6 +65,8 @@ class SlidingWindowOptimizer:
         huber: float = 1.0,
         optimize_scale: bool = False,
         scale_prior_sigma: float = 0.0,
+        tsvd_ratio: float = 0.0,
+        dense_max_cols: int = 1500,
     ) -> None:
         if window_size is not None and window_size < 2:
             raise ValueError(f"window_size must be >= 2 or None, got {window_size}")
@@ -72,12 +78,28 @@ class SlidingWindowOptimizer:
         self.huber = huber
         self.optimize_scale = optimize_scale
         self.scale_prior_sigma = scale_prior_sigma
+        # TSVD (Truncated SVD): drop optimization directions whose Hessian
+        # eigenvalue is below tsvd_ratio * max_eigenvalue. 0 disables.
+        self.tsvd_ratio = float(tsvd_ratio)
+        # Normal equations are dense below this many variables and sparse
+        # (scipy) above it, keeping the exact legacy solver for small windows.
+        self.dense_max_cols = int(dense_max_cols)
+        self.tsvd_kept = 0
+        self.tsvd_total = 0
         self.pose_ids: list[int] = []
+        # Node ids held fixed (no variables); they still participate in
+        # residuals and pin the gauge for fixed-lag optimization.
+        self.fixed_ids: set[int] = set()
         self.T: dict[int, np.ndarray] = {}
         self.edges: list[tuple] = []  # (i, j, M, sigma_t, sigma_r)
+        # Optional dense 6x6 whitening matrix W (cost = ||W e||^2, i.e.
+        # information Omega = W^T W). None -> diagonal 1/sigma per axis.
+        # Used for marginalization (relative) priors.
+        self.edge_whiten: list[np.ndarray | None] = []
         # Parallel bookkeeping for per-edge scale.
         self.edge_scale: list[float] = []
         self.scale_col: list[int | None] = []  # None = fixed / gauge
+        self.scale_prior_mean: list[float] = []  # prior mean of log(scale)
         self.n_scale: int = 0
         self.gauge_edge: int | None = None
         self.last_cost = float("inf")
@@ -85,13 +107,15 @@ class SlidingWindowOptimizer:
 
     # -- graph ---------------------------------------------------------------
 
-    def add_node(self, node_id: int, T: np.ndarray) -> None:
+    def add_node(self, node_id: int, T: np.ndarray, fixed: bool = False) -> None:
         if node_id in self.T:
             raise ValueError(f"duplicate node id {node_id}")
         if self.pose_ids and node_id <= self.pose_ids[-1]:
             raise ValueError("node ids must be strictly increasing")
         self.T[node_id] = np.asarray(T, float).copy()
         self.pose_ids.append(node_id)
+        if fixed:
+            self.fixed_ids.add(node_id)
         self._drop_oldest()
 
     def add_edge(
@@ -103,9 +127,22 @@ class SlidingWindowOptimizer:
         sigma_r: float | None = None,
         scale_free: bool = False,
         scale: float = 1.0,
+        scale_prior_mean: float = 0.0,
+        omega: np.ndarray | None = None,
     ) -> None:
         if i not in self.T or j not in self.T:
             raise KeyError("edge endpoints must be live nodes in the window")
+        if omega is not None:
+            # W with W^T W = Omega (cost e^T Omega e). Eigen-based so that a
+            # rank-deficient / round-off-degraded Omega still yields a valid
+            # whitener (negative eigenvalues clipped to zero).
+            omega = np.asarray(omega, float)
+            omega = 0.5 * (omega + omega.T)
+            w_e, V = np.linalg.eigh(omega)
+            self.edge_whiten.append(
+                np.sqrt(np.clip(w_e, 0.0, None))[:, None] * V.T)
+        else:
+            self.edge_whiten.append(None)
         self.edges.append((
             i, j, np.asarray(M, float).copy(),
             self.step_scale_t if sigma_t is None else sigma_t,
@@ -115,6 +152,7 @@ class SlidingWindowOptimizer:
         if s <= 0.0:
             s = 1.0
         self.edge_scale.append(s)
+        self.scale_prior_mean.append(float(scale_prior_mean))
         col = None
         if self.optimize_scale and scale_free:
             if self.gauge_edge is None:
@@ -142,6 +180,7 @@ class SlidingWindowOptimizer:
             keep = [k for k, e in enumerate(self.edges)
                     if e[0] != drop and e[1] != drop]
             self.edges = [self.edges[k] for k in keep]
+            self.edge_whiten = [self.edge_whiten[k] for k in keep]
             self.edge_scale = [self.edge_scale[k] for k in keep]
             cols = [self.scale_col[k] for k in keep]
             self.scale_col = []
@@ -174,14 +213,15 @@ class SlidingWindowOptimizer:
         if not self.edges:
             return np.zeros(0)
         out = [
-            _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
-            / self._edge_scale(st, sr)
+            self._apply_weight(
+                k, _edge_residual(self.T[i], self.T[j], self._scaled_M(k)))
             for k, (i, j, M, st, sr) in enumerate(self.edges)
         ]
         r = np.concatenate(out)
         if self._n_prior():
             pri = [
-                np.array([np.log(self.edge_scale[e]) / self.scale_prior_sigma])
+                np.array([(np.log(self.edge_scale[e]) - self.scale_prior_mean[e])
+                          / self.scale_prior_sigma])
                 for e, c in enumerate(self.scale_col) if c is not None
             ]
             r = np.concatenate([r] + pri)
@@ -190,14 +230,29 @@ class SlidingWindowOptimizer:
     def _edge_scale(self, st, sr):
         return np.concatenate([np.full(3, sr), np.full(3, st)])
 
+    def _apply_weight(self, k, v):
+        """Whiten a 6-vector: dense W @ v, or per-axis v / sigma."""
+        W = self.edge_whiten[k]
+        if W is not None:
+            return W @ v
+        _, _, _, st, sr = self.edges[k]
+        return v / self._edge_scale(st, sr)
+
+    def _apply_weight_jac(self, k, block):
+        """Whiten a 6x6 Jacobian block (rows = residual axes)."""
+        W = self.edge_whiten[k]
+        if W is not None:
+            return W @ block
+        _, _, _, st, sr = self.edges[k]
+        return block / self._edge_scale(st, sr)[:, None]
+
     def _huber_weights(self) -> np.ndarray:
         if not self.edges:
             return np.zeros(0)
         w = np.ones(6 * len(self.edges))
         for k, (i, j, M, st, sr) in enumerate(self.edges):
             e = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
-            sc = self._edge_scale(st, sr)
-            n = float(np.linalg.norm(e / sc))
+            n = float(np.linalg.norm(self._apply_weight(k, e)))
             if n > self.huber:
                 w[6 * k: 6 * k + 6] = self.huber / max(n, 1e-12)
         if self._n_prior():
@@ -232,53 +287,87 @@ class SlidingWindowOptimizer:
         twist = np.concatenate([w, v])
         return (se3_right_jacobian_inv(e) @ twist) / sc
 
-    def _jacobian(self, eps=1e-6):
-        """Jacobian of residuals wrt node right-increments and log-scales.
+    def _jacobian_coo(self, eps=1e-6):
+        """Sparse Jacobian as COO triplets ``(rows, cols, vals, shape)``.
 
-        Node columns analytic (verified against finite differences); edges
-        whose residual rotation norm exceeds the Bernoulli series comfort
-        range (||omega|| > 1.8) fall back to central differences on that
-        row only. Scale columns use the analytic expression in
-        :meth:`_scale_jacobian`.
+        Each edge contributes 6 residual rows that touch only its two
+        endpoint node blocks (12 columns) plus its own log-scale column,
+        so the matrix is extremely sparse for large pose graphs.
+
+        Node columns are analytic (verified against finite differences);
+        edges whose residual rotation norm exceeds the Bernoulli series
+        comfort range (||omega|| > 1.8) fall back to central differences on
+        that row only. Scale columns use :meth:`_scale_jacobian`.
         """
-        live = list(self.pose_ids)
-        n = len(live)
+        free = [nd for nd in self.pose_ids if nd not in self.fixed_ids]
+        n = len(free)
         ncol = 6 * n + self.n_scale
-        col = {node: k for k, node in enumerate(live)}
-        r0 = self._residuals()
-        J = np.zeros((r0.size, ncol))
+        col = {node: k for k, node in enumerate(free)}
+        nrow = self._residuals().size
+        rows: list[int] = []
+        cols: list[int] = []
+        vals: list[float] = []
         for k, (i, j, M, st, sr) in enumerate(self.edges):
-            rows = slice(6 * k, 6 * k + 6)
+            r0 = 6 * k
             sc = self._edge_scale(st, sr)
             Ms = self._scaled_M(k)
             e = _edge_residual(self.T[i], self.T[j], Ms)
             if float(np.linalg.norm(e[:3])) > 1.8:
-                self._jacobian_row_numeric(k, J, col, eps)
+                self._jacobian_row_numeric(k, col, rows, cols, vals, eps)
             else:
                 Ji = se3_right_jacobian_inv(e)
                 Jj = -se3_left_jacobian_inv(e) @ se3_ad(np.linalg.inv(Ms))
-                base_i = 6 * col[i]
-                base_j = 6 * col[j]
-                inv_sc = 1.0 / sc
-                J[rows, base_i:base_i + 6] = Ji * inv_sc[:, None]
-                J[rows, base_j:base_j + 6] = Jj * inv_sc[:, None]
+                Bi = self._apply_weight_jac(k, Ji)
+                Bj = self._apply_weight_jac(k, Jj)
+                base_i = 6 * col[i] if i in col else None
+                base_j = 6 * col[j] if j in col else None
+                for a in range(6):
+                    for d in range(6):
+                        v = Bi[a, d]
+                        if v != 0.0 and base_i is not None:
+                            rows.append(r0 + a)
+                            cols.append(base_i + d)
+                            vals.append(v)
+                        v = Bj[a, d]
+                        if v != 0.0 and base_j is not None:
+                            rows.append(r0 + a)
+                            cols.append(base_j + d)
+                            vals.append(v)
             c = self.scale_col[k]
             if c is not None:
-                J[rows, 6 * n + c] = self._scale_jacobian(k)
+                sj = self._scale_jacobian(k)
+                for a in range(6):
+                    if sj[a] != 0.0:
+                        rows.append(r0 + a)
+                        cols.append(6 * n + c)
+                        vals.append(sj[a])
         if self._n_prior():
             base = 6 * len(self.edges)
             for e, c in enumerate(self.scale_col):
                 if c is not None:
-                    J[base, 6 * n + c] = 1.0 / self.scale_prior_sigma
+                    rows.append(base)
+                    cols.append(6 * n + c)
+                    vals.append(1.0 / self.scale_prior_sigma)
                     base += 1
+        return (np.asarray(rows, dtype=np.int64),
+                np.asarray(cols, dtype=np.int64),
+                np.asarray(vals, dtype=float),
+                (nrow, ncol))
+
+    def _jacobian(self, eps=1e-6):
+        """Dense Jacobian (kept for tests and small problems)."""
+        rows, cols, vals, shape = self._jacobian_coo(eps)
+        J = np.zeros(shape)
+        if rows.size:
+            J[rows, cols] = vals
         return J
 
-    def _jacobian_row_numeric(self, k, J, col, eps=1e-6):
-        """Central differences for a single edge row (6+6 columns)."""
+    def _jacobian_row_numeric(self, k, col, rows, cols, vals, eps=1e-6):
+        """Central differences for one edge row, appended to COO lists."""
         i, j, M, st, sr = self.edges[k]
-        sc = self._edge_scale(st, sr)
-        inv_sc = 1.0 / sc
         for node in (i, j):
+            if node not in col:
+                continue  # fixed endpoint: no columns
             base = 6 * col[node]
             T0 = self.T[node].copy()
             for d in range(6):
@@ -289,49 +378,179 @@ class SlidingWindowOptimizer:
                 self.T[node] = T0 @ se3_exp(-delta)
                 rm = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
                 self.T[node] = T0
-                J[6 * k: 6 * k + 6, base + d] = ((rp - rm) * inv_sc) / (2.0 * eps)
+                g = self._apply_weight(k, (rp - rm) / (2.0 * eps))
+                for a in range(6):
+                    if g[a] != 0.0:
+                        rows.append(6 * k + a)
+                        cols.append(base + d)
+                        vals.append(g[a])
+
+    def _sparse_normal(self, r, w):
+        """Sparse reduced normal equations with node 0 (gauge) eliminated.
+
+        Returns ``(H, g)`` over variables 6..ncol-1. No dense matrix of the
+        full graph is ever materialised.
+        """
+        rows, cols, vals, shape = self._jacobian_coo()
+        J = sp.csr_matrix((vals, (rows, cols)), shape=shape)
+        Jw = J.multiply(w[:, None]).tocsr()
+        H = (J.T @ Jw).tocsr()
+        g = np.asarray(J.T @ (w * r)).ravel()
+        return H[6:, 6:].tocsr(), g[6:]
+
+    def _solve_sparse(self, H, rhs, lam):
+        """Solve ``(H + lam I) dx = rhs`` with sparse LU (reduced space)."""
+        n = H.shape[0]
+        A = (H + sp.eye(n, format="csr") * lam).tocsc()
+        return splu(A).solve(rhs)
+
+    def _full_normal(self):
+        """Gauss-Newton normal equations over all variables (sparse)."""
+        r = self._residuals()
+        w = self._huber_weights()
+        rows, cols, vals, shape = self._jacobian_coo()
+        J = sp.csr_matrix((vals, (rows, cols)), shape=shape)
+        Jw = J.multiply(w[:, None]).tocsr()
+        return (J.T @ Jw).tocsr(), np.asarray(J.T @ (w * r)).ravel(), shape[1]
+
+    def marginalize_relative(self, eliminate, keep, fix_scales=False):
+        """Schur-marginalize ``eliminate`` and return a relative prior.
+
+        ``keep`` must be exactly two nodes (the Markov blanket). Returns
+        ``(a, b, G, Omega)`` so that adding ``add_edge(a, b, G, omega=Omega)``
+        reproduces the marginal cost of the eliminated subgraph, up to the
+        linearization point used here. The relative-mean transform G and the
+        6x6 information Omega are both exact for the linearized system.
+
+        With ``fix_scales=True`` every log-scale is held at its current value
+        (no scale variable is optimized or eliminated), which keeps the prior
+        well conditioned when the segment's scales were already determined by
+        the surrounding graph.
+        """
+        if len(keep) != 2:
+            raise ValueError("marginalize_relative expects exactly 2 kept nodes")
+        free = [nd for nd in self.pose_ids if nd not in self.fixed_ids]
+        col = {nd: k for k, nd in enumerate(free)}
+        elim = set(eliminate)
+        if elim & self.fixed_ids or any(nd in self.fixed_ids for nd in keep):
+            raise ValueError("cannot marginalize fixed nodes")
+        elim_idx: list[int] = []
+        for nd in eliminate:
+            b = 6 * col[nd]
+            elim_idx.extend(range(b, b + 6))
+        if not fix_scales:
+            # Scale variables whose edge touches an eliminated node are
+            # eliminated with it; retained free-scale edges are unsupported.
+            for k, (i, j, *_rest) in enumerate(self.edges):
+                c = self.scale_col[k]
+                if c is None:
+                    continue
+                if i in elim or j in elim:
+                    elim_idx.append(6 * len(free) + c)
+                else:
+                    raise NotImplementedError(
+                        "retained free-scale edge in marginalize_relative")
+        keep_idx = [6 * col[nd] + d for nd in keep for d in range(6)]
+        H, g, _ = self._full_normal()
+        if fix_scales:
+            nnode = 6 * len(free)
+            H = H[:nnode, :nnode]
+            g = g[:nnode]
+        idx = elim_idx + keep_idx
+        Hs = H[idx][:, idx].toarray()
+        gs = g[idx]
+        ne = len(elim_idx)
+        Hee_inv = np.linalg.pinv(Hs[:ne, :ne])
+        H_r = Hs[ne:, ne:] - Hs[ne:, :ne] @ Hee_inv @ Hs[:ne, ne:]
+        H_r = 0.5 * (H_r + H_r.T)  # enforce symmetry against round-off
+        g_r = gs[ne:] - Hs[ne:, :ne] @ Hee_inv @ gs[:ne]
+        d_r = -np.linalg.pinv(H_r) @ g_r
+        meanT = {nd: self.T[nd] @ se3_exp(d_r[6 * m:6 * m + 6])
+                 for m, nd in enumerate(keep)}
+        a, b = keep
+        G = np.linalg.inv(meanT[b]) @ meanT[a]
+        # Jacobian of r = Log(G^-1 T_b^-1 T_a) at the mean (e = 0).
+        Jrel = np.zeros((6, 12))
+        Jrel[:, :6] = se3_right_jacobian_inv(np.zeros(6))
+        Jrel[:, 6:] = -se3_left_jacobian_inv(np.zeros(6)) @ se3_ad(np.linalg.inv(G))
+        M = Jrel @ np.linalg.pinv(H_r) @ Jrel.T
+        M = 0.5 * (M + M.T)
+        Omega = np.linalg.pinv(M)
+        Omega = 0.5 * (Omega + Omega.T)
+        return a, b, G, np.asarray(Omega, float)
 
     # -- solver ---------------------------------------------------------------
 
     def optimize(self, verbose: bool = False) -> float:
         live = list(self.pose_ids)
-        if len(live) < 3 or not self.edges:
+        free = [nd for nd in live if nd not in self.fixed_ids]
+        if len(live) < 3 or not self.edges or not free:
             self.last_cost = self._cost()
             return self.last_cost
-        n_node = len(live)
+        n_node = len(free)
+        ncol = 6 * n_node + self.n_scale
+        use_sparse = ncol > self.dense_max_cols
         lam = self.lambda_init
         prev_cost = self._cost()
         steps = 0
+        eig_cache = None  # (w, V, keep) in the anchored/reduced space
         for _ in range(self.max_iterations):
-            J = self._jacobian()
             r = self._residuals()
             w = self._huber_weights()
-            H = J.T @ (w[:, None] * J)
-            g = J.T @ (w * r)
+            if use_sparse:
+                # Reduced normal equations over variables 6..ncol-1: node 0 is
+                # the gauge and never moves. H stays sparse end to end.
+                Hred, gred = self._sparse_normal(r, w)
+            else:
+                J = self._jacobian()
+                H = J.T @ (w[:, None] * J)
+                g = J.T @ (w * r)
+                # Anchor the first node (gauge for the pose graph).
+                Hred = H.copy()
+                Hred[:6, :] = 0.0
+                Hred[:, :6] = 0.0
+                Hred[:6, :6] = np.eye(6)
+                gred = g.copy()
+                gred[:6] = 0.0
+            if self.tsvd_ratio > 0.0 and eig_cache is None:
+                # TSVD (Eckart-Young): eigen-decompose the symmetric PSD
+                # normal matrix once and reuse it. Directions with eigenvalue
+                # <= ratio*max are degenerate and receive no update (their
+                # pseudo-inverse is set to 0), so unobservable scales /
+                # translation directions cannot drift.
+                Hd = Hred.toarray() if use_sparse else Hred
+                w_e, V = np.linalg.eigh(Hd)
+                keep = w_e > self.tsvd_ratio * float(w_e.max())
+                self.tsvd_total = int(w_e.size)
+                self.tsvd_kept = int(np.count_nonzero(keep))
+                eig_cache = (w_e, V, keep)
             accepted = False
             # Levenberg-Marquardt: re-solve with stronger damping until the
             # step is accepted (the previous code re-applied the same step).
             for _attempt in range(8):
-                Hf = H.copy()
-                # Anchor the first node (gauge for the pose graph).
-                Hf[:6, :] = 0.0
-                Hf[:, :6] = 0.0
-                Hf[:6, :6] = np.eye(6)
-                rf = g.copy()
-                rf[:6] = 0.0
-                Hf += np.eye(H.shape[0]) * lam
                 try:
-                    dx = np.linalg.solve(Hf, -rf)
-                except np.linalg.LinAlgError:
+                    if eig_cache is not None:
+                        w_e, V, keep = eig_cache
+                        inv = np.zeros_like(w_e)
+                        inv[keep] = 1.0 / (w_e[keep] + lam)
+                        dxred = -(V * inv) @ (V.T @ gred)
+                    elif use_sparse:
+                        dxred = self._solve_sparse(Hred, -gred, lam)
+                    else:
+                        Hf = Hred + np.eye(ncol) * lam
+                        dxred = np.linalg.solve(Hf, -gred)
+                except (np.linalg.LinAlgError, RuntimeError):
                     lam *= 10.0
                     if lam > 1e7:
                         break
                     continue
+                dx = (np.concatenate([np.zeros(6), dxred])
+                      if use_sparse else dxred)
                 if float(np.max(np.abs(dx))) < 1e-10:
                     break
                 backup = {n_: self.T[n_].copy() for n_ in live}
                 backup_scale = list(self.edge_scale)
-                for k, node in enumerate(live):
+                for k, node in enumerate(free):
                     self.T[node] = backup[node] @ se3_exp(dx[6 * k: 6 * k + 6])
                 for e, c in enumerate(self.scale_col):
                     if c is not None:

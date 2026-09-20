@@ -44,6 +44,9 @@ from eval_tum_vo import (  # noqa: E402
     read_path_file,
     read_tum_file,
     umeyama,
+    resolve_dataset,
+    intrinsics_for,
+    _trans_consistent,
 )
 from vo.loop_closure import (  # noqa: E402
     confirmed_loop_hits,
@@ -54,6 +57,7 @@ from vo.cycle_consistency import chain_residual_deg, cumulative_rotations  # noq
 from vo.sinkhorn_numpy import NumpySinkhornMatcher  # noqa: E402
 from vo.trajectory import Trajectory  # noqa: E402
 from vo.se3_window import SlidingWindowOptimizer  # noqa: E402
+from vo.scale_kf import ScaleKF  # noqa: E402
 from vo.pose_estimation import CameraIntrinsics  # noqa: E402
 
 DEFAULT_ARGS = SimpleNamespace(
@@ -65,7 +69,7 @@ DEFAULT_ARGS = SimpleNamespace(
 
 
 def load_frames(dataset_root, seq, gt_max_diff=0.05):
-    base = Path(dataset_root) / f"rgbd_dataset_freiburg1_{seq}"
+    base, _cam = resolve_dataset(dataset_root, seq)
     gt_rows = read_tum_file(base / "groundtruth.txt")
     gt_poses = [(ts, quat_to_se3(v[:3], v[3:7])) for ts, v in gt_rows]
     frames = []
@@ -81,12 +85,14 @@ def load_frames(dataset_root, seq, gt_max_diff=0.05):
 # --------------------------------------------------------------------------
 def build_cache(args):
     sess = ort.InferenceSession(args.model, providers=["CPUExecutionProvider"])
-    cam = CameraIntrinsics(fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy,
-                           width=args.width, height=args.height)
     out = Path(args.cache_dir)
     out.mkdir(parents=True, exist_ok=True)
     seqs = [s for s in args.seq.split(",") if s]
     for seq in seqs:
+        fx, fy, cx, cy = intrinsics_for(
+            args.dataset_root, seq, (args.fx, args.fy, args.cx, args.cy))
+        cam = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy,
+                               width=args.width, height=args.height)
         frames = load_frames(args.dataset_root, seq)
         stride = args.stride
         n_pairs = (len(frames) - 1) // stride
@@ -141,10 +147,104 @@ def load_cache(cache_dir, seq):
             "stride": int(z["stride"]), "n_frames": int(z["n_frames"])}
 
 
+def _sequential_kf_priors(opt, kf, keys, params):
+    """Sequential keyframe-graph driver with transient marginalization.
+
+    ``opt`` supplies the measurements (``edges``) and odometry poses only; it
+    is not used as the solver. Consecutive keyframes are processed left to
+    right. At every step the active window contains the keyframes seen so far,
+    the accumulated relative priors, the new keyframe and the transient stride
+    frames in between. After optimization the transients are Schur-
+    marginalized (scales fixed at their window optimum) into a dense relative
+    prior over the two bounding keyframes, and then dropped. The reduced
+    graph therefore only ever holds keyframes + priors + KF-KF (loop) edges,
+    so its size is bounded by the number of keyframes.
+    """
+    step_t = params["step_scale_t"]
+    max_kf = params.get("max_keyframes")  # None = keep all keyframes active
+    all_edges = list(opt.edges)
+    kf_set = set(kf)
+    kf_index = {nd: m for m, nd in enumerate(kf)}
+    loop_edges = [(i, j, M, st, sr) for (i, j, M, st, sr) in all_edges
+                  if i in kf_set and j in kf_set
+                  and abs(kf_index[i] - kf_index[j]) > 1]
+    priors = []
+    est_pose = {kf[0]: opt.get_pose(kf[0])}
+
+    def new_window():
+        return SlidingWindowOptimizer(
+            window_size=None, max_iterations=params["loop_iterations"],
+            huber=1.0, step_scale_t=step_t, step_scale_r=step_t,
+            optimize_scale=True, scale_prior_sigma=params["scale_prior_sigma"],
+            tsvd_ratio=params.get("seq_tsvd_ratio", 0.0))
+
+    for m in range(len(kf) - 1):
+        a, b = kf[m], kf[m + 1]
+        trans = [i for i in keys if a < i < b]
+        # Fixed-lag: only the last max_kf keyframes stay active. The keyframe
+        # just before the window is pinned so the squeezed window remains
+        # connected to the frozen past.
+        if max_kf is None:
+            active_kf, boundary = kf[:m + 2], None
+        else:
+            lo = max(0, (m + 1) - max(1, max_kf) + 1)
+            active_kf = kf[lo:m + 2]
+            boundary = kf[lo - 1] if lo > 0 else None
+        node_set = set(active_kf) | set(trans)
+        if boundary is not None:
+            node_set.add(boundary)
+        nodes = sorted(node_set)
+
+        act = new_window()
+        for nd in nodes:
+            if nd == boundary:
+                act.add_node(nd, est_pose[nd], fixed=True)
+            else:
+                act.add_node(nd, est_pose.get(nd, opt.get_pose(nd)))
+        for (x, y, G, Om) in priors:
+            if x in node_set and y in node_set:
+                act.add_edge(x, y, G, omega=Om)
+        seg = {a} | set(trans) | {b}
+        for (i, j, M, st, sr) in all_edges:
+            if i in seg and j in seg and not (i == a and j == b):
+                act.add_edge(i, j, M, sigma_t=st, sigma_r=sr, scale_free=True)
+        for (i, j, M, st, sr) in all_edges:
+            if {i, j} == {a, b}:  # direct keyframe-to-keyframe measurement
+                act.add_edge(i, j, M, sigma_t=st, sigma_r=sr, scale_free=True)
+        for (i, j, M, st, sr) in loop_edges:
+            if i in node_set and j in node_set:
+                act.add_edge(i, j, M, sigma_t=st, sigma_r=sr, scale_free=True)
+        act.optimize()
+        if trans:
+            # Marginalize the transients in the presence of the priors.
+            aa, bb, G, Om = act.marginalize_relative(trans, [a, b],
+                                                     fix_scales=True)
+            priors.append((aa, bb, G, Om))
+        for nd in nodes:
+            if nd != boundary:  # keep the frozen boundary pinned
+                est_pose[nd] = act.get_pose(nd)
+
+    if max_kf is None:
+        red = new_window()
+        for nd in kf:
+            red.add_node(nd, est_pose.get(nd, opt.get_pose(nd)))
+        for (aa, bb, G, Om) in priors:
+            red.add_edge(aa, bb, G, omega=Om)
+        for (i, j, M, st, sr) in loop_edges:
+            red.add_edge(i, j, M, sigma_t=st, sigma_r=sr, scale_free=True)
+        red.optimize()
+        return red
+    # Bounded mode: report the frozen sequential estimates directly.
+    red = new_window()
+    for nd in kf:
+        red.add_node(nd, est_pose.get(nd, opt.get_pose(nd)))
+    return red
+
+
 # --------------------------------------------------------------------------
 # Evaluator (mirrors run_vo's loop-closure block)
 # --------------------------------------------------------------------------
-def eval_seq(c, params, cam, desc_matcher, match_cache=None):
+def eval_seq(c, params, cam, desc_matcher, match_cache=None, diag=None):
     stride = c["stride"]
     pa = SimpleNamespace(**vars(DEFAULT_ARGS))
     pa.kf_mode = params["kf_mode"]
@@ -201,11 +301,24 @@ def eval_seq(c, params, cam, desc_matcher, match_cache=None):
             odom_edges.append((a, i, o["R"], o["t"]))
             est_pos[-1] = node_poses[i][:3, 3].copy()
         if params["odom_ref"] == "kf":
-            if last_kf != i - stride:
-                kres = match_frames(last_kf, i)
-                if kres is not None and kres.get("ok"):
-                    odom_edges.append((last_kf, i, kres["R"], kres["t"]))
+            # Chain-relative transform to the last keyframe (reference for the
+            # translation-consistency gate and for keyframe promotion).
             dT = np.linalg.inv(node_poses[i]) @ node_poses[last_kf]
+            # Local map: constrain the frame to the last K keyframes (K=1 keeps
+            # the previous single-hub behaviour).
+            for ref in kf_nodes[-max(1, params.get("kf_local_map_k", 1)):]:
+                if ref == i - stride:
+                    continue
+                dT_ref = (dT if ref == last_kf
+                          else np.linalg.inv(node_poses[i]) @ node_poses[ref])
+                kres = match_frames(ref, i)
+                if (kres is not None and kres.get("ok")
+                        and kres.get("inlier_ratio", 0.0)
+                        >= params.get("kf_edge_min_inlier", 0.0)
+                        and _trans_consistent(
+                            dT_ref, kres.get("t"),
+                            params.get("trans_gate_deg", 0.0))):
+                    odom_edges.append((ref, i, kres["R"], kres["t"]))
             trans = float(np.linalg.norm(dT[:3, 3]))
             co = (np.trace(dT[:3, :3]) - 1.0) / 2.0
             rot = float(np.degrees(np.arccos(np.clip(co, -1.0, 1.0))))
@@ -217,26 +330,65 @@ def eval_seq(c, params, cam, desc_matcher, match_cache=None):
                 kf_nodes.append(i)
     gt_pos = c["gt_pos"]
 
-    # --- pose graph + loop closure + per-edge scale ---
-    opt = SlidingWindowOptimizer(
-        window_size=None, max_iterations=params["loop_iterations"], huber=1.0,
-        step_scale_t=params["step_scale_t"], step_scale_r=params["step_scale_t"],
-        optimize_scale=True, scale_prior_sigma=params["scale_prior_sigma"])
-    for idx, T in node_poses.items():
-        opt.add_node(idx, T)
-    added = set()
-    for (i, j, R, t) in odom_edges:
-        M = np.eye(4)
-        M[:3, :3] = R
-        M[:3, 3] = np.asarray(t, float).reshape(3)
-        opt.add_edge(i, j, M, scale_free=True)
-        added.add(edge_key(i, j))
-
     keys = sorted(node_poses.keys())
     if params["odom_ref"] == "kf":
         kf = list(kf_nodes)
     else:
         kf = select_keyframes(keys, node_poses, pa)
+
+    # Graph structure: "stride" keeps every stride frame as a node (legacy);
+    # "kf" keeps only keyframes. Intermediate frames then only carry the
+    # odometry chain used for propagation and for the final ATE.
+    graph_mode = params.get("graph_mode", "stride")
+    if graph_mode in ("kf", "kf_window"):
+        if graph_mode == "kf_window":
+            # Keyframes plus the first R stride frames after each keyframe
+            # (short-baseline spokes), dropping the long mid-segment tail.
+            r_frames = int(params.get("kf_window_r", 2)) * stride
+            keep = set(kf)
+            for k in keys:
+                p = kf[max(0, np.searchsorted(kf, k, side="right") - 1)]
+                if k - p <= r_frames:
+                    keep.add(k)
+            graph_nodes = sorted(keep)
+        else:
+            keep = set(kf)
+            graph_nodes = list(kf)
+        if params["odom_ref"] == "kf":
+            graph_edges = [(i, j, R, t) for (i, j, R, t) in odom_edges
+                           if i in keep and j in keep]
+        else:
+            # No additive keyframe spokes in prev mode: compose the odometry
+            # chain into direct keyframe-to-keyframe measurements, and keep
+            # any chain edges among the retained frames.
+            graph_edges = []
+            for a, b in zip(kf[:-1], kf[1:]):
+                M = np.linalg.inv(node_poses[b]) @ node_poses[a]
+                graph_edges.append((a, b, M[:3, :3].copy(), M[:3, 3].copy()))
+            keep_set = set(graph_nodes)
+            graph_edges += [(i, j, R, t) for (i, j, R, t) in odom_edges
+                            if i in keep_set and j in keep_set]
+    else:
+        graph_nodes = keys
+        graph_edges = odom_edges
+
+    # --- pose graph + loop closure + per-edge scale ---
+    opt = SlidingWindowOptimizer(
+        window_size=None, max_iterations=params["loop_iterations"], huber=1.0,
+        step_scale_t=params["step_scale_t"], step_scale_r=params["step_scale_t"],
+        optimize_scale=True, scale_prior_sigma=params["scale_prior_sigma"],
+        tsvd_ratio=(0.0 if (params.get("scale_kf_adaptive", False)
+                            or params.get("scale_kf_adapt_loop_ratio", 0.0) > 0.0)
+                    else params.get("tsvd_ratio", 0.0)))
+    for idx in graph_nodes:
+        opt.add_node(idx, node_poses[idx])
+    added = set()
+    for (i, j, R, t) in graph_edges:
+        M = np.eye(4)
+        M[:3, :3] = R
+        M[:3, 3] = np.asarray(t, float).reshape(3)
+        opt.add_edge(i, j, M, scale_free=True)
+        added.add(edge_key(i, j))
     gaps = [kf[i + 1] - kf[i] for i in range(len(kf) - 1)]
     kf_step = max(gaps) if gaps else stride * max(1, pa.keyframe_decim)
     odom_rot = {edge_key(i, j): np.asarray(R, float) for (i, j, R, t) in odom_edges}
@@ -279,9 +431,125 @@ def eval_seq(c, params, cam, desc_matcher, match_cache=None):
             opt.add_edge(a, b, M, scale_free=True, **sig)
             added.add(edge_key(a, b))
             n_loop += 1
-    opt.optimize()
 
-    est = np.array([opt.get_pose(k)[:3, 3] for k in keys])
+    # Adaptive gate decided BEFORE the first optimize: loop-closure density is
+    # known here and determines whether the graph can rely on KF scales
+    # (dense loops) or needs TSVD (sparse loops, e.g. desk2 n_loop=1).
+    loop_ratio_pre = n_loop / max(len(kf), 1)
+    adapt_lr = float(params.get("scale_kf_adapt_loop_ratio", 0.0))
+    tsvd_mode = bool(params.get("scale_kf", False)) and adapt_lr > 0.0 \
+        and loop_ratio_pre < adapt_lr
+    if tsvd_mode:
+        opt.tsvd_ratio = float(params.get("tsvd_ratio", 0.0) or 1e-3)
+
+    # Sequential mode owns all optimization: the graph above is only a
+    # measurement container (odometry poses + edges), never batch-solved.
+    if graph_mode != "kf_prior":
+        opt.optimize()
+
+    if graph_mode != "kf_prior" and params.get("scale_kf", False) and not tsvd_mode:
+        # Linear-KF pre-pass over the time-ordered edge scales. The measurement
+        # is z_e = s_e / m_e (m_e = chain baseline from the odometry poses).
+        # The filtered coefficient k and its variance P then re-centre the
+        # scale prior at log(k * m_e); a second (warm-start) optimize runs.
+        kf_filter = ScaleKF(params.get("scale_kf_q", 1e-3),
+                            params.get("scale_kf_r", 0.05))
+        adaptive = bool(params.get("scale_kf_adaptive", False))
+        tau = float(params.get("scale_kf_innov_tau", 3.0))
+        order = []
+        for e, (i, j, *_rest) in enumerate(opt.edges):
+            if opt.scale_col[e] is None:
+                continue  # gauge / fixed scale
+            m = float(np.linalg.norm(
+                node_poses[j][:3, 3] - node_poses[i][:3, 3]))
+            if m < 1e-9:
+                continue
+            order.append((int(j), e, m, float(opt.edge_scale[e])))
+        order.sort()
+        mean_by_edge = {}
+        innov = []
+        for j, e, m, s in order:
+            k_hat, p, inov = kf_filter.update(s / m)
+            mean_by_edge[e] = float(np.log(max(k_hat * m, 1e-6)))
+            if inov != 0.0:
+                innov.append(abs(inov))
+        for e, mu in mean_by_edge.items():
+            opt.scale_prior_mean[e] = mu
+        # Adaptive gating: if the scale coefficient does not follow the
+        # motion model (large normalised innovation, e.g. desk2), enable TSVD
+        # for the second pass; otherwise keep the KF prior only.
+        score = float(np.median(innov)) if innov else 0.0
+        if diag is not None:
+            diag["kf_innov_median"] = score
+            diag["kf_innov"] = [float(x) for x in innov]
+        # Adaptive gating. Two candidate misfit signals:
+        #  - normalised KF innovation (motion-model misfit)
+        #  - loop-closure density: few confirmed loops means the graph relies
+        #    on free-scale keyframe edges (e.g. desk2: n_loop=1).
+        loop_ratio = n_loop / max(len(kf), 1)
+        if diag is not None:
+            diag["loop_ratio"] = float(loop_ratio)
+        use_tsvd = False
+        if adaptive and score > tau:
+            use_tsvd = True
+        lr_thresh = float(params.get("scale_kf_adapt_loop_ratio", 0.0))
+        if lr_thresh > 0.0 and loop_ratio < lr_thresh:
+            use_tsvd = True
+        if use_tsvd:
+            opt.tsvd_ratio = float(params.get("tsvd_ratio", 0.0) or 1e-3)
+        sig = float(params.get("scale_kf_sigma", 0.5))
+        if sig > 0.0:
+            opt.scale_prior_sigma = sig
+            opt.optimize()
+
+    if graph_mode == "kf_prior":
+        # Sequential, bounded graph: forward pass with fixed-lag windows and
+        # transient marginalization. No global/batch solve is performed.
+        opt = _sequential_kf_priors(opt, kf, keys, params)
+        graph_nodes = list(kf)
+
+    if diag is not None:
+        # Per-edge diagnostics: optimized scale, endpoints and chain positions.
+        diag["edges"] = [(int(i), int(j)) for (i, j, *_rest) in opt.edges]
+        diag["edge_scale"] = [float(s) for s in opt.edge_scale]
+        diag["scale_col"] = list(opt.scale_col)
+        diag["node_pos"] = {int(k): np.asarray(v[:3, 3], float).tolist()
+                            for k, v in node_poses.items()}
+
+    if graph_mode in ("kf", "kf_window", "kf_prior"):
+        # Frames not in the graph are propagated from the nearest optimized
+        # keyframe along the odometry chain; ATE is still over every frame.
+        # Per-segment scale: the optimized keyframe spacing may differ from
+        # the raw odometry chain (scale-free edges), so rescale each segment's
+        # relative translation before propagating the intermediate frames.
+        node_set = set(graph_nodes)
+        seg_alpha = {}
+        for p, q in zip(kf[:-1], kf[1:]):
+            d_opt = np.linalg.norm(
+                opt.get_pose(q)[:3, 3] - opt.get_pose(p)[:3, 3])
+            d_odom = np.linalg.norm(
+                node_poses[q][:3, 3] - node_poses[p][:3, 3])
+            seg_alpha[p] = d_opt / d_odom if d_odom > 1e-9 else 1.0
+        est = []
+        for k in keys:
+            if k in node_set:
+                est.append(opt.get_pose(k)[:3, 3])
+                continue
+            p = kf[max(0, np.searchsorted(kf, k, side="right") - 1)]
+            rel = np.linalg.inv(node_poses[p]) @ node_poses[k]
+            rel[:3, 3] *= seg_alpha.get(p, 1.0)
+            est.append((opt.get_pose(p) @ rel)[:3, 3])
+        est = np.array(est)
+        if diag is not None:
+            # Diagnostics: error of the optimized keyframes themselves.
+            est_k = np.array([opt.get_pose(k)[:3, 3] for k in kf])
+            gt_k = np.array([gt_pos[k // stride] for k in kf])
+            if len(est_k) >= 3:
+                sk, Rk, tk = umeyama(est_k, gt_k, with_scale=True)
+                ek = np.linalg.norm(sk * (est_k @ Rk.T) + tk - gt_k, axis=1)
+                diag["ate_kf"] = float(np.median(ek))
+    else:
+        est = np.array([opt.get_pose(k)[:3, 3] for k in keys])
     gt = np.array([gt_pos[k // stride] for k in keys])
     if len(est) >= 3:
         s, R_a, t_a = umeyama(est, gt, with_scale=True)
@@ -318,6 +586,15 @@ def run_study(args):
             match_caches[s] = {}
     cam = CameraIntrinsics(fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy,
                            width=args.width, height=args.height)
+    if getattr(args, "auto_intrinsics", False):
+        cams = {}
+        for s in seqs:
+            fx, fy, cx, cy = intrinsics_for(
+                args.dataset_root, s, (args.fx, args.fy, args.cx, args.cy))
+            cams[s] = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy,
+                                       width=args.width, height=args.height)
+    else:
+        cams = {s: cam for s in seqs}
     if args.matcher == "torch":
         from torch_sinkhorn import TorchSinkhornMatcher
         desc_matcher = TorchSinkhornMatcher(iterations=20, epsilon=0.05,
@@ -337,7 +614,10 @@ def run_study(args):
             os.replace(tmp, p)
 
     import rustuna
-    sampler = rustuna.samplers.TPESampler(seed=args.seed)
+    if getattr(args, "sampler", "tpe") == "random":
+        sampler = rustuna.samplers.RandomSampler(seed=args.seed)
+    else:
+        sampler = rustuna.samplers.TPESampler(seed=args.seed)
     study_kwargs = dict(direction="minimize", sampler=sampler,
                         study_name=args.study_name)
     if args.storage:
@@ -349,6 +629,12 @@ def run_study(args):
     study = rustuna.create_study(**study_kwargs)
 
     def objective(trial):
+        def sf(name, low, high):
+            return trial.suggest_float(name, low, high)
+
+        def si(name, low, high):
+            return trial.suggest_int(name, low, high)
+
         odom_ref = (args.fix_odom_ref or
                     trial.suggest_categorical("odom_ref", ["prev", "kf"]))
         kf_mode = (args.fix_kf_mode or
@@ -364,23 +650,37 @@ def run_study(args):
             "keyframe_decim": (trial.suggest_int("keyframe_decim", 4, 16)
                                if use_decim else 15),
             "kf_trans_thresh": (6.0 if use_decim else
-                                trial.suggest_float("kf_trans_thresh",
-                                                    2.0, 16.0)),
+                                sf("kf_trans_thresh", 2.0, 16.0)),
             "kf_rot_thresh": (10.0 if use_decim else
-                              trial.suggest_float("kf_rot_thresh",
-                                                  5.0, 45.0)),
-            "loop_window": trial.suggest_int("loop_window", 20, 80),
-            "loop_min_gap": trial.suggest_int("loop_min_gap", 20, 60),
-            "loop_min_inlier": trial.suggest_float("loop_min_inlier", 0.25, 0.6),
-            "loop_temporal_k": trial.suggest_int("loop_temporal_k", 1, 4),
-            "scale_prior_sigma": trial.suggest_float("scale_prior_sigma", 0.2, 2.0),
-            "step_scale_t": trial.suggest_float("step_scale_t", 0.02, 0.2),
-            "loop_sigma_scale": trial.suggest_float("loop_sigma_scale", 0.0, 4.0),
+                              sf("kf_rot_thresh", 5.0, 45.0)),
+            "loop_window": si("loop_window", 20, 80),
+            "loop_min_gap": (args.fix_loop_min_gap if args.fix_loop_min_gap
+                             is not None else
+                             trial.suggest_int("loop_min_gap", 20, 60)),
+            "loop_min_inlier": (args.fix_loop_min_inlier
+                                if args.fix_loop_min_inlier is not None else
+                                trial.suggest_float("loop_min_inlier",
+                                                    0.25, 0.6)),
+            "loop_temporal_k": si("loop_temporal_k", 1, 4),
+            "scale_prior_sigma": sf("scale_prior_sigma", 0.2, 2.0),
+            "step_scale_t": sf("step_scale_t", 0.02, 0.2),
+            "loop_sigma_scale": sf("loop_sigma_scale", 0.0, 4.0),
             "loop_iterations": args.tune_iterations,
+            "tsvd_ratio": args.tsvd_ratio,
+            "scale_kf": args.scale_kf,
+            "scale_kf_q": args.scale_kf_q,
+            "scale_kf_r": args.scale_kf_r,
+            "scale_kf_sigma": args.scale_kf_sigma,
+            "scale_kf_adaptive": args.scale_kf_adaptive,
+            "scale_kf_innov_tau": args.scale_kf_innov_tau,
+            "scale_kf_adapt_loop_ratio": args.scale_kf_adapt_loop_ratio,
+            "trans_gate_deg": args.trans_gate_deg,
+            "kf_edge_min_inlier": args.kf_edge_min_inlier,
+            "kf_local_map_k": args.kf_local_map_k,
             "loop_rot_only": False,
             "cycle_threshold_deg": 0.0,
         }
-        per = {s: eval_seq(caches[s], params, cam, desc_matcher,
+        per = {s: eval_seq(caches[s], params, cams[s], desc_matcher,
                            match_caches[s]) for s in seqs}
         vals = [per[s]["ATE_median"] for s in seqs]
         mean_med = float(np.mean(vals))
@@ -416,7 +716,20 @@ def run_study(args):
         p.setdefault("keyframe_decim", 15)
         p.setdefault("kf_trans_thresh", 6.0)
         p.setdefault("kf_rot_thresh", 10.0)
+        p.setdefault("loop_min_gap", args.fix_loop_min_gap or 30)
+        p.setdefault("loop_min_inlier", args.fix_loop_min_inlier or 0.4)
         p.setdefault("loop_iterations", args.tune_iterations)
+        p.setdefault("tsvd_ratio", 0.0)
+        p.setdefault("scale_kf", False)
+        p.setdefault("scale_kf_q", 1e-3)
+        p.setdefault("scale_kf_r", 0.05)
+        p.setdefault("scale_kf_sigma", 0.5)
+        p.setdefault("scale_kf_adaptive", False)
+        p.setdefault("scale_kf_innov_tau", 3.0)
+        p.setdefault("scale_kf_adapt_loop_ratio", 0.0)
+        p.setdefault("trans_gate_deg", 0.0)
+        p.setdefault("kf_edge_min_inlier", 0.0)
+        p.setdefault("kf_local_map_k", 1)
         p.setdefault("loop_rot_only", False)
         p.setdefault("cycle_threshold_deg", 0.0)
         return p
@@ -443,6 +756,37 @@ def main():
     ap.add_argument("--n-trials", type=int, default=40)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--tune-iterations", type=int, default=20)
+    ap.add_argument("--tsvd-ratio", type=float, default=0.0,
+                    help="Truncated SVD: drop Hessian directions with "
+                         "eigenvalue below this fraction of the max (0=off).")
+    ap.add_argument("--scale-kf", action="store_true", default=False,
+                    help="Enable the linear-KF scale-coefficient pre-pass "
+                         "(re-centres the scale prior at k*motion).")
+    ap.add_argument("--scale-kf-q", type=float, default=1e-3,
+                    help="KF process variance q (how fast k may drift).")
+    ap.add_argument("--scale-kf-r", type=float, default=0.05,
+                    help="KF measurement variance r.")
+    ap.add_argument("--scale-kf-sigma", type=float, default=0.5,
+                    help="Scale-prior sigma used after the KF re-centering.")
+    ap.add_argument("--scale-kf-adaptive", action="store_true", default=False,
+                    help="Enable adaptive gating: only apply TSVD when the KF "
+                         "normalised innovation indicates a motion-model "
+                         "misfit.")
+    ap.add_argument("--scale-kf-innov-tau", type=float, default=3.0,
+                    help="Innovation (median |z|) threshold for adaptive TSVD.")
+    ap.add_argument("--scale-kf-adapt-loop-ratio", type=float, default=0.0,
+                    help="Adaptive TSVD by loop density: if n_loop/n_kf is "
+                         "below this, enable TSVD for the second pass (0=off).")
+    ap.add_argument("--trans-gate-deg", type=float, default=0.0,
+                    help="With odom_ref=kf, reject additive keyframe edges whose "
+                         "translation direction disagrees with the chain by more "
+                         "than this angle (degrees). 0 disables.")
+    ap.add_argument("--kf-edge-min-inlier", type=float, default=0.0,
+                    help="With odom_ref=kf, minimum inlier ratio for additive "
+                         "keyframe edges. 0 disables.")
+    ap.add_argument("--kf-local-map-k", type=int, default=1,
+                    help="With odom_ref=kf, constrain each frame to the last K "
+                         "keyframes (local map). 1 = single-hub additive.")
     ap.add_argument("--cache-dir", default="eval/results/tune_cache_loop")
     ap.add_argument("--out", default="eval/results/rustuna_tune_loop.json")
     ap.add_argument("--storage", default=None,
@@ -453,14 +797,22 @@ def main():
                     help="Fix odom_ref instead of searching it.")
     ap.add_argument("--fix-kf-mode", default=None, choices=["decim", "motion"],
                     help="Fix kf_mode instead of searching it.")
+    ap.add_argument("--fix-loop-min-gap", type=int, default=None,
+                    help="Fix loop_min_gap instead of searching it.")
+    ap.add_argument("--fix-loop-min-inlier", type=float, default=None,
+                    help="Fix loop_min_inlier instead of searching it.")
     ap.add_argument("--matcher", default="numpy", choices=["numpy", "torch"],
                     help="Descriptor matcher backend. 'torch' is ~6x faster "
                          "and float32-equivalent (tuning only).")
+    ap.add_argument("--sampler", default="tpe", choices=["tpe", "random"],
+                    help="Sampler backend. Use 'random' for unbiased exploration.")
     ap.add_argument("--build-cache", action="store_true")
     ap.add_argument("--report-only", action="store_true",
                     help="Do not run new trials; just write the result JSON "
                          "from an existing (storage-backed) study.")
     ap.add_argument("--fx", type=float, default=525.0)
+    ap.add_argument("--auto-intrinsics", action="store_true", default=False,
+                    help="Use per-camera TUM intrinsics (freiburg1/2/3).")
     ap.add_argument("--fy", type=float, default=525.0)
     ap.add_argument("--cx", type=float, default=320.0)
     ap.add_argument("--cy", type=float, default=240.0)

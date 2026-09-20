@@ -85,6 +85,51 @@ def read_path_file(path):
     return rows
 
 
+TUM_CAMERAS = ("freiburg1", "freiburg2", "freiburg3")
+
+# TUM RGB-D factory/calibrated intrinsics; the driver already undistorts the
+# images, so distortion is zero and these pinhole intrinsics are used as-is.
+TUM_INTRINSICS = {
+    "freiburg1": (525.0, 525.0, 320.0, 240.0),
+    "freiburg2": (520.9, 521.0, 325.1, 249.7),
+    "freiburg3": (535.4, 539.2, 320.1, 247.6),
+}
+
+
+def resolve_dataset(dataset_root, seq):
+    """Resolve a sequence name to ``(base_dir, camera_id)``.
+
+    Plain names (desk, desk2, room, 360, xyz, ...) map to freiburg1 for
+    backward compatibility; ``fr2_desk`` / ``freiburg2_desk`` /
+    ``rgbd_dataset_freiburg2_desk`` resolve to the corresponding camera.
+    """
+    if seq.startswith("rgbd_dataset_"):
+        name = seq
+    elif seq.startswith("freiburg"):
+        name = f"rgbd_dataset_{seq}"
+    elif seq[:3] in ("fr1", "fr2", "fr3") and len(seq) > 4 and seq[3] == "_":
+        name = f"rgbd_dataset_freiburg{seq[2]}_{seq[4:]}"
+    else:
+        name = f"rgbd_dataset_freiburg1_{seq}"
+    cam = "freiburg1"
+    for c in TUM_CAMERAS:
+        if c in name:
+            cam = c
+            break
+    return Path(dataset_root) / name, cam
+
+
+def intrinsics_for(dataset_root, seq, default):
+    """Return the pinhole intrinsics for a sequence.
+
+    ``default`` is a 4-tuple used for freiburg1 (keeps existing configs).
+    """
+    _, cam = resolve_dataset(dataset_root, seq)
+    if cam == "freiburg1":
+        return default
+    return TUM_INTRINSICS[cam]
+
+
 def nearest_timestamp(rows, timestamp, max_diff):
     """Return the nearest ``(timestamp, value)`` row within ``max_diff``."""
     if not rows:
@@ -314,6 +359,25 @@ def _edge_diag(frames, a, b, R_c, t_c, inlier, n_matches, cum_rot=None):
     return diag
 
 
+def _trans_consistent(dT, t, max_deg):
+    """True if the chain-relative translation direction (from ``dT``) and the
+    measured essential translation ``t`` agree within ``max_deg`` degrees.
+
+    ``max_deg <= 0`` disables the check. With the gate enabled, a near-zero
+    translation on either side counts as inconsistent (no reliable direction).
+    """
+    if max_deg <= 0:
+        return True
+    tc = np.asarray(dT[:3, 3], float).reshape(3)
+    tk = np.asarray(t, float).reshape(3)
+    nc = float(np.linalg.norm(tc))
+    nk = float(np.linalg.norm(tk))
+    if nc < 1e-9 or nk < 1e-9:
+        return False
+    cosang = float(np.clip(np.dot(tc, tk) / (nc * nk), -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosang))) <= max_deg
+
+
 def select_keyframes(keys, node_poses, args):
     """Pick keyframe node ids.
 
@@ -354,7 +418,12 @@ def run_vo(args):
     seqs = ["desk", "desk2", "room"] if args.seq == "all" else [args.seq]
     summary = []
     for seq in seqs:
-        base = Path(args.dataset_root) / f"rgbd_dataset_freiburg1_{seq}"
+        base, cam_id = resolve_dataset(args.dataset_root, seq)
+        if getattr(args, "auto_intrinsics", False):
+            fx, fy, cx, cy = intrinsics_for(
+                args.dataset_root, seq, (args.fx, args.fy, args.cx, args.cy))
+            cam = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy,
+                                   width=args.width, height=args.height)
         gt_rows = read_tum_file(base / "groundtruth.txt")
         frame_list = read_path_file(base / "rgb.txt")
         depth_rows = (
@@ -453,13 +522,23 @@ def run_vo(args):
             nonlocal last_kf
             if args.odom_ref != "kf":
                 return
-            if last_kf != i - args.stride:
-                kres = match_keyframes(last_kf, i)
+            # Chain-relative transform to the last keyframe (reference for the
+            # translation-consistency gate and for keyframe promotion).
+            dT = np.linalg.inv(node_poses[i]) @ node_poses[last_kf]
+            # Local map: constrain the new frame to the last K keyframes instead
+            # of a single hub (--kf-local-map-k 1 keeps the previous behaviour).
+            for ref in kf_nodes[-max(1, args.kf_local_map_k):]:
+                if ref == i - args.stride:
+                    continue  # consecutive chain edge already covers this pair
+                dT_ref = (dT if ref == last_kf
+                          else np.linalg.inv(node_poses[i]) @ node_poses[ref])
+                kres = match_keyframes(ref, i)
                 if (kres is not None and kres.get("ok")
                         and kres.get("inlier_ratio", 0.0)
-                        >= args.kf_edge_min_inlier):
-                    odom.append((last_kf, i, kres["R"], kres["t"]))
-            dT = np.linalg.inv(node_poses[i]) @ node_poses[last_kf]
+                        >= args.kf_edge_min_inlier
+                        and _trans_consistent(dT_ref, kres.get("t"),
+                                              args.trans_gate_deg)):
+                    odom.append((ref, i, kres["R"], kres["t"]))
             trans = float(np.linalg.norm(dT[:3, 3]))
             c = (np.trace(dT[:3, :3]) - 1.0) / 2.0
             rot = float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
@@ -533,6 +612,7 @@ def run_vo(args):
                 optimize_scale=args.edge_scale,
                 scale_prior_sigma=(args.scale_prior_sigma
                                    if args.edge_scale else 0.0),
+                tsvd_ratio=args.tsvd_ratio,
             )
             for idx, T in node_poses.items():
                 opt.add_node(idx, T)
@@ -749,7 +829,7 @@ def run_gtcheck(args):
     seqs = ["desk", "desk2", "room"] if args.seq == "all" else [args.seq]
     out = []
     for seq in seqs:
-        base = Path(args.dataset_root) / f"rgbd_dataset_freiburg1_{seq}"
+        base, _cam_id = resolve_dataset(args.dataset_root, seq)
         frame_list = []
         with open(base / "rgb.txt") as f:
             for line in f:
@@ -873,6 +953,17 @@ def main():
                     help="With --odom-ref kf, minimum inlier ratio to add the "
                          "additive edge to the last keyframe (0 = no gate; "
                          "gating at 0.3 hurt desk, so it is off by default).")
+    ap.add_argument("--kf-local-map-k", type=int, default=1,
+                    help="With --odom-ref kf, constrain each frame to the last K "
+                         "keyframes instead of a single hub (local map). 1 = "
+                         "previous single-hub additive behaviour.")
+    ap.add_argument("--trans-gate-deg", type=float, default=0.0,
+                    help="With --odom-ref kf, reject an additive keyframe edge "
+                         "whose translation direction disagrees with the "
+                         "odometry-chain direction by more than this angle "
+                         "(degrees). 0 disables the gate. Long-baseline "
+                         "essential translations are unreliable under low "
+                         "parallax/rotation, where this gate rejects them.")
     ap.add_argument("--odom-ref", choices=["prev", "kf"], default="prev",
                     help="prev: consecutive-pair chain only. kf: additive - "
                          "keep the chain and also add, for every frame, an edge "
@@ -914,6 +1005,10 @@ def main():
     ap.add_argument("--scale-loop-only", action="store_true", default=False,
                     help="With --edge-scale, keep odometry edges at unit scale "
                          "and free only loop/refinement edges.")
+    ap.add_argument("--tsvd-ratio", type=float, default=0.0,
+                    help="Truncated SVD: drop optimization directions whose "
+                         "Hessian eigenvalue is below this fraction of the max "
+                         "eigenvalue (0 = plain LM solve).")
     ap.add_argument("--loop-iterations", type=int, default=60,
                     help="Gauss-Newton iterations for the full-graph optimize.")
     ap.add_argument("--loop-huber", type=float, default=1.0,
@@ -947,6 +1042,9 @@ def main():
     ap.add_argument("--sink-iterations", type=int, default=20)
     ap.add_argument("--unused-score", type=float, default=1.0)
     ap.add_argument("--fx", type=float, default=525.0)
+    ap.add_argument("--auto-intrinsics", action="store_true", default=False,
+                    help="Use per-camera TUM intrinsics (freiburg1/2/3) instead "
+                         "of the fixed --fx/--fy/--cx/--cy.")
     ap.add_argument("--fy", type=float, default=525.0)
     ap.add_argument("--cx", type=float, default=320.0)
     ap.add_argument("--cy", type=float, default=240.0)

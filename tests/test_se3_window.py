@@ -128,5 +128,103 @@ class TestWindowOptimizer:
             opt.add_node(3, np.eye(4))
 
 
+def _random_graph(seed=0, n_nodes=40):
+    rng = np.random.default_rng(seed)
+    T = [np.eye(4)]
+    meas = []
+    for _ in range(n_nodes - 1):
+        M = rand_T(rng, 0.5, 0.3)
+        meas.append(M)
+        T.append(T[-1] @ np.linalg.inv(M))
+    return rng, T, meas
+
+
+def _run_graph(dense_max_cols, tsvd_ratio=0.0):
+    """Build a noisy chain + one loop edge with free scales and optimize."""
+    rng, T, meas = _random_graph()
+    n = len(T)
+    opt = SlidingWindowOptimizer(
+        window_size=None, max_iterations=40, step_scale_t=0.1, step_scale_r=0.1,
+        optimize_scale=True, scale_prior_sigma=0.5, tsvd_ratio=tsvd_ratio,
+        dense_max_cols=dense_max_cols)
+    for i, Ti in enumerate(T):
+        opt.add_node(i, Ti)
+    for k, M in enumerate(meas):
+        opt.add_edge(k, k + 1, M, scale_free=True)
+    # Noisy global loop edge 0 -> n-1 (true relative pose is inv(T_{n-1}) T_0).
+    M_loop = np.linalg.inv(T[-1]) @ T[0]
+    M_loop[:3, 3] = M_loop[:3, 3] * 0.9 + rng.normal(0, 0.05, 3)
+    opt.add_edge(0, n - 1, M_loop, scale_free=True)
+    cost = opt.optimize()
+    poses = [opt.get_pose(i) for i in range(n)]
+    return cost, poses, list(opt.edge_scale), opt.tsvd_kept
+
+
+class TestSparseSolver:
+    def test_jacobian_coo_matches_dense(self):
+        rng, T, meas = _random_graph(seed=1)
+        opt = SlidingWindowOptimizer(window_size=None, max_iterations=1,
+                                     optimize_scale=True, scale_prior_sigma=0.3)
+        for i, Ti in enumerate(T):
+            opt.add_node(i, Ti)
+        for k, M in enumerate(meas):
+            opt.add_edge(k, k + 1, M, scale_free=True)
+        rows, cols, vals, shape = opt._jacobian_coo()
+        Jcoo = np.zeros(shape)
+        Jcoo[rows, cols] = vals
+        assert shape == opt._jacobian().shape
+        assert np.allclose(Jcoo, opt._jacobian(), atol=1e-12)
+
+class TestMarginalization:
+    def test_relative_prior_reproduces_full_solution(self):
+        rng = np.random.default_rng(7)
+        true = [np.eye(4)]
+        meas = []
+        for _ in range(4):
+            Gt = rand_T(rng, 0.4, 0.25)
+            true.append(true[-1] @ np.linalg.inv(Gt))
+            meas.append(Gt @ rand_T(rng, 0.02, 0.01))
+        T = [np.eye(4)]
+        for k in range(4):
+            T.append(T[-1] @ np.linalg.inv(meas[k]))
+
+        full = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+                                     step_scale_t=0.1, step_scale_r=0.1)
+        for i, Ti in enumerate(T):
+            full.add_node(i, Ti)
+        for k in range(4):
+            full.add_edge(k, k + 1, meas[k])
+        full.add_edge(0, 2, np.linalg.inv(T[2]) @ T[0])  # spoke
+        cost_full = full.optimize()
+
+        a, b, G, Omega = full.marginalize_relative([1, 2, 3], [0, 4])
+        assert a == 0 and b == 4
+        assert Omega.shape == (6, 6)
+        assert np.allclose(Omega, Omega.T, atol=1e-9)
+
+        red = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+                                     step_scale_t=0.1, step_scale_r=0.1)
+        red.add_node(0, T[0])
+        red.add_node(4, T[4])
+        red.add_edge(0, 4, G, omega=Omega)
+        red.optimize()
+
+        # The marginalized relative prior should place node 4 where the full
+        # batch graph does (nonlinearity is small after convergence).
+        assert np.allclose(red.get_pose(4), full.get_pose(4), atol=5e-3)
+        assert cost_full < 1e-1
+
+    @pytest.mark.parametrize("tsvd_ratio", [0.0, 1e-3])
+    def test_sparse_matches_dense(self, tsvd_ratio):
+        cost_d, poses_d, scale_d, _ = _run_graph(10 ** 9, tsvd_ratio)
+        cost_s, poses_s, scale_s, kept_s = _run_graph(0, tsvd_ratio)
+        assert cost_s == pytest.approx(cost_d, rel=1e-8, abs=1e-10)
+        for pd, ps in zip(poses_d, poses_s):
+            assert np.allclose(pd, ps, atol=1e-8)
+        assert np.allclose(scale_d, scale_s, atol=1e-8)
+        if tsvd_ratio > 0.0:
+            assert kept_s > 0
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
