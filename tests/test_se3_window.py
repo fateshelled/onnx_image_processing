@@ -175,6 +175,18 @@ class TestSparseSolver:
         assert shape == opt._jacobian().shape
         assert np.allclose(Jcoo, opt._jacobian(), atol=1e-12)
 
+    @pytest.mark.parametrize("tsvd_ratio", [0.0, 1e-3])
+    def test_sparse_matches_dense(self, tsvd_ratio):
+        cost_d, poses_d, scale_d, _ = _run_graph(10 ** 9, tsvd_ratio)
+        cost_s, poses_s, scale_s, kept_s = _run_graph(0, tsvd_ratio)
+        assert cost_s == pytest.approx(cost_d, rel=1e-8, abs=1e-10)
+        for pd, ps in zip(poses_d, poses_s):
+            assert np.allclose(pd, ps, atol=1e-8)
+        assert np.allclose(scale_d, scale_s, atol=1e-8)
+        if tsvd_ratio > 0.0:
+            assert kept_s > 0
+
+
 class TestMarginalization:
     def test_relative_prior_reproduces_full_solution(self):
         rng = np.random.default_rng(7)
@@ -214,16 +226,44 @@ class TestMarginalization:
         assert np.allclose(red.get_pose(4), full.get_pose(4), atol=5e-3)
         assert cost_full < 1e-1
 
-    @pytest.mark.parametrize("tsvd_ratio", [0.0, 1e-3])
-    def test_sparse_matches_dense(self, tsvd_ratio):
-        cost_d, poses_d, scale_d, _ = _run_graph(10 ** 9, tsvd_ratio)
-        cost_s, poses_s, scale_s, kept_s = _run_graph(0, tsvd_ratio)
-        assert cost_s == pytest.approx(cost_d, rel=1e-8, abs=1e-10)
-        for pd, ps in zip(poses_d, poses_s):
-            assert np.allclose(pd, ps, atol=1e-8)
-        assert np.allclose(scale_d, scale_s, atol=1e-8)
-        if tsvd_ratio > 0.0:
-            assert kept_s > 0
+class TestMultiNodePrior:
+    def test_general_marginalization_with_loop(self):
+        rng = np.random.default_rng(21)
+        meas = []
+        for _ in range(4):
+            meas.append(rand_T(rng, 0.4, 0.25) @ rand_T(rng, 0.02, 0.01))
+        T = [np.eye(4)]
+        for k in range(4):
+            T.append(T[-1] @ np.linalg.inv(meas[k]))
+
+        full = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+                                     step_scale_t=0.1, step_scale_r=0.1)
+        for i, Ti in enumerate(T):
+            full.add_node(i, Ti)
+        for k in range(4):
+            full.add_edge(k, k + 1, meas[k])
+        M_loop = np.linalg.inv(T[3]) @ T[0]  # loop 0 -> 3
+        M_loop[:3, 3] *= 0.9
+        full.add_edge(0, 3, M_loop)
+        full.optimize()
+
+        # Node 0's Markov blanket here is {1 (chain), 3 (loop)} -> 2 nodes, but
+        # the primitive is general (any number of retained nodes).
+        keep, H_r, b_r = full.marginalize_general([0], [1, 3])
+        assert keep == [1, 3]
+        assert H_r.shape == (12, 12)
+
+        red = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+                                     step_scale_t=0.1, step_scale_r=0.1)
+        for i in (1, 2, 3, 4):
+            red.add_node(i, full.get_pose(i))
+        for k in (1, 2, 3):
+            red.add_edge(k, k + 1, meas[k])
+        red.add_prior_factor([1, 3], H_r, b_r,
+                             [full.get_pose(1), full.get_pose(3)])
+        red.optimize()
+        for nd in (2, 3, 4):
+            assert np.allclose(red.get_pose(nd), full.get_pose(nd), atol=5e-3)
 
 
 if __name__ == "__main__":

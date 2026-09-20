@@ -45,6 +45,7 @@ ap.add_argument("--resume", action="store_true",
                 help="skip sequences already present in the output json")
 ap.add_argument("--force", action="store_true",
                 help="re-evaluate sequences even if already present")
+ap.add_argument("--matcher", default="torch", choices=["numpy", "torch"])
 args = ap.parse_args()
 SEQ = [s for s in args.seq.split(",") if s]
 
@@ -65,8 +66,13 @@ params["scale_kf_q"] = 1e-3
 params["scale_kf_r"] = 0.1
 params["scale_kf_sigma"] = 0.5
 
-matcher = rtl.NumpySinkhornMatcher(iterations=20, epsilon=0.05,
+if args.matcher == "torch":
+    from torch_sinkhorn import TorchSinkhornMatcher
+    matcher = TorchSinkhornMatcher(iterations=20, epsilon=0.05,
                                    unused_score=1.0, distance_type="l2")
+else:
+    matcher = rtl.NumpySinkhornMatcher(iterations=20, epsilon=0.05,
+                                       unused_score=1.0, distance_type="l2")
 for seq in SEQ:
     npz = REPO / f"eval/results/tune_cache_loop/{seq}.npz"
     if not npz.exists():
@@ -78,7 +84,8 @@ for seq in SEQ:
     fx, fy, cx, cy = intrinsics_for(DATASET_ROOT, seq, (525., 525., 320., 240.))
     cam = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, width=640, height=480)
     cache = rtl.load_cache(REPO / "eval/results/tune_cache_loop", seq)
-    pkl = REPO / f"eval/results/tune_cache_loop/match_cache_{seq}_torch.pkl"
+    pkl = REPO / (f"eval/results/tune_cache_loop/"
+                  f"match_cache_{seq}_{args.matcher}.pkl")
     mc = pickle.load(open(pkl, "rb")) if pkl.exists() else {}
     row = {}
     for label, kf, lr in CONFIGS:

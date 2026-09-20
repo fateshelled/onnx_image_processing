@@ -30,6 +30,7 @@ the dense LM path is kept for small windows. Runs on CPU. Not ONNX-related.
 """
 
 import numpy as np
+import scipy.linalg as sla
 from scipy import sparse as sp
 from scipy.sparse.linalg import splu
 
@@ -84,6 +85,9 @@ class SlidingWindowOptimizer:
         # Normal equations are dense below this many variables and sparse
         # (scipy) above it, keeping the exact legacy solver for small windows.
         self.dense_max_cols = int(dense_max_cols)
+        # Above this many variables the TSVD eigendecomposition is skipped
+        # (a dense eigendecomposition would need ~n^2 memory and OOM).
+        self.tsvd_dense_max_cols = 12000
         self.tsvd_kept = 0
         self.tsvd_total = 0
         self.pose_ids: list[int] = []
@@ -96,6 +100,11 @@ class SlidingWindowOptimizer:
         # information Omega = W^T W). None -> diagonal 1/sigma per axis.
         # Used for marginalization (relative) priors.
         self.edge_whiten: list[np.ndarray | None] = []
+        # Dense marginalization priors: each entry is (ids, L, mu, x0) with
+        # cost ||L (delta - mu)||^2 over right-increments delta_i =
+        # Log(x0_i^-1 T_i). Used to project an eliminated subgraph onto its
+        # (multi-node) Markov blanket.
+        self.prior_factors: list[tuple] = []
         # Parallel bookkeeping for per-edge scale.
         self.edge_scale: list[float] = []
         self.scale_col: list[int | None] = []  # None = fixed / gauge
@@ -163,6 +172,56 @@ class SlidingWindowOptimizer:
                 self.n_scale += 1
         self.scale_col.append(col)
 
+    def add_prior_factor(self, ids, H, b, x0) -> None:
+        """Add a dense Gaussian prior over several nodes.
+
+        ``cost = 0.5 * (delta - mu)^T Lambda (delta - mu)`` with
+        ``Lambda = H`` and ``mu = -H^+ b``. ``x0`` is the linearization point
+        (poses aligned with ``ids``). Stored whitened for row assembly.
+        """
+        ids = tuple(int(i) for i in ids)
+        H = np.asarray(H, float)
+        H = 0.5 * (H + H.T)
+        b = np.asarray(b, float).ravel()
+        mu = -np.linalg.pinv(H) @ b
+        w_e, V = np.linalg.eigh(H)
+        L = np.sqrt(np.clip(w_e, 0.0, None))[:, None] * V.T
+        x0 = [np.asarray(p, float).copy() for p in x0]
+        self.prior_factors.append((ids, L, mu, x0))
+
+    def add_nl_regularization(self, strength=1.0, tau=1.0, length=1.0):
+        """Direction-dependent Tikhonov (NL-Reg) anchored to the current poses.
+
+        Builds the unit-balanced node Hessian ``H_bal = S^-1 H S^-1``
+        (rotation dofs scaled by ``length`` so translation/rotation are
+        comparable), weights its spectrum with the Wiener filter
+        ``g(mu) = strength * tau / (mu + tau)`` (continuous, no threshold),
+        and adds a dense prior factor anchoring every node to its current
+        pose with information ``Lambda = S Lambda_bal S``. Weak directions are
+        pulled back to the prior; well-conditioned directions are untouched.
+        Scales are not regularized (node poses only).
+        """
+        free = [nd for nd in self.pose_ids if nd not in self.fixed_ids]
+        if not free:
+            return
+        H, _g, _ncol = self._full_normal()
+        nnode = 6 * len(free)
+        Hn = H[:nnode, :nnode]
+        Hn = Hn.toarray() if sp.issparse(Hn) else np.asarray(Hn)
+        Hn = 0.5 * (Hn + Hn.T)
+        s = np.ones(nnode)
+        s[0::6] = s[1::6] = s[2::6] = float(length)  # rotation dofs
+        dinv = 1.0 / s
+        Hb = Hn * dinv[:, None] * dinv[None, :]
+        w_e, V = sla.eigh(Hb)
+        w_e = np.clip(w_e, 0.0, None)
+        gw = float(strength) * float(tau) / (w_e + float(tau))
+        Lam_bal = (V * gw) @ V.T
+        Lam = Lam_bal * s[:, None] * s[None, :]
+        Lam = 0.5 * (Lam + Lam.T)
+        self.add_prior_factor(free, Lam, np.zeros(nnode),
+                              [self.T[nd] for nd in free])
+
     def get_scale(self, edge_index: int) -> float:
         return self.edge_scale[edge_index]
 
@@ -220,12 +279,25 @@ class SlidingWindowOptimizer:
         r = np.concatenate(out)
         if self._n_prior():
             pri = [
-                np.array([(np.log(self.edge_scale[e]) - self.scale_prior_mean[e])
+                np.array([(np.log(max(self.edge_scale[e], 1e-12))
+                           - self.scale_prior_mean[e])
                           / self.scale_prior_sigma])
                 for e, c in enumerate(self.scale_col) if c is not None
             ]
             r = np.concatenate([r] + pri)
+        for fac in self.prior_factors:
+            r = np.concatenate([r, self._prior_factor_residual(fac)])
         return r
+
+    def _prior_factor_delta(self, fac) -> np.ndarray:
+        ids, _L, _mu, x0 = fac
+        return np.concatenate([
+            se3_log(np.linalg.inv(x0[k]) @ self.T[nd])
+            for k, nd in enumerate(ids)])
+
+    def _prior_factor_residual(self, fac) -> np.ndarray:
+        ids, L, mu, _x0 = fac
+        return L @ (self._prior_factor_delta(fac) - mu)
 
     def _edge_scale(self, st, sr):
         return np.concatenate([np.full(3, sr), np.full(3, st)])
@@ -257,6 +329,8 @@ class SlidingWindowOptimizer:
                 w[6 * k: 6 * k + 6] = self.huber / max(n, 1e-12)
         if self._n_prior():
             w = np.concatenate([w, np.ones(self._n_prior())])
+        for fac in self.prior_factors:
+            w = np.concatenate([w, np.ones(6 * len(fac[0]))])
         return w
 
     def _cost(self) -> float:
@@ -349,6 +423,22 @@ class SlidingWindowOptimizer:
                     cols.append(6 * n + c)
                     vals.append(1.0 / self.scale_prior_sigma)
                     base += 1
+        base = 6 * len(self.edges) + self._n_prior()
+        for (ids, L, mu, _x0) in self.prior_factors:
+            m6 = 6 * len(ids)
+            for kk, nd in enumerate(ids):
+                if nd not in col:
+                    continue  # fixed in the factor: delta is pinned
+                cb = 6 * col[nd]
+                blk = L[:, 6 * kk:6 * kk + 6]
+                for a in range(m6):
+                    for d in range(6):
+                        v = blk[a, d]
+                        if v != 0.0:
+                            rows.append(base + a)
+                            cols.append(cb + d)
+                            vals.append(v)
+            base += m6
         return (np.asarray(rows, dtype=np.int64),
                 np.asarray(cols, dtype=np.int64),
                 np.asarray(vals, dtype=float),
@@ -479,6 +569,39 @@ class SlidingWindowOptimizer:
         Omega = 0.5 * (Omega + Omega.T)
         return a, b, G, np.asarray(Omega, float)
 
+    def marginalize_general(self, eliminate, keep):
+        """Schur-marginalize ``eliminate`` onto an arbitrary ``keep`` set.
+
+        Returns ``(keep, H_r, b_r)`` so that
+        ``add_prior_factor(keep, H_r, b_r, [pose(k) for k in keep])`` reproduces
+        the marginal cost over the retained nodes. Scales are fixed at their
+        current values (same convention as the fixed-lag transient
+        marginalization), so the prior is over the 6-dof poses only.
+        """
+        free = [nd for nd in self.pose_ids if nd not in self.fixed_ids]
+        col = {nd: k for k, nd in enumerate(free)}
+        elim = set(eliminate)
+        if elim & self.fixed_ids:
+            raise ValueError("cannot marginalize fixed nodes")
+        elim_idx: list[int] = []
+        for nd in eliminate:
+            b = 6 * col[nd]
+            elim_idx.extend(range(b, b + 6))
+        keep_idx = [6 * col[nd] + d for nd in keep for d in range(6)]
+        H, g, _ = self._full_normal()
+        nnode = 6 * len(free)
+        H = H[:nnode, :nnode]
+        g = g[:nnode]
+        idx = elim_idx + keep_idx
+        Hs = H[idx][:, idx].toarray()
+        gs = g[idx]
+        ne = len(elim_idx)
+        Hee_inv = np.linalg.pinv(Hs[:ne, :ne])
+        H_r = Hs[ne:, ne:] - Hs[ne:, :ne] @ Hee_inv @ Hs[:ne, ne:]
+        H_r = 0.5 * (H_r + H_r.T)
+        g_r = gs[ne:] - Hs[ne:, :ne] @ Hee_inv @ gs[:ne]
+        return list(keep), H_r, g_r
+
     # -- solver ---------------------------------------------------------------
 
     def optimize(self, verbose: bool = False) -> float:
@@ -513,24 +636,31 @@ class SlidingWindowOptimizer:
                 gred = g.copy()
                 gred[:6] = 0.0
             if self.tsvd_ratio > 0.0 and eig_cache is None:
-                # TSVD (Eckart-Young): eigen-decompose the symmetric PSD
-                # normal matrix once and reuse it. Directions with eigenvalue
-                # <= ratio*max are degenerate and receive no update (their
-                # pseudo-inverse is set to 0), so unobservable scales /
-                # translation directions cannot drift.
-                Hd = Hred.toarray() if use_sparse else Hred
-                w_e, V = np.linalg.eigh(Hd)
-                keep = w_e > self.tsvd_ratio * float(w_e.max())
-                self.tsvd_total = int(w_e.size)
-                self.tsvd_kept = int(np.count_nonzero(keep))
-                eig_cache = (w_e, V, keep)
+                # TSVD (Eckart-Young): directions with eigenvalue <= ratio*max
+                # are degenerate and receive no update, so unobservable scales
+                # / translation directions cannot drift. The sparse path keeps
+                # everything sparse via eigsh (no dense Hessian), the dense
+                # path uses scipy.linalg.eigh.
+                if use_sparse and Hred.shape[0] > self.tsvd_dense_max_cols:
+                    # Too large for a dense eigendecomposition: skip TSVD and
+                    # rely on the sparse solve (avoids OOM on huge graphs).
+                    self.tsvd_total = int(Hred.shape[0])
+                    self.tsvd_kept = int(Hred.shape[0])
+                    eig_cache = ("skip",)
+                else:
+                    Hd = Hred.toarray() if use_sparse else Hred
+                    w_e, V = sla.eigh(Hd)
+                    keep = w_e > self.tsvd_ratio * float(w_e.max())
+                    self.tsvd_total = int(w_e.size)
+                    self.tsvd_kept = int(np.count_nonzero(keep))
+                    eig_cache = ("eig", w_e, V, keep)
             accepted = False
             # Levenberg-Marquardt: re-solve with stronger damping until the
             # step is accepted (the previous code re-applied the same step).
             for _attempt in range(8):
                 try:
-                    if eig_cache is not None:
-                        w_e, V, keep = eig_cache
+                    if eig_cache is not None and eig_cache[0] == "eig":
+                        w_e, V, keep = eig_cache[1:]
                         inv = np.zeros_like(w_e)
                         inv[keep] = 1.0 / (w_e[keep] + lam)
                         dxred = -(V * inv) @ (V.T @ gred)
@@ -538,7 +668,7 @@ class SlidingWindowOptimizer:
                         dxred = self._solve_sparse(Hred, -gred, lam)
                     else:
                         Hf = Hred + np.eye(ncol) * lam
-                        dxred = np.linalg.solve(Hf, -gred)
+                        dxred = sla.solve(Hf, -gred)
                 except (np.linalg.LinAlgError, RuntimeError):
                     lam *= 10.0
                     if lam > 1e7:
@@ -554,8 +684,9 @@ class SlidingWindowOptimizer:
                     self.T[node] = backup[node] @ se3_exp(dx[6 * k: 6 * k + 6])
                 for e, c in enumerate(self.scale_col):
                     if c is not None:
-                        self.edge_scale[e] = (
-                            backup_scale[e] * float(np.exp(dx[6 * n_node + c])))
+                        self.edge_scale[e] = max(
+                            backup_scale[e]
+                            * float(np.exp(dx[6 * n_node + c])), 1e-9)
                 cost = self._cost()
                 if cost <= prev_cost - 1e-12:
                     lam = max(lam / 3.0, 1e-9)

@@ -169,6 +169,7 @@ def _sequential_kf_priors(opt, kf, keys, params):
                   if i in kf_set and j in kf_set
                   and abs(kf_index[i] - kf_index[j]) > 1]
     priors = []
+    node_priors = []  # (ids, H, b, x0) from exited keyframes
     est_pose = {kf[0]: opt.get_pose(kf[0])}
 
     def new_window():
@@ -176,35 +177,57 @@ def _sequential_kf_priors(opt, kf, keys, params):
             window_size=None, max_iterations=params["loop_iterations"],
             huber=1.0, step_scale_t=step_t, step_scale_r=step_t,
             optimize_scale=True, scale_prior_sigma=params["scale_prior_sigma"],
-            tsvd_ratio=params.get("seq_tsvd_ratio", 0.0))
+            tsvd_ratio=(0.0 if params.get("nl_reg", False)
+                        else params.get("seq_tsvd_ratio", 0.0)))
 
     for m in range(len(kf) - 1):
         a, b = kf[m], kf[m + 1]
         trans = [i for i in keys if a < i < b]
-        # Fixed-lag: only the last max_kf keyframes stay active. The keyframe
-        # just before the window is pinned so the squeezed window remains
-        # connected to the frozen past.
+        trans_set = set(trans)
         if max_kf is None:
-            active_kf, boundary = kf[:m + 2], None
+            free_kf = kf[:m + 2]
         else:
-            lo = max(0, (m + 1) - max(1, max_kf) + 1)
-            active_kf = kf[lo:m + 2]
-            boundary = kf[lo - 1] if lo > 0 else None
-        node_set = set(active_kf) | set(trans)
-        if boundary is not None:
-            node_set.add(boundary)
+            free_kf = kf[max(0, (m + 1) - max(1, max_kf) + 1):m + 2]
+        free_set = set(free_kf)
+        # Option 1 (deferred marginalization): keyframes that left the active
+        # window stay in the optimizer until every node on their Markov
+        # blanket is active again; only then are they Schur-marginalized and
+        # dropped. This keeps the marginal at a fresh linearization point.
+        held = set()
+        changed = True
+        while changed:
+            changed = False
+            for (ids, *_rest) in node_priors:
+                if any(nd in free_set or nd in held for nd in ids):
+                    for nd in ids:
+                        if (nd not in free_set and nd not in held
+                                and nd not in trans_set):
+                            held.add(nd)
+                            changed = True
+            for e in all_edges:
+                if (e[0] in free_set or e[0] in held):
+                    if e[1] in kf_set and e[1] not in free_set \
+                            and e[1] not in held:
+                        held.add(e[1])
+                        changed = True
+                if (e[1] in free_set or e[1] in held):
+                    if e[0] in kf_set and e[0] not in free_set \
+                            and e[0] not in held:
+                        held.add(e[0])
+                        changed = True
+        node_set = free_set | held | trans_set
         nodes = sorted(node_set)
 
         act = new_window()
         for nd in nodes:
-            if nd == boundary:
-                act.add_node(nd, est_pose[nd], fixed=True)
-            else:
-                act.add_node(nd, est_pose.get(nd, opt.get_pose(nd)))
+            act.add_node(nd, est_pose.get(nd, opt.get_pose(nd)))
         for (x, y, G, Om) in priors:
             if x in node_set and y in node_set:
                 act.add_edge(x, y, G, omega=Om)
-        seg = {a} | set(trans) | {b}
+        for (ids, H, bbias, x0) in node_priors:
+            if all(nd in node_set for nd in ids):
+                act.add_prior_factor(ids, H, bbias, x0)
+        seg = {a} | trans_set | {b}
         for (i, j, M, st, sr) in all_edges:
             if i in seg and j in seg and not (i == a and j == b):
                 act.add_edge(i, j, M, sigma_t=st, sigma_r=sr, scale_free=True)
@@ -214,15 +237,38 @@ def _sequential_kf_priors(opt, kf, keys, params):
         for (i, j, M, st, sr) in loop_edges:
             if i in node_set and j in node_set:
                 act.add_edge(i, j, M, sigma_t=st, sigma_r=sr, scale_free=True)
+        if params.get("nl_reg", False):
+            act.add_nl_regularization(params.get("nl_reg_c", 1.0),
+                                      params.get("nl_reg_tau", 1.0),
+                                      params.get("nl_reg_length", 1.0))
         act.optimize()
         if trans:
-            # Marginalize the transients in the presence of the priors.
             aa, bb, G, Om = act.marginalize_relative(trans, [a, b],
                                                      fix_scales=True)
             priors.append((aa, bb, G, Om))
         for nd in nodes:
-            if nd != boundary:  # keep the frozen boundary pinned
-                est_pose[nd] = act.get_pose(nd)
+            est_pose[nd] = act.get_pose(nd)
+        # Marginalize a held keyframe once its blanket is fully active and no
+        # existing prior still refers to it.
+        referenced = {nd for (ids, *_r) in node_priors for nd in ids}
+        for E in sorted(held):
+            if E in referenced or E not in act.pose_ids:
+                continue
+            nbr = set()
+            for (i, j, *_r) in act.edges:
+                if i == E:
+                    nbr.add(j)
+                elif j == E:
+                    nbr.add(i)
+            for (ids, *_r) in act.prior_factors:
+                if E in ids:
+                    nbr |= (set(ids) - {E})
+            nbr = {x for x in nbr if x in node_set and x not in trans_set}
+            if nbr and nbr <= free_set:
+                keep_ids, H_r, b_r = act.marginalize_general([E], sorted(nbr))
+                node_priors.append((tuple(keep_ids), H_r, b_r,
+                                    [act.get_pose(k) for k in keep_ids]))
+                held.discard(E)
 
     if max_kf is None:
         red = new_window()
@@ -801,7 +847,7 @@ def main():
                     help="Fix loop_min_gap instead of searching it.")
     ap.add_argument("--fix-loop-min-inlier", type=float, default=None,
                     help="Fix loop_min_inlier instead of searching it.")
-    ap.add_argument("--matcher", default="numpy", choices=["numpy", "torch"],
+    ap.add_argument("--matcher", default="torch", choices=["numpy", "torch"],
                     help="Descriptor matcher backend. 'torch' is ~6x faster "
                          "and float32-equivalent (tuning only).")
     ap.add_argument("--sampler", default="tpe", choices=["tpe", "random"],
