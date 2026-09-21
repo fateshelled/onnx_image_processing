@@ -329,58 +329,74 @@ class OnlinePoseGraph:
             if nd in self._kf or nd == b:
                 self._est[nd] = act.get_pose(nd)
         # Marginalize a held keyframe once its blanket is fully active. The
-        # eliminated keyframe is recorded so it is never reintroduced.
-        referenced = {nd for (ids, *_r) in self._node_priors for nd in ids
-                      if nd not in self._eliminated}
-        n_npri = len(self._node_priors)  # priors assembled into `act` above
+        # marginal is computed over E's own incident subgraph only (not the
+        # whole window), and replaces exactly the factors incident to E, so
+        # neither boundary factors (e.g. prev--prevprev) nor separator-internal
+        # factors are double counted or lost.
+        new_npri = []
+        remove_pri_ids, remove_loop_ids, remove_npri_ids = set(), set(), set()
         for E in sorted(held):
             if E in self._eliminated or E not in act.pose_ids:
                 continue
-            if E in referenced:
+            # Factors incident to E. Those actually present in the current
+            # solve (both endpoints live) supply the marginal; all of them are
+            # removed because a factor with an eliminated endpoint can never be
+            # applied again.
+            inc_pri_all = [pr for pr in self._priors[:n_pri]
+                           if E in (pr[0], pr[1])]
+            inc_loop_all = [lp for lp in self._loops if E in (lp[0], lp[1])]
+            inc_npri_all = [npr for npr in self._node_priors if E in npr[0]]
+            if not (inc_pri_all or inc_loop_all or inc_npri_all):
                 continue
+            inc_pri = [pr for pr in inc_pri_all
+                       if pr[0] in node_set and pr[1] in node_set]
+            inc_loop = [lp for lp in inc_loop_all
+                        if lp[0] in node_set and lp[1] in node_set]
+            inc_npri = [npr for npr in inc_npri_all
+                        if all(nd in node_set for nd in npr[0])]
             nbr = set()
-            for (i, j, *_r) in act.edges:
-                if i == E:
-                    nbr.add(j)
-                elif j == E:
-                    nbr.add(i)
-            for (ids, *_r) in act.prior_factors:
-                if E in ids:
-                    nbr |= (set(ids) - {E})
+            for (x, y, *_r) in inc_pri:
+                nbr.add(x if y == E else y)
+            for (la, lb, *_r) in inc_loop:
+                nbr.add(la if lb == E else lb)
+            for (ids, *_r) in inc_npri:
+                nbr |= set(ids)
+            nbr.discard(E)
             nbr = {x for x in nbr if x in node_set and x not in trans
                    and x not in self._eliminated}
             closure = set(nbr) | {E}
-            # A multi-node prior that only partially overlaps the closure
-            # cannot be represented by H_r alone (its outside part would be
-            # lost and its inside part counted twice), so defer elimination.
-            if any(set(ids) & closure and not set(ids) <= closure
-                   for (ids, *_r) in act.prior_factors):
+            # A multi-node prior that extends past the closure cannot be
+            # represented by a marginal over nbr alone: defer elimination.
+            if any(not set(ids) <= closure for (ids, *_r) in inc_npri_all):
                 continue
-            if nbr and nbr <= free_set:
-                keep_ids, H_r, b_r = act.marginalize_general([E], sorted(nbr))
-                self._node_priors.append(
-                    (tuple(keep_ids), H_r, b_r,
-                     [act.get_pose(k) for k in keep_ids]))
-                self._eliminated.add(E)
-                # Every factor fully inside the eliminated closure
-                # (nbr + {E}) was part of `act` and is therefore already
-                # contained in H_r: drop it so it is not applied again in later
-                # windows. Factors that were NOT assembled into `act` are
-                # excluded by index -- the transient prior appended just above
-                # (index >= n_pri) and node priors created in this same held
-                # loop (index >= n_npri) -- so they are never dropped.
-                closure = set(keep_ids) | {E}
-                self._priors = [
-                    pr for i, pr in enumerate(self._priors)
-                    if i >= n_pri
-                    or not (pr[0] in closure and pr[1] in closure)]
-                self._loops = [
-                    lp for lp in self._loops
-                    if not (lp[0] in closure and lp[1] in closure)]
-                self._node_priors = [
-                    npr for i, npr in enumerate(self._node_priors)
-                    if i >= n_npri
-                    or not set(npr[0]) <= closure]
+            if not nbr or not nbr <= free_set:
+                continue
+            sub = self._new_window()
+            for nd in sorted(closure):
+                sub.add_node(nd, act.get_pose(nd))
+            for (x, y, G, Om) in inc_pri:
+                sub.add_edge(x, y, G, omega=Om)
+            for (la, lb, R, t, sig) in inc_loop:
+                sub.add_edge(la, lb, self._meas(R, t), scale_free=True, **sig)
+            for (ids, H, bb, x0) in inc_npri:
+                sub.add_prior_factor(ids, H, bb, x0)
+            keep_ids, H_r, b_r = sub.marginalize_general([E], sorted(nbr))
+            new_npri.append((tuple(keep_ids), H_r, b_r,
+                             [act.get_pose(k) for k in keep_ids]))
+            self._eliminated.add(E)
+            remove_pri_ids |= {id(pr) for pr in inc_pri_all}
+            remove_loop_ids |= {id(lp) for lp in inc_loop_all}
+            remove_npri_ids |= {id(npr) for npr in inc_npri_all}
+        if remove_pri_ids:
+            self._priors = [pr for pr in self._priors
+                            if id(pr) not in remove_pri_ids]
+        if remove_loop_ids:
+            self._loops = [lp for lp in self._loops
+                           if id(lp) not in remove_loop_ids]
+        if remove_npri_ids:
+            self._node_priors = [npr for npr in self._node_priors
+                                 if id(npr) not in remove_npri_ids]
+        self._node_priors.extend(new_npri)
         # Prune priors/loops fully consumed by elimination so the per-window
         # scan stays proportional to the bounded active set, not to N.
         if self._eliminated:
@@ -416,7 +432,7 @@ class OnlinePoseGraph:
         need = max(1, int(self.p.get("loop_temporal_k", 1)))
         hits = []
         for a in self._kf[-window:]:
-            if a == b or b - a < min_gap or a in self._eliminated:
+            if a == b or b - a < min_gap:
                 continue
             # Detect against every keyframe in the window, not only the active
             # ones: a far loop endpoint may have left the bounded node set, in
@@ -472,14 +488,16 @@ class OnlinePoseGraph:
         """
         if not self.p.get("global_opt_on_loop", True) or len(self._kf) < 2:
             return
-        # Eliminated keyframes are represented only through their marginal
-        # priors, so they must not be re-added here (that would double count).
-        kfs = [k for k in self._kf if k not in self._eliminated and k in self._est]
+        kfs = [k for k in self._kf if k in self._est]
         if len(kfs) < 2:
             return
         act = self._new_window()
         for k in kfs:
-            act.add_node(k, self._est[k])
+            # Eliminated keyframes are already summarized by their marginal
+            # priors, so they are re-added as *fixed* landmarks only: this lets
+            # loop edges measured against them be applied without optimizing
+            # (and double counting) them again.
+            act.add_node(k, self._est[k], fixed=(k in self._eliminated))
         for (x, y, G, Om) in self._priors:
             if x in act.pose_ids and y in act.pose_ids:
                 act.add_edge(x, y, G, omega=Om)
@@ -491,7 +509,8 @@ class OnlinePoseGraph:
                 act.add_edge(a, b, self._meas(R, t), scale_free=True, **sig)
         act.optimize()
         for k in kfs:
-            self._est[k] = act.get_pose(k)
+            if k not in self._eliminated and k in act.pose_ids:
+                self._est[k] = act.get_pose(k)
 
     def _pose_of(self, fid):
         if fid in self._est:

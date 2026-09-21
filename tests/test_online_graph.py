@@ -61,7 +61,9 @@ def test_online_graph_node_set_is_bounded():
               "kf_trans_thresh": 0.0, "kf_rot_thresh": 0.0,
               "loop_iterations": 10, "step_scale_t": 0.1,
               "scale_prior_sigma": 2.0, "loop_window": 80,
-              "loop_min_gap": 30, "loop_min_inlier": 0.4, "nl_reg": True,
+              # Candidate keyframes must still be active for a loop to be
+              # usable under bounding, so keep the gap small.
+              "loop_min_gap": 8, "loop_min_inlier": 0.4, "nl_reg": True,
               "nl_reg_c": 10.0, "nl_reg_tau": 10.0, "nl_reg_length": 1.0}
     graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
     max_nodes = 0
