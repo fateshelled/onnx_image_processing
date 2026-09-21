@@ -353,6 +353,20 @@ class OnlinePoseGraph:
                     (tuple(keep_ids), H_r, b_r,
                      [act.get_pose(k) for k in keep_ids]))
                 self._eliminated.add(E)
+                # The marginal H_r already contains every factor incident to E
+                # and every factor living entirely inside the separator nbr.
+                # Drop those from the reduced graph so they are not applied a
+                # second time in later windows (avoids double counting).
+                ks = set(keep_ids)
+                self._priors = [pr for pr in self._priors
+                                if E not in (pr[0], pr[1])
+                                and not (pr[0] in ks and pr[1] in ks)]
+                self._loops = [lp for lp in self._loops
+                               if E not in (lp[0], lp[1])
+                               and not (lp[0] in ks and lp[1] in ks)]
+                self._node_priors = [self._node_priors[-1]] + [
+                    npr for npr in self._node_priors[:-1]
+                    if E not in npr[0] and not set(npr[0]) <= ks]
         # Prune priors/loops fully consumed by elimination so the per-window
         # scan stays proportional to the bounded active set, not to N.
         if self._eliminated:
