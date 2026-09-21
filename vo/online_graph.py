@@ -29,6 +29,7 @@ from __future__ import annotations
 import numpy as np
 
 from .loop_closure import confirmed_loop_hits, edge_key
+from .scale_kf import ScaleKF
 from .se3_window import SlidingWindowOptimizer
 
 # Default parameters for the online sequential graph (optuna-tuned seq_opt1).
@@ -40,6 +41,7 @@ DEFAULT_PARAMS = {
     "loop_temporal_k": 1, "loop_sigma_scale": 2.0,
     "scale_prior_sigma": 2.0, "step_scale_t": 0.1, "loop_iterations": 10,
     "tsvd_ratio": 0.0, "scale_kf": False,
+    "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
     "graph_mode": "kf_prior", "max_keyframes": 3, "seq_tsvd_ratio": 0.0,
     "nl_reg": True, "nl_reg_c": 10.0, "nl_reg_tau": 10.0, "nl_reg_length": 1.0,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
@@ -110,6 +112,13 @@ class OnlinePoseGraph:
         self._hits = []         # per-keyframe loop hits (temporal confirmation)
         self._added = set()     # edge_key set (odometry + accepted closures)
         self._loops = []        # accepted loop edges (a, b, R, t, sig)
+        # Kalman filter on the motion-normalised keyframe-spoke scale
+        # (unit-norm translation -> baseline). Sequential: each keyframe's
+        # spoke is recentred with the k_hat from the previous keyframes.
+        self._scale_kf = None
+        if params.get("scale_kf", False):
+            self._scale_kf = ScaleKF(params.get("scale_kf_q", 1e-3),
+                                     params.get("scale_kf_r", 0.1))
         self._pending_global = False  # a loop arrived; Tier-2 pass is owed
         self.n_loop = 0
         self.last_n_nodes = 0
@@ -295,11 +304,27 @@ class OnlinePoseGraph:
                 p = self._prev[v]
                 act.add_edge(p, v, self._meas(R, t), scale_free=True)
                 self._added.add(edge_key(p, v))
+        kf_spoke = None  # (act edge index, odometry baseline) for the new KF
         for v in trans + [b]:
             if v in self._spoke:
                 ref, R, t, _inl, _n = self._spoke[v]
                 if ref in node_set and ref != self._prev.get(v):
-                    act.add_edge(ref, v, self._meas(R, t), scale_free=True)
+                    kwargs, m = {}, None
+                    if v == b and self._scale_kf is not None:
+                        # Unit-norm spoke translation -> baseline m: recentre
+                        # its scale prior at log(k_hat * m) (Kalman filter).
+                        m = float(np.linalg.norm(
+                            self._T[b][:3, 3] - self._T[ref][:3, 3]))
+                        sig = float(self.p.get("scale_kf_sigma", 0.5))
+                        if (m > 1e-9 and sig > 0.0
+                                and self._scale_kf.k is not None):
+                            kwargs["scale_prior_mean"] = float(
+                                np.log(max(self._scale_kf.k * m, 1e-6)))
+                            kwargs["scale_prior_sigma"] = sig
+                    act.add_edge(ref, v, self._meas(R, t),
+                                 scale_free=True, **kwargs)
+                    if v == b and m is not None and m > 1e-9:
+                        kf_spoke = (len(act.edges) - 1, m)
                     self._added.add(edge_key(ref, v))
         self._add_loops(b)
         # Re-inject every accepted loop edge whose endpoints are both active,
@@ -325,6 +350,12 @@ class OnlinePoseGraph:
                                       self.p.get("nl_reg_tau", 10.0),
                                       self.p.get("nl_reg_length", 1.0))
         act.optimize()
+        # Kalman-filter update from the optimised spoke scale (z = s / m). The
+        # filtered k_hat recentres the next keyframe's spoke scale prior.
+        if (kf_spoke is not None
+                and act.scale_col[kf_spoke[0]] is not None):
+            self._scale_kf.update(
+                float(act.edge_scale[kf_spoke[0]]) / kf_spoke[1])
         # NL-Reg is a solver-only regularizer: remove it before marginalizing so
         # it is neither counted as a blanket edge nor baked into the prior.
         if nl_reg:

@@ -77,6 +77,33 @@ def test_online_graph_node_set_is_bounded():
     assert max_nodes < 40, f"node set not bounded: {max_nodes}"
 
 
+def test_scale_kf_path_runs_and_zero_sigma_is_safe():
+    """The Kalman-filter scale path must run and not divide by zero."""
+    from vo.online_graph import DEFAULT_PARAMS
+    for sigma in (0.5, 0.0):
+        rng = np.random.default_rng(3)
+        N = 80
+        gt = [np.eye(4)]
+        for _ in range(N - 1):
+            gt.append(gt[-1] @ se3_exp(rng.normal(size=6) * 0.08))
+
+        def match_fn(a, b):
+            R, t = _relative(gt[a], gt[b])
+            return {"ok": True, "R": R, "t": t, "inlier_ratio": 1.0,
+                    "n_matches": 300}
+
+        params = dict(DEFAULT_PARAMS)
+        params.update(scale_kf=True, scale_kf_sigma=sigma, kf_max_gap=5,
+                      kf_min_gap=4, nl_reg=True, max_keyframes=3)
+        graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
+        for k in range(N):
+            T = graph.add_frame(k)
+            assert np.isfinite(T).all()
+        assert graph._scale_kf is not None
+        assert graph._scale_kf.k is not None and np.isfinite(graph._scale_kf.k)
+        assert graph._scale_kf.k > 0.0
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

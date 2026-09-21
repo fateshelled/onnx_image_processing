@@ -107,6 +107,7 @@ class SlidingWindowOptimizer:
         self.prior_factors: list[tuple] = []
         # Parallel bookkeeping for per-edge scale.
         self.edge_scale: list[float] = []
+        self.edge_scale_sigma: list[float] = []  # per-edge scale-prior width
         self.scale_col: list[int | None] = []  # None = fixed / gauge
         self.scale_prior_mean: list[float] = []  # prior mean of log(scale)
         self.n_scale: int = 0
@@ -138,6 +139,7 @@ class SlidingWindowOptimizer:
         scale: float = 1.0,
         scale_prior_mean: float = 0.0,
         omega: np.ndarray | None = None,
+        scale_prior_sigma: float | None = None,
     ) -> None:
         if i not in self.T or j not in self.T:
             raise KeyError("edge endpoints must be live nodes in the window")
@@ -162,6 +164,10 @@ class SlidingWindowOptimizer:
             s = 1.0
         self.edge_scale.append(s)
         self.scale_prior_mean.append(float(scale_prior_mean))
+        # Per-edge scale-prior width (None -> the window default).
+        self.edge_scale_sigma.append(
+            self.scale_prior_sigma if scale_prior_sigma is None
+            else float(scale_prior_sigma))
         col = None
         if self.optimize_scale and scale_free:
             if self.gauge_edge is None:
@@ -252,6 +258,8 @@ class SlidingWindowOptimizer:
             self.edges = [self.edges[k] for k in keep]
             self.edge_whiten = [self.edge_whiten[k] for k in keep]
             self.edge_scale = [self.edge_scale[k] for k in keep]
+            self.edge_scale_sigma = [self.edge_scale_sigma[k] for k in keep]
+            self.scale_prior_mean = [self.scale_prior_mean[k] for k in keep]
             cols = [self.scale_col[k] for k in keep]
             self.scale_col = []
             self.n_scale = 0
@@ -274,9 +282,12 @@ class SlidingWindowOptimizer:
         return Ms
 
     def _n_prior(self) -> int:
-        if self.optimize_scale and self.scale_prior_sigma > 0.0:
-            return self.n_scale
-        return 0
+        # Only edges whose per-edge scale-prior width is positive contribute a
+        # row (a 0 width means "no scale prior for this edge").
+        if not self.optimize_scale:
+            return 0
+        return sum(1 for c, s in zip(self.scale_col, self.edge_scale_sigma)
+                   if c is not None and s > 0.0)
 
     def _residuals(self) -> np.ndarray:
         """Scaled residual vector; edge rows then scale-prior rows."""
@@ -292,8 +303,9 @@ class SlidingWindowOptimizer:
             pri = [
                 np.array([(np.log(max(self.edge_scale[e], 1e-12))
                            - self.scale_prior_mean[e])
-                          / self.scale_prior_sigma])
-                for e, c in enumerate(self.scale_col) if c is not None
+                          / self.edge_scale_sigma[e]])
+                for e, c in enumerate(self.scale_col)
+                if c is not None and self.edge_scale_sigma[e] > 0.0
             ]
             r = np.concatenate([r] + pri)
         for fac in self.prior_factors:
@@ -429,10 +441,10 @@ class SlidingWindowOptimizer:
         if self._n_prior():
             base = 6 * len(self.edges)
             for e, c in enumerate(self.scale_col):
-                if c is not None:
+                if c is not None and self.edge_scale_sigma[e] > 0.0:
                     rows.append(base)
                     cols.append(6 * n + c)
-                    vals.append(1.0 / self.scale_prior_sigma)
+                    vals.append(1.0 / self.edge_scale_sigma[e])
                     base += 1
         base = 6 * len(self.edges) + self._n_prior()
         for (ids, L, mu, _x0) in self.prior_factors:
@@ -678,8 +690,11 @@ class SlidingWindowOptimizer:
                     elif use_sparse:
                         dxred = self._solve_sparse(Hred, -gred, lam)
                     else:
+                        # Hf = Hred + lam*I is symmetric positive definite, so
+                        # use a Cholesky-based solve (much faster than the
+                        # default general LU for the dense window).
                         Hf = Hred + np.eye(ncol) * lam
-                        dxred = sla.solve(Hf, -gred)
+                        dxred = sla.solve(Hf, -gred, assume_a="pos")
                 except (np.linalg.LinAlgError, RuntimeError):
                     lam *= 10.0
                     if lam > 1e7:

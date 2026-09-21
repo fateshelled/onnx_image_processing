@@ -22,6 +22,42 @@ def rand_T(rng, max_t=1.0, max_rot=0.5):
     return T
 
 
+class TestPerEdgeScalePriorSigma:
+    def test_per_edge_sigma_and_zero_sigma_safe(self):
+        rng = np.random.default_rng(7)
+        T = [rand_T(rng) for _ in range(4)]
+        opt = SlidingWindowOptimizer(window_size=None, max_iterations=5,
+                                     optimize_scale=True, scale_prior_sigma=2.0)
+        for i, Ti in enumerate(T):
+            opt.add_node(i, Ti)
+        # edge 0-1 becomes the gauge; edge 1-2 has sigma 0 (no prior row);
+        # edge 2-3 uses a tight per-edge sigma.
+        opt.add_edge(0, 1, rand_T(rng), scale_free=True)
+        opt.add_edge(1, 2, rand_T(rng), scale_free=True,
+                     scale_prior_mean=float(np.log(3.0)), scale_prior_sigma=0.0)
+        opt.add_edge(2, 3, rand_T(rng), scale_free=True,
+                     scale_prior_mean=float(np.log(3.0)), scale_prior_sigma=0.1)
+        assert opt.edge_scale_sigma == [2.0, 0.0, 0.1]
+        # Only the sigma>0 non-gauge edge contributes a scale-prior row.
+        assert opt._n_prior() == 1
+        opt.optimize()  # must not raise ZeroDivisionError
+        assert all(np.isfinite(s) for s in opt.edge_scale)
+
+    def test_drop_oldest_keeps_lists_in_sync(self):
+        rng = np.random.default_rng(8)
+        T = [rand_T(rng) for _ in range(4)]
+        opt = SlidingWindowOptimizer(window_size=3, optimize_scale=True,
+                                     scale_prior_sigma=2.0)
+        for i in range(3):
+            opt.add_node(i, T[i])
+        opt.add_edge(0, 1, rand_T(rng), scale_free=True)
+        opt.add_edge(1, 2, rand_T(rng), scale_free=True)
+        opt.add_node(3, T[3])  # drops node 0 and the edge (0,1)
+        opt.add_edge(2, 3, rand_T(rng), scale_free=True)
+        assert len(opt.edge_scale) == len(opt.edge_scale_sigma) \
+            == len(opt.scale_prior_mean) == len(opt.edges)
+
+
 class TestSe3:
     def test_exp_log_roundtrip(self):
         rng = np.random.default_rng(0)
