@@ -317,6 +317,7 @@ class OnlinePoseGraph:
         # it is neither counted as a blanket edge nor baked into the prior.
         if nl_reg:
             act.pop_last_prior_factor()
+        n_pri = len(self._priors)  # factors assembled into `act` above
         if trans:
             aa, bb2, G, Om = act.marginalize_relative(trans, [a, b],
                                                       fix_scales=True)
@@ -331,6 +332,7 @@ class OnlinePoseGraph:
         # eliminated keyframe is recorded so it is never reintroduced.
         referenced = {nd for (ids, *_r) in self._node_priors for nd in ids
                       if nd not in self._eliminated}
+        n_npri = len(self._node_priors)  # priors assembled into `act` above
         for E in sorted(held):
             if E in self._eliminated or E not in act.pose_ids:
                 continue
@@ -347,26 +349,38 @@ class OnlinePoseGraph:
                     nbr |= (set(ids) - {E})
             nbr = {x for x in nbr if x in node_set and x not in trans
                    and x not in self._eliminated}
+            closure = set(nbr) | {E}
+            # A multi-node prior that only partially overlaps the closure
+            # cannot be represented by H_r alone (its outside part would be
+            # lost and its inside part counted twice), so defer elimination.
+            if any(set(ids) & closure and not set(ids) <= closure
+                   for (ids, *_r) in act.prior_factors):
+                continue
             if nbr and nbr <= free_set:
                 keep_ids, H_r, b_r = act.marginalize_general([E], sorted(nbr))
                 self._node_priors.append(
                     (tuple(keep_ids), H_r, b_r,
                      [act.get_pose(k) for k in keep_ids]))
                 self._eliminated.add(E)
-                # The marginal H_r already contains every factor incident to E
-                # and every factor living entirely inside the separator nbr.
-                # Drop those from the reduced graph so they are not applied a
-                # second time in later windows (avoids double counting).
-                ks = set(keep_ids)
-                self._priors = [pr for pr in self._priors
-                                if E not in (pr[0], pr[1])
-                                and not (pr[0] in ks and pr[1] in ks)]
-                self._loops = [lp for lp in self._loops
-                               if E not in (lp[0], lp[1])
-                               and not (lp[0] in ks and lp[1] in ks)]
-                self._node_priors = [self._node_priors[-1]] + [
-                    npr for npr in self._node_priors[:-1]
-                    if E not in npr[0] and not set(npr[0]) <= ks]
+                # Every factor fully inside the eliminated closure
+                # (nbr + {E}) was part of `act` and is therefore already
+                # contained in H_r: drop it so it is not applied again in later
+                # windows. Factors that were NOT assembled into `act` are
+                # excluded by index -- the transient prior appended just above
+                # (index >= n_pri) and node priors created in this same held
+                # loop (index >= n_npri) -- so they are never dropped.
+                closure = set(keep_ids) | {E}
+                self._priors = [
+                    pr for i, pr in enumerate(self._priors)
+                    if i >= n_pri
+                    or not (pr[0] in closure and pr[1] in closure)]
+                self._loops = [
+                    lp for lp in self._loops
+                    if not (lp[0] in closure and lp[1] in closure)]
+                self._node_priors = [
+                    npr for i, npr in enumerate(self._node_priors)
+                    if i >= n_npri
+                    or not set(npr[0]) <= closure]
         # Prune priors/loops fully consumed by elimination so the per-window
         # scan stays proportional to the bounded active set, not to N.
         if self._eliminated:
