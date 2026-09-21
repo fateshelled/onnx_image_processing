@@ -78,6 +78,8 @@ def decode(raw):
                                else int(params["max_keyframes"]))
     params["held_cap"] = (None if params["held_cap"] in ("auto", "none")
                           else int(params["held_cap"]))
+    if "scale_kf" in params:
+        params["scale_kf"] = bool(params["scale_kf"])
     return params
 
 
@@ -89,7 +91,15 @@ ap.add_argument("--storage",
                 default=str(REPO / "eval/results/tune_online_optuna.db"))
 ap.add_argument("--study-name", default="online_bounded")
 ap.add_argument("--out", default=str(REPO / "eval/results/tune_online.json"))
+ap.add_argument("--with-scale-kf", action="store_true",
+                help="also search the sequential Kalman-filter (scale_kf) knobs")
 args = ap.parse_args()
+
+if args.with_scale_kf:
+    # The Kalman filter replaced the previous fixed scale_kf=False assumption
+    # (commit 8075067), so expose it (and its prior sigma, only when on) to the
+    # search. Kept out of SPACE because sigma is conditional on scale_kf.
+    FIXED.pop("scale_kf", None)
 
 seqs = [s for s in args.seq.split(",") if s]
 matcher = TorchSinkhornMatcher(iterations=20, epsilon=0.05,
@@ -115,6 +125,11 @@ study = optuna.create_study(
 def objective(trial):
     raw = {name: trial.suggest_categorical(name, levels)
            for name, levels in SPACE.items()}
+    if args.with_scale_kf:
+        raw["scale_kf"] = trial.suggest_categorical("scale_kf", [0, 1])
+        if raw["scale_kf"]:
+            raw["scale_kf_sigma"] = trial.suggest_categorical(
+                "scale_kf_sigma", [0.3, 0.5, 1.0])
     params = decode(raw)
     per, meta = {}, {}
     t0 = time.time()
@@ -136,7 +151,10 @@ def objective(trial):
           f"worst={worst:.4f} "
           + " ".join(f"{s}={per[s]:.3f}" for s in seqs)
           + f" [kf={raw['max_keyframes']} held={raw['held_cap']} "
-          f"gop={raw['global_opt_period']}]", flush=True)
+          f"gop={raw['global_opt_period']}"
+          + (f" skf={raw['scale_kf']}/{raw.get('scale_kf_sigma', '-')}"
+             if "scale_kf" in raw else "")
+          + "]", flush=True)
     return score
 
 
