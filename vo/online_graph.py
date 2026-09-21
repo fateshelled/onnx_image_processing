@@ -32,22 +32,26 @@ from .loop_closure import confirmed_loop_hits, edge_key
 from .scale_kf import ScaleKF
 from .se3_window import SlidingWindowOptimizer
 
-# Default parameters for the online sequential graph (optuna-tuned seq_opt1).
+# Default parameters for the online sequential graph. Adopted from the
+# 200-trial optuna study "online_bounded_kf" (best trial 174, mean+worst
+# ATE 0.5245 on desk/desk2/room; a near-tie with trials 119/121/122 at
+# 0.5247). Some values sit on the search-grid boundary (kf_max_gap=8,
+# max_keyframes=12) and may improve further with a wider grid.
 DEFAULT_PARAMS = {
     "odom_ref": "kf", "kf_mode": "motion", "keyframe_decim": 15,
-    "kf_trans_thresh": 8.0, "kf_rot_thresh": 10.0, "kf_max_gap": 16,
-    "kf_local_map_k": 1, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
-    "loop_window": 80, "loop_min_gap": 30, "loop_min_inlier": 0.4,
-    "loop_temporal_k": 1, "loop_sigma_scale": 2.0,
-    "scale_prior_sigma": 2.0, "step_scale_t": 0.1, "loop_iterations": 10,
+    "kf_trans_thresh": 4.0, "kf_rot_thresh": 30.0, "kf_max_gap": 8,
+    "kf_local_map_k": 2, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
+    "loop_window": 60, "loop_min_gap": 20, "loop_min_inlier": 0.5,
+    "loop_temporal_k": 2, "loop_sigma_scale": 1.0,
+    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 10,
     "tsvd_ratio": 0.0, "scale_kf": False,
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
-    "graph_mode": "kf_prior", "max_keyframes": 3, "seq_tsvd_ratio": 0.0,
-    "nl_reg": True, "nl_reg_c": 10.0, "nl_reg_tau": 10.0, "nl_reg_length": 1.0,
+    "graph_mode": "kf_prior", "max_keyframes": 12, "seq_tsvd_ratio": 0.0,
+    "nl_reg": True, "nl_reg_c": 10.0, "nl_reg_tau": 30.0, "nl_reg_length": 0.5,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
-    "held_cap": None, "global_opt_on_loop": True, "global_opt_period": 0,
+    "held_cap": 4, "global_opt_on_loop": True, "global_opt_period": 10,
 }
 
 
