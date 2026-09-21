@@ -131,8 +131,18 @@ class OnlinePoseGraph:
 
     @property
     def keyframes(self):
-        """Current keyframe ids (for callers that cache per-frame features)."""
+        """All keyframe ids seen so far (including eliminated ones)."""
         return list(self._kf)
+
+    @property
+    def match_keyframes(self):
+        """Keyframes the loop matcher may query (recent ``loop_window`` only).
+
+        Callers that cache per-frame features can prune to this set; it stays
+        bounded even though ``keyframes`` grows with the sequence.
+        """
+        w = int(self.p.get("loop_window", 80))
+        return list(self._kf) if w <= 0 else self._kf[-w:]
 
     def add_frame(self, idx, odom=None):
         """Process one frame ``idx`` and return its camera-to-world 4x4 pose.
@@ -367,7 +377,9 @@ class OnlinePoseGraph:
             closure = set(nbr) | {E}
             # A multi-node prior that extends past the closure cannot be
             # represented by a marginal over nbr alone: defer elimination.
-            if any(not set(ids) <= closure for (ids, *_r) in inc_npri_all):
+            # Pairwise/loop factors whose far endpoint already left the window
+            # (eliminated or dropped) are dead, so they are simply removed.
+            if any(not set(npr[0]) <= closure for npr in inc_npri_all):
                 continue
             if not nbr or not nbr <= free_set:
                 continue
@@ -444,9 +456,12 @@ class OnlinePoseGraph:
                              float(r.get("inlier_ratio", 0.0)),
                              int(r.get("n_matches", -1))))
         bi = len(self._kf)  # index of the new keyframe
-        while len(self._hits) < bi:
-            self._hits.append([])
-        self._hits.append(hits)
+        if need > 1:
+            # Only the temporal-consistency gate needs the per-keyframe hit
+            # history; skip storing it (it would grow O(N)) when disabled.
+            while len(self._hits) < bi:
+                self._hits.append([])
+            self._hits.append(hits)
         gaps = [self._kf[i + 1] - self._kf[i] for i in range(len(self._kf) - 1)]
         gaps.append(b - self._kf[-1])
         kf_step = max(gaps) if gaps else self._step

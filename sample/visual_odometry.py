@@ -217,8 +217,8 @@ def run_visual_odometry(session, reader, camera_intrinsics, model_height,
         T = graph.add_frame(idx)
         trajectory.add_pose(T)
 
-        # Keep only keyframes + the most recent frames in the image cache.
-        keep = set(graph.keyframes) | {idx - 1, idx}
+        # Keep only the keyframes the matcher may still query + recent frames.
+        keep = set(graph.match_keyframes) | {idx - 1, idx}
         for k in [k for k in images if k not in keep]:
             images.pop(k, None)
 

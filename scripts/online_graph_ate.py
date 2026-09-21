@@ -88,7 +88,7 @@ for k in range(0, len(rgb_rows), args.stride):
         continue
     images[idx] = cv2.resize(img, (w, h)).astype(np.float32)[None, None]
     T = graph.add_frame(idx)
-    keep = set(graph.keyframes) | {idx - 1, idx}
+    keep = set(graph.match_keyframes) | {idx - 1, idx}
     for m in [m for m in images if m not in keep]:
         images.pop(m, None)
     est.append(T[:3, 3])
