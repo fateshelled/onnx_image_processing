@@ -189,6 +189,17 @@ class SlidingWindowOptimizer:
         x0 = [np.asarray(p, float).copy() for p in x0]
         self.prior_factors.append((ids, L, mu, x0))
 
+    def pop_last_prior_factor(self) -> bool:
+        """Remove the most recently added prior factor (e.g. NL-Reg).
+
+        Used so a temporary regularizer is not baked into a marginalization
+        prior. Returns True when a factor was removed.
+        """
+        if not self.prior_factors:
+            return False
+        self.prior_factors.pop()
+        return True
+
     def add_nl_regularization(self, strength=1.0, tau=1.0, length=1.0):
         """Direction-dependent Tikhonov (NL-Reg) anchored to the current poses.
 

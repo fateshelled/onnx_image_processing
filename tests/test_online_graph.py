@@ -44,6 +44,37 @@ def test_online_graph_tracks_ground_truth():
     assert max(err) < 0.2, f"max position error {max(err):.3f}"
 
 
+def test_online_graph_node_set_is_bounded():
+    """The active node set must not grow with the sequence length."""
+    rng = np.random.default_rng(1)
+    N = 240
+    gt = [np.eye(4)]
+    for _ in range(N - 1):
+        gt.append(gt[-1] @ se3_exp(rng.normal(size=6) * 0.08))
+
+    def match_fn(a, b):
+        R, t = _relative(gt[a], gt[b])
+        return {"ok": True, "R": R, "t": t, "inlier_ratio": 1.0,
+                "n_matches": 300}
+
+    params = {"kf_max_gap": 5, "kf_min_gap": 4, "max_keyframes": 3,
+              "kf_trans_thresh": 0.0, "kf_rot_thresh": 0.0,
+              "loop_iterations": 10, "step_scale_t": 0.1,
+              "scale_prior_sigma": 2.0, "loop_window": 80,
+              "loop_min_gap": 30, "loop_min_inlier": 0.4, "nl_reg": True,
+              "nl_reg_c": 10.0, "nl_reg_tau": 10.0, "nl_reg_length": 1.0}
+    graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
+    max_nodes = 0
+    for k in range(N):
+        graph.add_frame(k)
+        max_nodes = max(max_nodes, graph.last_n_nodes)
+    assert graph.n_kf > 20
+    assert graph.n_loop > 0
+    # Bounded: with max_keyframes=3 / held_cap=6 the node set stays small and
+    # does not grow with N.
+    assert max_nodes < 40, f"node set not bounded: {max_nodes}"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

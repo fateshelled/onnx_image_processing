@@ -1,40 +1,18 @@
 #!/usr/bin/env python3
-"""
-Visual Odometry sample using ONNX feature matching model.
+"""Visual odometry sample: ONNX matcher + the shared online pose graph.
 
-Estimates camera trajectory from a video or image sequence.  Two model types
-are supported and detected automatically from the number of model outputs:
+The whole pose-graph logic lives in :mod:`vo.online_graph` (the same code the
+offline evaluator drives), so this script only wires the pieces together:
 
-  3-output model (keypoints1, keypoints2, matching_probs):
-      Shi-Tomasi + Angle + Sparse BAD + Sinkhorn
-      Pose estimation is performed with OpenCV RANSAC (findEssentialMat).
+* a frame source (video / image directory / camera),
+* the ONNX matching model,
+* an index-based ``match_fn(i, j)`` backed by a small frame-image cache,
+* trajectory output (npz / plot) and optional live display.
 
-  4-output model (keypoints1, keypoints2, matching_probs, E):
-      Shi-Tomasi + Angle + Sparse BAD + Sinkhorn + Essential Matrix
-      The Essential Matrix is estimated inside the ONNX model using the
-      weighted 8-point algorithm.  Pose recovery (recoverPose) is called
-      directly with the ONNX-provided E, skipping RANSAC.
-
-Usage:
-    # Export the 3-output model:
-    python onnx_export/export_shi_tomasi_angle_sparse_bad_sinkhorn.py -o matcher.onnx -H 480 -W 640 --max-keypoints 512
-
-    # Export the 4-output combined model (Essential Matrix baked in):
-    python onnx_export/export_shi_tomasi_angle_sparse_bad_sinkhorn_essential_matrix.py \\
-        -o matcher_e.onnx -H 480 -W 640 --max-keypoints 512 \\
-        --fx 525 --fy 525 --cx 320 --cy 240
-
-    # Run VO on video:
-    python sample/visual_odometry.py --model matcher.onnx --video video.mp4 --fx 525 --fy 525 --cx 320 --cy 240
-
-    # Run VO on image sequence:
-    python sample/visual_odometry.py --model matcher.onnx --image-dir frames/ --fx 525 --fy 525 --cx 320 --cy 240
-
-    # Run VO on webcam:
-    python sample/visual_odometry.py --model matcher.onnx --camera 0 --fx 525 --fy 525 --cx 320 --cy 240 --display
-
-    # Save trajectory and visualization:
-    python sample/visual_odometry.py --model matcher.onnx --video video.mp4 --fx 525 --fy 525 --cx 320 --cy 240 --save-trajectory trajectory.npz --save-plot trajectory.png
+The graph requests every match itself (odometry chain, keyframe spokes, loop
+closures); the sample never decides graph structure. Use ``--skip-frames`` to
+keep a usable baseline between nodes (consecutive frames are often degenerate
+for a monocular Essential-matrix solve).
 """
 
 import argparse
@@ -50,472 +28,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import onnxruntime as ort
 
-# Add parent directory to path to import modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from vo import (
-    CameraIntrinsics,
-    estimate_pose_ransac,
-    Trajectory,
-    create_camera,
-)
-from vo.online_graph import DEFAULT_PARAMS as GRAPH_DEFAULTS, OnlinePoseGraph
-from vo.onnx_matcher import OnnxSessionMatcher
-from provider_utils import create_session
+from vo import CameraIntrinsics, Trajectory, create_camera  # noqa: E402
+from vo.online_graph import DEFAULT_PARAMS, OnlinePoseGraph  # noqa: E402
+from vo.onnx_matcher import OnnxSessionMatcher  # noqa: E402
+from provider_utils import create_session  # noqa: E402
 
 
-def load_image_from_array(
-    image: np.ndarray,
-    height: int,
-    width: int,
-) -> np.ndarray:
-    """
-    Convert an image array to model input format.
-
-    Args:
-        image: Input image array (H, W, 3) or (H, W)
-        height: Target height
-        width: Target width
-
-    Returns:
-        Grayscale image array of shape (1, 1, H, W) with values in [0, 255]
-    """
-    # Convert to grayscale if needed
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image
-
-    # Resize
+def load_image(frame: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Convert an image to model input: (1, 1, H, W) grayscale in [0, 255]."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
     resized = cv2.resize(gray, (width, height), interpolation=cv2.INTER_LINEAR)
-
-    # Convert to float32 and add batch/channel dimensions
-    arr = resized.astype(np.float32)
-    return arr[np.newaxis, np.newaxis, :, :]
+    return resized.astype(np.float32)[np.newaxis, np.newaxis, :, :]
 
 
-def estimate_pose_from_essential_matrix(
-    keypoints1: np.ndarray,
-    keypoints2: np.ndarray,
-    E: np.ndarray,
-    camera_intrinsics,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray]:
-    """
-    Recover camera pose from a pre-computed Essential Matrix.
-
-    Used with the 4-output combined ONNX model
-    (Shi-Tomasi + Angle + Sparse BAD + Sinkhorn + Essential Matrix), which
-    embeds Essential Matrix estimation inside the ONNX graph.  Unlike the
-    RANSAC-based ``estimate_pose_ransac``, this function skips
-    ``findEssentialMat`` and calls ``recoverPose`` directly with the
-    ONNX-provided E.
-
-    Args:
-        keypoints1: Matched keypoints in image 1, shape (N, 2) as (y, x).
-        keypoints2: Matched keypoints in image 2, shape (N, 2) as (y, x).
-        E: Essential Matrix from the ONNX model, shape (3, 3).
-        camera_intrinsics: Camera intrinsic parameters (CameraIntrinsics).
-
-    Returns:
-        Tuple of:
-            - R: Rotation matrix (3, 3) or None if recovery failed.
-            - t: Translation vector (3, 1) or None if recovery failed.
-            - inlier_mask: Boolean mask of chirality-passing points (N,).
-    """
-    if len(keypoints1) < 5:
-        return None, None, np.zeros(len(keypoints1), dtype=bool)
-
-    # Convert from (y, x) to (x, y) as required by OpenCV
-    pts1 = keypoints1[:, [1, 0]].astype(np.float64)
-    pts2 = keypoints2[:, [1, 0]].astype(np.float64)
-
-    E_f64 = E.astype(np.float64)
-
-    num_inliers, R, t, pose_mask = cv2.recoverPose(
-        E_f64,
-        pts1,
-        pts2,
-        camera_intrinsics.K,
-    )
-
-    if num_inliers < 5:
-        return None, None, np.zeros(len(keypoints1), dtype=bool)
-
-    inlier_mask = pose_mask.ravel() > 0
-    return R, t, inlier_mask
-
-
-def _remap_pose_mask(
-    pose_map: np.ndarray,
-    pose_mask: np.ndarray,
-    num_matches: int,
-) -> np.ndarray:
-    """
-    Map a chirality mask computed on the permissive pose set back to the
-    top-N match set, using the index mapping returned by ``extract_matches``.
-
-    Args:
-        pose_map: For each top-N match, the index of its counterpart in the
-            pose set, or -1 if it is not part of the pose set. Shape (N,).
-        pose_mask: Chirality mask over the pose set, shape (M,).
-        num_matches: Number of top-N matches (N).
-
-    Returns:
-        Boolean inlier mask over the top-N match set, shape (N,).
-    """
-    inlier_mask = np.zeros(num_matches, dtype=bool)
-    pose_map = np.asarray(pose_map, dtype=np.int64)
-    passing = np.asarray(pose_mask).ravel() > 0
-    mapped = pose_map >= 0
-    inlier_mask[mapped] = passing[pose_map[mapped]]
-    return inlier_mask
-
-
-def extract_matches(
-    matching_probs: np.ndarray,
-    keypoints1: np.ndarray,
-    keypoints2: np.ndarray,
-    threshold: float = 0.1,
-    max_matches: int = 100,
-    pose_recovery_threshold: float | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Extract mutual nearest-neighbor matches from Sinkhorn probability matrix.
-
-    Args:
-        matching_probs: Sinkhorn probability matrix of shape (1, K+1, K+1)
-        keypoints1: Keypoints in image1 of shape (1, K, 2) as (y, x)
-        keypoints2: Keypoints in image2 of shape (1, K, 2) as (y, x)
-        threshold: Minimum match probability
-        max_matches: Maximum number of matches (after threshold + sorting)
-        pose_recovery_threshold: If set, additionally return a larger,
-            more permissive match set for pose recovery (recoverPose).
-            These are mutual-NN matches above ``pose_recovery_threshold``
-            (no top-N cut, applied *before* ``threshold`` filtering).
-            Used with the 4-output model so that the chirality/sign check
-            in recoverPose sees a point set consistent with the
-            ONNX-internal weighted 8-point estimate, which uses all
-            keypoints weighted by Sinkhorn probabilities. Reduces sign
-            flips (reverse-direction tracking) on low-texture/parallel
-            motion scenes.
-            Must be ``<=`` ``threshold``; otherwise a ``ValueError`` is
-            raised. Pad keypoints (``(-1, -1)``, from ``select_topk_keypoints``)
-            are excluded from the pose set.
-
-    Returns:
-        Tuple of:
-            - matched_kpts1: (N, 2) matched keypoint coordinates in image1
-            - matched_kpts2: (N, 2) matched keypoint coordinates in image2
-            - match_scores: (N,) match probability scores
-            - pose_kpts1: (M, 2) permissive match set for pose recovery
-              (same as matched_kpts1 when pose_recovery_threshold is None)
-            - pose_kpts2: (M, 2) permissive match set for pose recovery
-            - pose_map: (N,) index into the pose set for each top-N match,
-              or -1 if that match is not part of the pose set. Gives
-              consistent index-based correspondence for remapping masks
-              computed on the pose set back to the top-N match set.
-    """
-    P = matching_probs[0]  # (K+1, K+1)
-    kpts1 = keypoints1[0]  # (K, 2)
-    kpts2 = keypoints2[0]  # (K, 2)
-
-    K = kpts1.shape[0]
-
-    # Core probability matrix excluding dustbin
-    P_core = P[:K, :K]  # (K, K)
-
-    # Mutual nearest neighbors
-    max_j_for_i = np.argmax(P_core, axis=1)
-    max_i_for_j = np.argmax(P_core, axis=0)
-
-    # Check mutual consistency (vectorized)
-    mutual_mask = np.arange(K) == max_i_for_j[max_j_for_i]
-
-    # Get match probabilities (pre-threshold: the permissive pose set below
-    # must be built from this broad population, before threshold + top-N cut)
-    match_indices_i = np.where(mutual_mask)[0]
-    match_indices_j = max_j_for_i[match_indices_i]
-    scores_full = P_core[match_indices_i, match_indices_j]
-
-    # Permissive match set for pose recovery (recoverPose chirality check)
-    if pose_recovery_threshold is not None:
-        if pose_recovery_threshold > threshold:
-            raise ValueError(
-                f"pose_recovery_threshold ({pose_recovery_threshold}) must be "
-                f"<= threshold ({threshold})"
-            )
-        pose_sel = scores_full >= pose_recovery_threshold
-        pose_idx_i = match_indices_i[pose_sel]
-        pose_idx_j = match_indices_j[pose_sel]
-        # Exclude pad keypoints (-1, -1) from the pose set
-        pose_valid = (
-            (kpts1[pose_idx_i, 0] >= 0)
-            & (kpts1[pose_idx_i, 1] >= 0)
-            & (kpts2[pose_idx_j, 0] >= 0)
-            & (kpts2[pose_idx_j, 1] >= 0)
-        )
-        pose_idx_i = pose_idx_i[pose_valid]
-        pose_idx_j = pose_idx_j[pose_valid]
-        pose_kpts1 = kpts1[pose_idx_i]
-        pose_kpts2 = kpts2[pose_idx_j]
-    else:
-        pose_idx_i = None  # filled after top-N selection below
-
-    # Apply threshold
-    above_threshold = scores_full >= threshold
-    match_indices_i = match_indices_i[above_threshold]
-    match_indices_j = match_indices_j[above_threshold]
-    scores = scores_full[above_threshold]
-
-    # Sort by score descending and take top matches
-    sort_order = np.argsort(scores)[::-1][:max_matches]
-    match_indices_i = match_indices_i[sort_order]
-    match_indices_j = match_indices_j[sort_order]
-    scores = scores[sort_order]
-
-    matched_kpts1 = kpts1[match_indices_i]
-    matched_kpts2 = kpts2[match_indices_j]
-
-    # Map each top-N match to its pose-set position (index-based, robust
-    # against dtype/rounding changes: both index arrays come from the same
-    # unique mutual-NN set, so no coordinate matching is needed)
-    if pose_recovery_threshold is not None:
-        pose_pos = {int(k): p for p, k in enumerate(pose_idx_i)}
-        pose_map = np.array(
-            [pose_pos.get(int(k), -1) for k in match_indices_i], dtype=np.int64
-        )
-    else:
-        pose_kpts1 = matched_kpts1
-        pose_kpts2 = matched_kpts2
-        pose_map = np.arange(len(matched_kpts1), dtype=np.int64)
-
-    return matched_kpts1, matched_kpts2, scores, pose_kpts1, pose_kpts2, pose_map
-
-
-def draw_display_info(
-    frame: np.ndarray,
-    trajectory,  # Trajectory type
-    frame_count: int,
-    num_matches: int,
-    num_inliers: int,
-    matched_kpts2: np.ndarray,
-    inlier_mask: np.ndarray,
-    pose_updated: bool,
-    status_message: str,
-    model_width: int,
-    model_height: int,
-) -> np.ndarray:
-    """
-    Draw visual odometry information on frame.
-
-    Args:
-        frame: Input frame to annotate
-        trajectory: Trajectory object
-        frame_count: Current frame number
-        num_matches: Number of feature matches
-        num_inliers: Number of RANSAC inliers
-        matched_kpts2: Matched keypoints in current frame (N, 2) as (y, x)
-        inlier_mask: Boolean mask indicating inliers (N,) or None
-        pose_updated: Whether pose was successfully updated
-        status_message: Error/warning message or None
-        model_width: Model input width for scaling
-        model_height: Model input height for scaling
-
-    Returns:
-        Annotated frame with trajectory info and keypoints
-    """
-    info_frame = frame.copy()
-    frame_h, frame_w = info_frame.shape[:2]
-    pos = trajectory.get_current_position()
-    dist = trajectory.get_trajectory_length()
-
-    # Auto-scale font size and thickness based on frame size
-    # Reference: 640x480 with font_scale=0.7, thickness=2
-    base_width = 640
-    base_height = 480
-    size_scale = min(frame_w / base_width, frame_h / base_height)
-    font_scale = 0.7 * size_scale
-    font_thickness = max(1, int(2 * size_scale))
-
-    # Calculate line spacing based on scaled font
-    line_height = int(30 * size_scale)
-    margin_x = int(10 * size_scale)
-    start_y = line_height
-
-    # Scale keypoints from model resolution to frame resolution
-    scale_x = frame_w / model_width
-    scale_y = frame_h / model_height
-
-    # Scale keypoint radius based on frame size
-    base_radius = max(1, int(3 * size_scale))
-
-    # Draw matched keypoints
-    if num_matches > 0:
-        for i, (y, x) in enumerate(matched_kpts2):
-            # Keypoints are in (y, x) format
-            px = int(x * scale_x)
-            py = int(y * scale_y)
-
-            # Color based on inlier/outlier status
-            if pose_updated and inlier_mask is not None and inlier_mask[i]:
-                # Inliers: Green
-                color = (0, 255, 0)
-                radius = base_radius + 1
-            elif inlier_mask is not None and not inlier_mask[i]:
-                # Outliers (RANSAC rejected): Red
-                color = (0, 0, 255)
-                radius = base_radius
-            else:
-                # No pose estimate: Yellow
-                color = (0, 255, 255)
-                radius = base_radius
-
-            cv2.circle(info_frame, (px, py), radius, color, -1)
-            cv2.circle(info_frame, (px, py), radius + 1, (0, 0, 0), 1)
-
-    # Always display the same number of lines to prevent flickering
-    # Line 1: Frame number
-    cv2.putText(info_frame, f"Frame: {frame_count}",
-               (margin_x, start_y),
-               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-    # Line 2: Status message (error or OK)
-    if status_message:
-        cv2.putText(info_frame, status_message,
-                   (margin_x, start_y + line_height),
-                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), font_thickness)
-    else:
-        cv2.putText(info_frame, "STATUS: OK",
-                   (margin_x, start_y + line_height),
-                   cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-    # Line 3: Position
-    cv2.putText(info_frame, f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]",
-               (margin_x, start_y + line_height * 2),
-               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-    # Line 4: Distance
-    cv2.putText(info_frame, f"Distance: {dist:.2f} (norm)",
-               (margin_x, start_y + line_height * 3),
-               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-    # Line 5: Matches and Inliers
-    cv2.putText(info_frame, f"Matches: {num_matches} | Inliers: {num_inliers}",
-               (margin_x, start_y + line_height * 4),
-               cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 0), font_thickness)
-
-    return info_frame
-
-
-class VideoReader:
-    """Read frames from video file, image sequence, or webcam."""
-
-    def __init__(
-        self,
-        source,
-        is_video: bool = True,
-        is_camera: bool = False,
-        camera_backend: str = "opencv",
-        camera_width: int = 640,
-        camera_height: int = 480,
-        camera_fps: int = 30,
-    ):
-        """
-        Initialize video reader.
-
-        Args:
-            source: Video file path, image directory, or camera device ID
-            is_video: If True, read from video file; otherwise from image directory
-            is_camera: If True, read from webcam (source should be camera ID)
-            camera_backend: Camera backend ("opencv" or "realsense")
-            camera_width: Camera resolution width
-            camera_height: Camera resolution height
-            camera_fps: Camera framerate
-        """
-        self.is_video = is_video
-        self.is_camera = is_camera
-        self.source = source
-        self.camera = None
-        self.cap = None
-
-        if is_camera:
-            # Open camera using wrapper
-            # Try to convert to int for numeric device IDs, otherwise keep as string
-            try:
-                device_id = int(source)
-            except (ValueError, TypeError):
-                device_id = source
-
-            self.camera = create_camera(
-                backend=camera_backend,
-                device_id=device_id,
-                width=camera_width,
-                height=camera_height,
-                fps=camera_fps,
-                enable_depth=False,
-            )
-            self.total_frames = float('inf')  # Unlimited for camera
-            self.fps = self.camera.get_fps()
-        elif is_video:
-            # Open video file
-            self.cap = cv2.VideoCapture(source)
-            if not self.cap.isOpened():
-                raise RuntimeError(f"Failed to open video: {source}")
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        else:
-            # Load image file list
-            patterns = ['*.png', '*.jpg', '*.jpeg', '*.bmp']
-            self.image_files = []
-            for pattern in patterns:
-                self.image_files.extend(glob.glob(os.path.join(source, pattern)))
-            self.image_files.sort()
-            self.total_frames = len(self.image_files)
-            self.fps = 30.0  # Default
-            self.frame_idx = 0
-
-            if self.total_frames == 0:
-                raise RuntimeError(f"No images found in: {source}")
-
-    def read(self) -> tuple[bool, np.ndarray]:
-        """
-        Read next frame.
-
-        Returns:
-            Tuple of (success, frame)
-        """
-        if self.is_camera:
-            ret, frame = self.camera.read()
-            return ret, frame
-        elif self.is_video:
-            ret, frame = self.cap.read()
-            return ret, frame
-        else:
-            if self.frame_idx >= self.total_frames:
-                return False, None
-            frame = cv2.imread(self.image_files[self.frame_idx])
-            self.frame_idx += 1
-            return True, frame
-
-    def release(self):
-        """Release resources."""
-        if self.is_camera and self.camera is not None:
-            self.camera.release()
-        elif self.is_video and self.cap is not None:
-            self.cap.release()
-
-    def __len__(self) -> int:
-        """Return total number of frames."""
-        return self.total_frames
-
-
-def _output_indices(output_names):
-    """Resolve model outputs by name (robust to extra outputs / ordering).
-
-    Returns a dict with keys ``k1``, ``k2``, ``probs`` and ``e`` (None when
-    absent). Detecting by name keeps models with extra outputs (e.g.
-    descriptors) from being misread as an Essential matrix.
-    """
+def output_indices(output_names):
+    """Resolve model outputs by name (robust to extra outputs / ordering)."""
     low = {n.lower(): i for i, n in enumerate(output_names)}
 
     def pick(*cands):
@@ -528,681 +57,336 @@ def _output_indices(output_names):
         "k1": pick("keypoints1", "keypoints_1", "kp1"),
         "k2": pick("keypoints2", "keypoints_2", "kp2"),
         "probs": pick("matching_probs", "matching_probabilities", "probs"),
-        "e": pick("essential_matrix", "e_matrix", "e"),
     }
 
 
-def run_visual_odometry(
-    session: ort.InferenceSession,
-    reader: VideoReader,
-    camera_intrinsics: CameraIntrinsics,
-    model_height: int,
-    model_width: int,
-    match_threshold: float = 0.1,
-    ransac_threshold: float = 1.4,
-    max_matches: int = 100,
-    min_matches: int = 20,
-    min_inlier_ratio: float = 0.5,
-    min_motion_pixels: float = 1.0,
-    max_reference_age: int = 30,
-    pose_recovery_threshold: float = 0.01,
-    skip_frames: int = 1,
-    max_frames: int = None,
-    verbose: bool = True,
-    display: bool = False,
-    use_graph: bool = False,
-) -> Trajectory:
-    """
-    Run visual odometry on video/image sequence/webcam.
+class VideoReader:
+    """Read frames from a video file, an image sequence, or a camera."""
 
-    Args:
-        session: ONNX Runtime session
-        reader: Video reader
-        camera_intrinsics: Camera intrinsic parameters
-        model_height: Model input height
-        model_width: Model input width
-        match_threshold: Minimum match probability
-        ransac_threshold: RANSAC reprojection threshold
-        max_matches: Maximum number of matches
-        min_matches: Minimum number of matches required
-        min_inlier_ratio: Minimum ratio of RANSAC inliers to matches (0-1).
-            Frames where inlier_count/match_count is below this threshold are
-            rejected. A low inlier ratio indicates a degenerate Essential Matrix
-            (fitted to noise), leading to large random trajectory jumps.
-            Default: 0.5 (require at least 50% inliers).
-        min_motion_pixels: Minimum RMS pixel displacement between matched
-            keypoints to attempt pose estimation (default: 1.0). When the camera
-            is stationary the optical flow is near-zero, causing findEssentialMat
-            to fit a degenerate matrix and recoverPose to give unstable inlier
-            counts (0-3 or all inliers randomly). Frames below this threshold
-            are classified as "no motion" and skipped without updating the pose.
-            However, slow continuous motion is accumulated by NOT updating the
-            reference frame until motion crosses the threshold or max_reference_age.
-        max_reference_age: Maximum number of frames the reference frame can age
-            before forced update (default: 30). Prevents reference frame from
-            becoming too stale during long periods of sub-threshold motion, while
-            still allowing slow continuous motion to accumulate for detection.
-        pose_recovery_threshold: Match probability threshold for the permissive
-            pose-recovery match set used with the 4-output model (default: 0.01).
-            Lower than ``match_threshold`` so recoverPose's chirality check sees
-            a point set consistent with the model-internal weighted 8-point
-            Essential Matrix estimate (which uses all keypoints).
-        skip_frames: Process every N-th frame
-        max_frames: Maximum number of frames to process
-        verbose: Print progress information
-        display: Display frames and trajectory in real-time
+    def __init__(self, source, is_video=True, is_camera=False,
+                 camera_backend="opencv", camera_width=640, camera_height=480,
+                 camera_fps=30):
+        self.is_video = is_video
+        self.is_camera = is_camera
+        self.source = source
+        self.camera = None
+        self.cap = None
+        self.frame_idx = 0
 
-    Returns:
-        Trajectory object containing camera poses
+        if is_camera:
+            try:
+                device_id = int(source)
+            except (ValueError, TypeError):
+                device_id = source
+            self.camera = create_camera(
+                backend=camera_backend, device_id=device_id,
+                width=camera_width, height=camera_height, fps=camera_fps,
+                enable_depth=False)
+            self.total_frames = float("inf")
+            self.fps = self.camera.get_fps()
+        elif is_video:
+            self.cap = cv2.VideoCapture(source)
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Failed to open video: {source}")
+            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        else:
+            patterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp"]
+            self.image_files = []
+            for pattern in patterns:
+                self.image_files.extend(glob.glob(os.path.join(source, pattern)))
+            self.image_files.sort()
+            self.total_frames = len(self.image_files)
+            self.fps = 30.0
+            if self.total_frames == 0:
+                raise RuntimeError(f"No images found in: {source}")
+
+    def read(self):
+        if self.is_camera:
+            return self.camera.read()
+        if self.is_video:
+            return self.cap.read()
+        if self.frame_idx >= self.total_frames:
+            return False, None
+        frame = cv2.imread(self.image_files[self.frame_idx])
+        self.frame_idx += 1
+        return True, frame
+
+    def release(self):
+        if self.is_camera and self.camera is not None:
+            self.camera.release()
+        elif self.is_video and self.cap is not None:
+            self.cap.release()
+
+    def __len__(self):
+        return self.total_frames
+
+
+def draw_display_info(frame, trajectory, frame_count, stats, last, status,
+                      model_width, model_height):
+    """Annotate a frame with trajectory/status and the last matched keypoints."""
+    info = frame.copy()
+    fh, fw = info.shape[:2]
+    scale = min(fw / 640.0, fh / 480.0)
+    font = 0.7 * scale
+    thick = max(1, int(2 * scale))
+    lh = int(30 * scale)
+    mx = int(10 * scale)
+
+    if last is not None and len(last.get("kpts2", [])) > 0:
+        kp2 = last["kpts2"]
+        mask = last.get("inlier_mask")
+        sx, sy = fw / model_width, fh / model_height
+        r = max(1, int(3 * scale))
+        for i, (y, x) in enumerate(kp2):
+            inl = mask is not None and i < len(mask) and mask[i]
+            color = (0, 255, 0) if inl else (0, 0, 255)
+            cv2.circle(info, (int(x * sx), int(y * sy)), r + (1 if inl else 0),
+                       color, -1)
+
+    pos = trajectory.get_current_position()
+    dist = trajectory.get_trajectory_length()
+    lines = [
+        (f"Frame: {frame_count}", (0, 255, 0)),
+        (status if status else "STATUS: OK", (0, 0, 255) if status else (0, 255, 0)),
+        (f"Position: [{pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}]", (0, 255, 0)),
+        (f"Distance: {dist:.2f} (norm)", (0, 255, 0)),
+        (f"Keyframes: {stats['n_kf']} | Loops: {stats['n_loop']}", (0, 255, 0)),
+        (f"Matches: {stats['n_matches']} | ok={stats['ok']}", (0, 255, 0)),
+    ]
+    for i, (text, color) in enumerate(lines):
+        cv2.putText(info, text, (mx, lh * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX,
+                    font, color, thick)
+    return info
+
+
+def run_visual_odometry(session, reader, camera_intrinsics, model_height,
+                        model_width, params=None, match_threshold=0.1,
+                        ransac_threshold=1.4, max_matches=1024, min_matches=20,
+                        skip_frames=0, max_frames=None, verbose=True,
+                        display=False):
+    """Run the online pose graph over a frame source.
+
+    Returns ``(trajectory, graph)``.
     """
+    input_names = [i.name for i in session.get_inputs()]
+    oi = output_indices([o.name for o in session.get_outputs()])
+    for key in ("k1", "k2", "probs"):
+        if oi[key] is None:
+            raise RuntimeError(f"Model output for '{key}' not found")
+
+    matcher = OnnxSessionMatcher(
+        session, camera_intrinsics, input_names, oi,
+        match_threshold=match_threshold, max_matches=max_matches,
+        min_matches=min_matches, min_inlier_ratio=0.0)
+    matcher.debug_display = display
+
+    images = {}
+
+    def match_fn(i, j):
+        if i not in images or j not in images:
+            return {"ok": False, "n_matches": 0, "inlier_ratio": 0.0}
+        return matcher.match(images[i], images[j])
+
+    graph = OnlinePoseGraph(dict(DEFAULT_PARAMS if params is None else params),
+                            camera_intrinsics, match_fn)
     trajectory = Trajectory()
 
-    input_names = [inp.name for inp in session.get_inputs()]
-    output_names = [out.name for out in session.get_outputs()]
-
-    # Model outputs are resolved by name, so models with extra outputs
-    # (descriptors) or different ordering work unchanged.
-    oi = _output_indices(output_names)
-    e_idx = oi["e"]
-    has_essential_matrix = e_idx is not None
-
-    # Optional online pose graph: all graph logic lives in vo.online_graph;
-    # here we only provide a matcher that runs the ONNX session on two images.
-    graph = None
-    if use_graph:
-        # Matching mirrors the eval pipeline (mutual-NN + dustbin margin +
-        # top-K, then MAGSAC Essential solve). All of it lives in vo/.
-        matcher = OnnxSessionMatcher(
-            session, camera_intrinsics, input_names, oi,
-            match_threshold=match_threshold, max_matches=max(1024, max_matches),
-            dbin=0.1, method="magsac", ransac_threshold=ransac_threshold,
-            min_matches=min_matches, min_inlier_ratio=0.0)
-        graph = OnlinePoseGraph(dict(GRAPH_DEFAULTS), camera_intrinsics,
-                                matcher.match)
-
-    # Warm up camera (allow auto-exposure/auto-focus to stabilize)
     if reader.is_camera:
-        for _ in range(10):
-            ret, _ = reader.read()
-            if not ret:
-                # Early camera initialization failure detected during warm-up
-                # Break immediately to allow subsequent error handling to catch it
+        for _ in range(10):  # warm up auto-exposure / auto-focus
+            if not reader.read()[0]:
                 break
-
-    # Read first frame
-    ret, prev_frame = reader.read()
-    if not ret:
-        raise RuntimeError("Failed to read first frame")
-
-    prev_image = load_image_from_array(prev_frame, model_height, model_width)
-    # display_frame = prev_frame.copy() if display else None
 
     frame_count = 0
-    processed_count = 0
-    total_matches = 0
-    total_inliers = 0
-    frames_since_last_update = 0  # Track reference frame age
-
-    if verbose:
-        print(f"Processing frames (skip={skip_frames})...")
-        if display:
-            print("Press 'q' to quit, 's' to save current trajectory")
-
-    start_time = time.time()
+    processed = 0
+    idx = 0
+    start = time.time()
 
     while True:
-        # Read next frame
-        ret, curr_frame = reader.read()
+        ret, frame = reader.read()
         if not ret:
             break
-
         frame_count += 1
-
-        # Skip frames if needed
-        if frame_count % (skip_frames + 1) != 0:
+        if skip_frames and frame_count % (skip_frames + 1) != 0:
             continue
-
-        processed_count += 1
-
-        # Check max frames limit
-        if max_frames is not None and processed_count > max_frames:
+        processed += 1
+        if max_frames is not None and processed > max_frames:
             break
 
-        # Convert current frame to model input
-        curr_image = load_image_from_array(curr_frame, model_height, model_width)
+        images[idx] = load_image(frame, model_height, model_width)
+        T = graph.add_frame(idx)
+        trajectory.add_pose(T)
 
-        if use_graph:
-            # Online pose graph path: the graph requests matches itself and
-            # returns the current camera-to-world pose.
-            T = graph.add_frame(curr_image)
-            trajectory.add_pose(T)
-            st = graph.last_stats
-            if verbose and processed_count % 10 == 0:
-                print(f"Frame {frame_count}: "
-                      f"position={trajectory.get_current_position()} "
-                      f"odom_ok={st['ok']} ratio={st['inlier_ratio']:.2f} "
-                      f"inl={st['n_matches']}")
-            continue
+        # Keep only keyframes + the most recent frames in the image cache.
+        keep = set(graph.keyframes) | {idx - 1, idx}
+        for k in [k for k in images if k not in keep]:
+            images.pop(k, None)
 
-        # Run feature matching
-        results = session.run(
-            output_names,
-            {input_names[0]: prev_image, input_names[1]: curr_image},
-        )
+        stats = {
+            "ok": graph.last_stats["ok"],
+            "n_matches": graph.last_stats["n_matches"],
+            "n_kf": graph.n_kf,
+            "n_loop": graph.n_loop,
+        }
+        if verbose and processed % 10 == 0:
+            elapsed = time.time() - start
+            print(f"Frame {frame_count}: position="
+                  f"{trajectory.get_current_position()}, "
+                  f"odom_ok={stats['ok']}, kf={stats['n_kf']}, "
+                  f"loops={stats['n_loop']}, "
+                  f"fps={processed / max(elapsed, 1e-6):.1f}")
 
-        keypoints1 = results[oi["k1"]]      # (1, K, 2)
-        keypoints2 = results[oi["k2"]]      # (1, K, 2)
-        matching_probs = results[oi["probs"]]  # (1, K+1, K+1)
-        E_onnx = results[e_idx] if has_essential_matrix else None  # (3, 3) or None
-
-        # Extract matches
-        matched_kpts1, matched_kpts2, _scores, pose_kpts1, pose_kpts2, pose_map = extract_matches(
-            matching_probs,
-            keypoints1,
-            keypoints2,
-            threshold=match_threshold,
-            max_matches=max_matches,
-            pose_recovery_threshold=pose_recovery_threshold if has_essential_matrix else None,
-        )
-
-        num_matches = len(matched_kpts1)
-        total_matches += num_matches
-
-        # Initialize status for display
-        status_message = None
-        pose_updated = False
-        inlier_mask = np.zeros(num_matches, dtype=bool)
-        num_inliers = 0
-
-        if num_matches < min_matches:
-            if verbose:
-                print(f"Frame {frame_count}: Insufficient matches ({num_matches} < {min_matches}), skipping...")
-            status_message = f"INSUFFICIENT MATCHES ({num_matches}/{min_matches})"
-        else:
-            # Check for sufficient motion before running pose estimation.
-            # When the camera is stationary, optical flow is near-zero and
-            # findEssentialMat produces a degenerate Essential Matrix, causing
-            # recoverPose to return unstable inlier counts (0-3 or all inliers).
-            flow = matched_kpts2 - matched_kpts1  # (N, 2) in (dy, dx)
-            rms_flow = float(np.sqrt(np.mean(np.sum(flow ** 2, axis=1))))
-
-            if rms_flow < min_motion_pixels:
-                # Insufficient motion: skip pose estimation to avoid degenerate Essential Matrix.
-                # DO NOT update reference frame yet - allow slow continuous motion to accumulate
-                # across frames until it crosses the threshold. This ensures we don't miss gradual
-                # movements (e.g., slow walking, camera drift).
-                frames_since_last_update += 1
-                status_message = f"NO MOTION (rms={rms_flow:.2f}px, age={frames_since_last_update})"
-                if verbose:
-                    print(f"Frame {frame_count}: No motion (rms={rms_flow:.2f}px), skipping... "
-                          f"(reference age: {frames_since_last_update} frames)")
-
-                # Safety check: if reference frame becomes too old, force update to prevent
-                # large jumps when motion eventually resumes (e.g., after long static period).
-                if frames_since_last_update >= max_reference_age:
-                    prev_image = curr_image
-                    frames_since_last_update = 0
-                    if verbose:
-                        print(f"  → Reference frame forced update (age limit reached)")
-            else:
-                # Estimate pose
-                if has_essential_matrix:
-                    # 4-output model: use the Essential Matrix from ONNX directly.
-                    # The E matrix was computed inside the model using all keypoints
-                    # weighted by Sinkhorn probabilities (weighted 8-point algorithm).
-                    # recoverPose is called with the permissive match set
-                    # (pose_kpts, looser threshold, no top-N cut) so the chirality
-                    # check sees a point set consistent with the model-internal
-                    # estimate, reducing sign flips on ambiguous scenes.
-                    R, t, pose_mask = estimate_pose_from_essential_matrix(
-                        pose_kpts1,
-                        pose_kpts2,
-                        E_onnx,
-                        camera_intrinsics,
-                    )
-                    if R is not None:
-                        # Remap chirality mask back to the top-N match set so
-                        # display and inlier-ratio gating use consistent indexing.
-                        # Index-based mapping from extract_matches (pose_map),
-                        # robust against coordinate rounding changes.
-                        inlier_mask = _remap_pose_mask(pose_map, pose_mask, num_matches)
-                    else:
-                        inlier_mask = np.zeros(num_matches, dtype=bool)
-                else:
-                    # 3-output model: estimate E via RANSAC then recover pose.
-                    R, t, inlier_mask = estimate_pose_ransac(
-                        matched_kpts1,
-                        matched_kpts2,
-                        camera_intrinsics,
-                        ransac_threshold=ransac_threshold,
-                    )
-
-                num_inliers = np.sum(inlier_mask)
-                total_inliers += num_inliers
-
-                inlier_ratio = num_inliers / num_matches if num_matches > 0 else 0.0
-                if R is None or num_inliers < min_matches or inlier_ratio < min_inlier_ratio:
-                    if verbose:
-                        print(f"Frame {frame_count}: Pose estimation failed "
-                              f"(inliers={num_inliers}, ratio={inlier_ratio:.0%}), skipping...")
-                    status_message = (f"POSE ESTIMATION FAILED "
-                                      f"(inliers={num_inliers}, ratio={inlier_ratio:.0%})")
-                    # Keep reference frame unchanged - may succeed on next frame with
-                    # more motion. Do NOT increment frames_since_last_update here:
-                    # that counter tracks the *reference frame age for motion
-                    # accumulation* (no-motion case only). Pose failures are a
-                    # matching/geometry problem, not slow motion, and forcing a
-                    # reference update on age would discard the frame the pose
-                    # estimator will likely succeed on next iteration.
-                else:
-                    # Success: add pose to trajectory and update reference frame
-                    trajectory.add_relative_pose(R, t)
-                    pose_updated = True
-                    prev_image = curr_image
-                    frames_since_last_update = 0  # Reset age counter
-
-                    if verbose and processed_count % 10 == 0:
-                        elapsed = time.time() - start_time
-                        fps = processed_count / elapsed
-                        if reader.is_camera or reader.total_frames == float('inf'):
-                            print(f"Frame {frame_count}: "
-                                  f"matches={num_matches}, inliers={num_inliers}, "
-                                  f"position={trajectory.get_current_position()}, "
-                                  f"fps={fps:.1f}")
-                        else:
-                            print(f"Frame {frame_count}/{reader.total_frames}: "
-                                  f"matches={num_matches}, inliers={num_inliers}, "
-                                  f"position={trajectory.get_current_position()}, "
-                                  f"fps={fps:.1f}")
-
-        # Display frame and trajectory in real-time (always update if display is on)
         if display:
-            info_frame = draw_display_info(
-                frame=curr_frame,
-                trajectory=trajectory,
-                frame_count=frame_count,
-                num_matches=num_matches,
-                num_inliers=num_inliers,
-                matched_kpts2=matched_kpts2,
-                inlier_mask=inlier_mask,
-                pose_updated=pose_updated,
-                status_message=status_message,
-                model_width=model_width,
-                model_height=model_height,
-            )
-            cv2.imshow('Visual Odometry', info_frame)
-
-            # Check for key press
+            info = draw_display_info(
+                frame, trajectory, frame_count, stats, matcher.last,
+                None if stats["ok"] else "POSE FAILED",
+                model_width, model_height)
+            cv2.imshow("Visual Odometry", info)
             key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("\nQuitting...")
+            if key == ord("q"):
                 break
-            elif key == ord('s'):
-                save_path = f"trajectory_{int(time.time())}.npz"
-                trajectory.save_to_file(save_path)
-                print(f"\nTrajectory saved to: {save_path}")
+            if key == ord("s"):
+                path = f"trajectory_{int(time.time())}.npz"
+                trajectory.save_to_file(path)
+                print(f"Trajectory saved to: {path}")
 
-    elapsed = time.time() - start_time
+        idx += 1
 
+    elapsed = time.time() - start
     if verbose:
-        print(f"\nProcessing complete!")
-        print(f"Total frames: {frame_count}")
-        print(f"Processed frames: {processed_count}")
-        print(f"Trajectory length: {len(trajectory)} poses")
-        print(f"Average matches: {total_matches / max(1, processed_count):.1f}")
-        print(f"Average inliers: {total_inliers / max(1, len(trajectory) - 1):.1f}")
-        print(f"Total distance: {trajectory.get_trajectory_length():.2f} (normalised units, "
-              f"monocular scale ambiguity)")
-        print(f"Processing time: {elapsed:.2f} seconds ({processed_count / elapsed:.1f} fps)")
+        print(f"\nProcessing complete: {processed} frames, "
+              f"{len(trajectory)} poses, {graph.n_kf} keyframes, "
+              f"{graph.n_loop} loops")
+        print(f"Total distance: {trajectory.get_trajectory_length():.2f} "
+              f"(normalised units, monocular scale ambiguity)")
+        if processed:
+            print(f"Processing time: {elapsed:.2f}s "
+                  f"({processed / elapsed:.1f} fps)")
 
-    return trajectory
+    return trajectory, graph
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Visual Odometry using ONNX feature matching model"
-    )
+        description="Visual odometry with an ONNX matcher and the online "
+                    "keyframe pose graph (vo.online_graph)")
 
-    # Input source
-    source_group = parser.add_mutually_exclusive_group(required=True)
-    source_group.add_argument(
-        "--video", "-v",
-        type=str,
-        help="Input video file path"
-    )
-    source_group.add_argument(
-        "--image-dir", "-d",
-        type=str,
-        help="Input image directory path"
-    )
-    source_group.add_argument(
-        "--camera", "-c",
-        type=str,
-        help="Camera device ID (e.g., '0' for default, or serial number/MxID for RealSense/OAK-D)"
-    )
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--video", "-v", type=str, help="Input video file")
+    src.add_argument("--image-dir", "-d", type=str, help="Input image directory")
+    src.add_argument("--camera", "-c", type=str, help="Camera device ID")
 
-    # Model and camera parameters
-    parser.add_argument(
-        "--model", "-m",
-        type=str,
-        required=True,
-        help="Path to the exported ONNX model file"
-    )
-    parser.add_argument(
-        "--fx",
-        type=float,
-        default=None,
-        help="Focal length in x direction (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
-    )
-    parser.add_argument(
-        "--fy",
-        type=float,
-        default=None,
-        help="Focal length in y direction (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
-    )
-    parser.add_argument(
-        "--cx",
-        type=float,
-        default=None,
-        help="Principal point x coordinate (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
-    )
-    parser.add_argument(
-        "--cy",
-        type=float,
-        default=None,
-        help="Principal point y coordinate (pixels). Required for OpenCV/video, auto-detected for RealSense/Orbbec/OAK."
-    )
-    parser.add_argument(
-        "--camera-backend",
-        type=str,
-        default="opencv",
-        choices=["opencv", "realsense", "orbbec", "oak"],
-        help="Camera backend (opencv, realsense, orbbec, or oak, default: opencv)"
-    )
-    parser.add_argument(
-        "--camera-width",
-        type=int,
-        default=640,
-        help="Camera resolution width (default: 640)"
-    )
-    parser.add_argument(
-        "--camera-height",
-        type=int,
-        default=480,
-        help="Camera resolution height (default: 480)"
-    )
-    parser.add_argument(
-        "--camera-fps",
-        type=int,
-        default=30,
-        help="Camera framerate (default: 30)"
-    )
+    parser.add_argument("--model", "-m", type=str, required=True,
+                        help="Exported ONNX matching model")
+    parser.add_argument("--fx", type=float, default=None)
+    parser.add_argument("--fy", type=float, default=None)
+    parser.add_argument("--cx", type=float, default=None)
+    parser.add_argument("--cy", type=float, default=None)
+    parser.add_argument("--camera-backend", type=str, default="opencv",
+                        choices=["opencv", "realsense", "orbbec", "oak"])
+    parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--camera-fps", type=int, default=30)
 
-    # Processing parameters
-    parser.add_argument(
-        "--match-threshold", "-t",
-        type=float,
-        default=0.1,
-        help="Match probability threshold (default: 0.1)"
-    )
-    parser.add_argument(
-        "--ransac-threshold",
-        type=float,
-        default=1.4,
-        help="RANSAC reprojection threshold in pixels (default: 1.4)"
-    )
-    parser.add_argument(
-        "--max-matches",
-        type=int,
-        default=300,
-        help="Maximum number of matches (default: 300)"
-    )
-    parser.add_argument(
-        "--min-matches",
-        type=int,
-        default=10,
-        help="Minimum number of matches required (default: 10)"
-    )
-    parser.add_argument(
-        "--min-inlier-ratio",
-        type=float,
-        default=0.5,
-        help="Minimum RANSAC inlier ratio (inliers/matches) to accept a pose estimate. "
-             "Frames below this threshold are skipped to prevent degenerate E matrix jumps. "
-             "(default: 0.5)"
-    )
-    parser.add_argument(
-        "--min-motion-pixels",
-        type=float,
-        default=1.0,
-        help="Minimum RMS pixel displacement of matched keypoints to attempt pose estimation. "
-             "Frames below this threshold are treated as 'no motion' to avoid degenerate "
-             "Essential Matrix estimation when the camera is stationary (default: 1.0)"
-    )
-    parser.add_argument(
-        "--max-reference-age",
-        type=int,
-        default=30,
-        help="Maximum number of frames the reference frame can age before forced update. "
-             "Prevents stale references during long static periods while still allowing "
-             "slow continuous motion to accumulate for detection (default: 30)"
-    )
-    parser.add_argument(
-        "--pose-recovery-threshold",
-        type=float,
-        default=0.01,
-        help="Match probability threshold for the permissive pose-recovery match "
-             "set used with the 4-output model. Lower than --match-threshold so "
-             "recoverPose's chirality check is consistent with the model-internal "
-             "weighted 8-point Essential Matrix estimate (default: 0.01)"
-    )
-    parser.add_argument(
-        "--skip-frames",
-        type=int,
-        default=0,
-        help="Process every N-th frame (0=process all frames, default: 0)"
-    )
-    parser.add_argument(
-        "--max-frames",
-        type=int,
-        default=None,
-        help="Maximum number of frames to process (default: None, process all)"
-    )
+    parser.add_argument("--match-threshold", "-t", type=float, default=0.1,
+                        help="Minimum match probability (default: 0.1)")
+    parser.add_argument("--ransac-threshold", type=float, default=1.4,
+                        help="MAGSAC/RANSAC reprojection threshold (default: 1.4)")
+    parser.add_argument("--max-matches", type=int, default=1024,
+                        help="Maximum matches per pair (default: 1024)")
+    parser.add_argument("--min-matches", type=int, default=20,
+                        help="Minimum matches/inliers to accept a pose (default: 20)")
+    parser.add_argument("--skip-frames", type=int, default=0,
+                        help="Process every N-th frame (0=all, default: 0)")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="Maximum number of frames to process")
 
-    # Output options
-    parser.add_argument(
-        "--save-trajectory",
-        type=str,
-        default=None,
-        help="Save trajectory to file (*.npz)"
-    )
-    parser.add_argument(
-        "--save-plot",
-        type=str,
-        default=None,
-        help="Save trajectory plot to file (*.png)"
-    )
-    parser.add_argument(
-        "--plot-3d",
-        action="store_true",
-        help="Plot 3D trajectory instead of 2D"
-    )
-    parser.add_argument(
-        "--display",
-        action="store_true",
-        help="Display frames and trajectory in real-time (press 'q' to quit, 's' to save)"
-    )
-    parser.add_argument(
-        "--graph",
-        action="store_true",
-        help="Use the online keyframe pose graph (vo.online_graph) instead of "
-             "plain relative-pose chaining. Graph logic lives in vo/."
-    )
-    parser.add_argument(
-        "--quiet", "-q",
-        action="store_true",
-        help="Suppress progress output"
-    )
-
+    parser.add_argument("--save-trajectory", type=str, default=None,
+                        help="Save trajectory to *.npz")
+    parser.add_argument("--save-plot", type=str, default=None,
+                        help="Save trajectory plot to *.png")
+    parser.add_argument("--plot-3d", action="store_true")
+    parser.add_argument("--display", action="store_true",
+                        help="Show frames (q quit, s save)")
+    parser.add_argument("--quiet", "-q", action="store_true")
     return parser.parse_args()
+
+
+def read_intrinsics(args, model_width, model_height, reader):
+    if args.camera is not None and args.camera_backend in ("realsense", "orbbec", "oak") \
+            and args.fx is None:
+        if not hasattr(reader.camera, "get_camera_intrinsics"):
+            raise RuntimeError("Camera does not support intrinsics auto-detection")
+        intr = reader.camera.get_camera_intrinsics()
+        if intr is None:
+            raise RuntimeError("Failed to get camera intrinsics")
+        sx = model_width / intr.width
+        sy = model_height / intr.height
+        return CameraIntrinsics(fx=intr.fx * sx, fy=intr.fy * sy,
+                                cx=intr.cx * sx, cy=intr.cy * sy,
+                                width=model_width, height=model_height)
+    if None in (args.fx, args.fy, args.cx, args.cy):
+        raise ValueError("Camera intrinsics (--fx --fy --cx --cy) are required")
+    return CameraIntrinsics(fx=args.fx, fy=args.fy, cx=args.cx, cy=args.cy,
+                            width=model_width, height=model_height)
 
 
 def main():
     args = parse_args()
 
-    # Create ONNX Runtime session
     print(f"Loading ONNX model: {args.model}")
     session = create_session(args.model)
-    inputs = session.get_inputs()
-    outputs = session.get_outputs()
-
-    # Get model input dimensions
-    input_shape = inputs[0].shape  # [B, 1, H, W]
-    model_height = input_shape[2]
-    model_width = input_shape[3]
-
-    has_essential_matrix = _output_indices([o.name for o in outputs])["e"] is not None
-    model_type = (
-        "Sinkhorn + Essential Matrix"
-        if has_essential_matrix
-        else "Sinkhorn (no Essential Matrix output)"
-    )
+    shape = session.get_inputs()[0].shape
+    model_height, model_width = shape[2], shape[3]
     print(f"Model input size: {model_height}x{model_width}")
-    print(f"Model type: {model_type}")
-    for inp in inputs:
-        print(f"  Input:  {inp.name} {inp.shape}")
-    for out in outputs:
-        print(f"  Output: {out.name} {out.shape}")
+    for o in session.get_outputs():
+        print(f"  Output: {o.name} {o.shape}")
 
-    # Open video/image/camera source
     if args.camera is not None:
-        print(f"\nOpening camera: {args.camera} (backend: {args.camera_backend})")
-        reader = VideoReader(
-            args.camera,
-            is_video=False,
-            is_camera=True,
-            camera_backend=args.camera_backend,
-            camera_width=args.camera_width,
-            camera_height=args.camera_height,
-            camera_fps=args.camera_fps,
-        )
+        reader = VideoReader(args.camera, is_video=False, is_camera=True,
+                             camera_backend=args.camera_backend,
+                             camera_width=args.camera_width,
+                             camera_height=args.camera_height,
+                             camera_fps=args.camera_fps)
     elif args.video:
-        print(f"\nOpening video: {args.video}")
-        reader = VideoReader(args.video, is_video=True, is_camera=False)
+        reader = VideoReader(args.video, is_video=True)
     else:
-        print(f"\nOpening image directory: {args.image_dir}")
-        reader = VideoReader(args.image_dir, is_video=False, is_camera=False)
+        reader = VideoReader(args.image_dir, is_video=False)
 
-    # Create camera intrinsics
-    # For RealSense/Orbbec/OAK cameras, auto-detect intrinsics if not provided
-    if args.camera is not None and args.camera_backend in ["realsense", "orbbec", "oak"]:
-        if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
-            print(f"\nAuto-detecting camera intrinsics from {args.camera_backend.upper()}...")
-            if hasattr(reader.camera, 'get_camera_intrinsics'):
-                camera_intrinsics = reader.camera.get_camera_intrinsics()
-                if camera_intrinsics is None:
-                    raise RuntimeError(f"Failed to get camera intrinsics from {args.camera_backend.upper()}")
-                print(f"Camera intrinsics (auto-detected, native resolution): {camera_intrinsics}")
-                # Scale intrinsics from camera native resolution to model input resolution.
-                # Essential Matrix estimation requires intrinsics in the same coordinate
-                # space as the keypoints (model resolution), not the camera's native resolution.
-                # Always re-calculate to ensure consistency, even if scale factors are 1.0.
-                scale_x = model_width / camera_intrinsics.width
-                scale_y = model_height / camera_intrinsics.height
-                camera_intrinsics = CameraIntrinsics(
-                    fx=camera_intrinsics.fx * scale_x,
-                    fy=camera_intrinsics.fy * scale_y,
-                    cx=camera_intrinsics.cx * scale_x,
-                    cy=camera_intrinsics.cy * scale_y,
-                    width=model_width,
-                    height=model_height,
-                )
-                print(f"Camera intrinsics (scaled to model {model_width}x{model_height}): {camera_intrinsics}")
-            else:
-                raise RuntimeError("Camera does not support intrinsics auto-detection")
-        else:
-            # Use manually specified intrinsics
-            camera_intrinsics = CameraIntrinsics(
-                fx=args.fx,
-                fy=args.fy,
-                cx=args.cx,
-                cy=args.cy,
-                width=model_width,
-                height=model_height,
-            )
-            print(f"\nCamera intrinsics (manual): {camera_intrinsics}")
-    else:
-        # Non-3D-camera: require manual specification
-        if args.fx is None or args.fy is None or args.cx is None or args.cy is None:
-            raise ValueError(
-                "Camera intrinsics (--fx, --fy, --cx, --cy) are required for OpenCV cameras and video files. "
-                "Please specify all intrinsic parameters."
-            )
-        camera_intrinsics = CameraIntrinsics(
-            fx=args.fx,
-            fy=args.fy,
-            cx=args.cx,
-            cy=args.cy,
-            width=model_width,
-            height=model_height,
-        )
-        print(f"\nCamera intrinsics: {camera_intrinsics}")
+    camera_intrinsics = read_intrinsics(args, model_width, model_height, reader)
+    print(f"Camera intrinsics: {camera_intrinsics}")
+    print(f"Total frames: {len(reader)}  FPS: {reader.fps:.2f}")
 
-    if reader.is_camera:
-        print(f"Camera mode (unlimited frames)")
-    else:
-        print(f"Total frames: {len(reader)}")
-    print(f"FPS: {reader.fps:.2f}")
-
-    # Run visual odometry
     try:
-        trajectory = run_visual_odometry(
-            session,
-            reader,
-            camera_intrinsics,
-            model_height,
-            model_width,
+        trajectory, _graph = run_visual_odometry(
+            session, reader, camera_intrinsics, model_height, model_width,
             match_threshold=args.match_threshold,
             ransac_threshold=args.ransac_threshold,
-            max_matches=args.max_matches,
-            min_matches=args.min_matches,
-            min_inlier_ratio=args.min_inlier_ratio,
-            min_motion_pixels=args.min_motion_pixels,
-            max_reference_age=args.max_reference_age,
-            pose_recovery_threshold=args.pose_recovery_threshold,
-            skip_frames=args.skip_frames,
-            max_frames=args.max_frames,
-            verbose=not args.quiet,
-            display=args.display,
-            use_graph=args.graph,
-        )
+            max_matches=args.max_matches, min_matches=args.min_matches,
+            skip_frames=args.skip_frames, max_frames=args.max_frames,
+            verbose=not args.quiet, display=args.display)
     finally:
         reader.release()
         if args.display:
             cv2.destroyAllWindows()
 
-    # Save trajectory if requested
     if args.save_trajectory:
         trajectory.save_to_file(args.save_trajectory)
         print(f"\nTrajectory saved to: {args.save_trajectory}")
 
-    # Plot trajectory if requested
     if args.save_plot:
-        print(f"\nGenerating trajectory plot...")
-        matplotlib.use('Agg')  # Non-interactive backend
-
+        matplotlib.use("Agg")
         if args.plot_3d:
             fig = plt.figure(figsize=(12, 10))
-            ax = fig.add_subplot(111, projection='3d')
+            ax = fig.add_subplot(111, projection="3d")
             trajectory.plot_3d(ax, show_orientation=True)
         else:
             fig, ax = plt.subplots(figsize=(10, 10))
             trajectory.plot_2d(ax, show_orientation=True)
-
         plt.tight_layout()
-        plt.savefig(args.save_plot, dpi=150, bbox_inches='tight')
-        print(f"Trajectory plot saved to: {args.save_plot}")
+        plt.savefig(args.save_plot, dpi=150, bbox_inches="tight")
         plt.close()
+        print(f"Trajectory plot saved to: {args.save_plot}")
 
     print("\nDone!")
 

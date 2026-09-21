@@ -67,6 +67,9 @@ class OnnxSessionMatcher:
         self.ransac_threshold = ransac_threshold
         self.min_matches = min_matches
         self.min_inlier_ratio = min_inlier_ratio
+        # When set, the most recent match stores keypoints/mask for display.
+        self.debug_display = False
+        self.last = None
 
     def match(self, img_a, img_b):
         outs = self.session.run(None, {self.in0: img_a, self.in1: img_b})
@@ -77,15 +80,20 @@ class OnnxSessionMatcher:
             k1, k2, P, self.match_threshold, self.max_matches, self.dbin)
         n = len(mk1)
         if n < self.min_matches:
+            self.last = {"kpts2": mk2, "inlier_mask": np.zeros(n, bool),
+                         "n_matches": n}
             return {"ok": False, "n_matches": n, "inlier_ratio": 0.0}
         method = cv2.USAC_MAGSAC if self.method == "magsac" else cv2.RANSAC
         R, t, mask = estimate_pose_ransac(
             mk1, mk2, self.cam, ransac_threshold=self.ransac_threshold,
             method=method)
         if R is None:
+            self.last = {"kpts2": mk2, "inlier_mask": np.zeros(n, bool),
+                         "n_matches": n}
             return {"ok": False, "n_matches": n, "inlier_ratio": 0.0}
         n_inl = int(np.sum(mask))
         ratio = n_inl / n if n else 0.0
         ok = n_inl >= self.min_matches and ratio >= self.min_inlier_ratio
+        self.last = {"kpts2": mk2, "inlier_mask": mask, "n_matches": n_inl}
         return {"ok": ok, "R": R, "t": t,
                 "inlier_ratio": ratio, "n_matches": n_inl}

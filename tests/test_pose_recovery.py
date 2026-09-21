@@ -9,10 +9,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
-sys.path.insert(0, str(Path(__file__).parent / "sample"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sample.visual_odometry import extract_matches, _remap_pose_mask
+from vo.pose_recovery import extract_matches, _remap_pose_mask
 
 
 def make_sinkhorn_matrix(core_scores: np.ndarray) -> np.ndarray:

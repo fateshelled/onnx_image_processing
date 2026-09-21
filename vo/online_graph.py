@@ -1,23 +1,34 @@
 """Online keyframe pose graph with a fixed-lag window and NL-Reg.
 
-This module owns all the pose-graph logic (keyframe promotion, per-frame
-spoke/loop matching requests, Schur marginalization of transient frames,
-multi-node priors for exited keyframes, direction-dependent Tikhonov
-regularization). Callers such as ``sample/visual_odometry.py`` only feed
-frames in and read the current camera pose back out.
+This module owns **all** the pose-graph logic so the offline evaluator
+(``eval/rustuna_tune_loop.py``) and the streaming sample
+(``sample/visual_odometry.py``) share one implementation:
 
-The graph is matcher-agnostic: the caller passes ``match_fn(image_a,
-image_b) -> dict`` where the dict has keys ``ok`` (bool), ``R`` (3x3),
-``t`` (3,), ``inlier_ratio`` and ``n_matches``. The graph stores only the
-images it still needs (keyframes and the most recent frame).
+* keyframe promotion by a motion criterion;
+* per-frame odometry propagation (chain) and additive keyframe spokes;
+* Schur marginalization of transient frames into relative priors;
+* deferred (option 1) marginalization of exited keyframes into multi-node
+  priors;
+* loop closure with the temporal-consistency gate and cycle handling;
+* direction-dependent Tikhonov regularization (NL-Reg).
+
+The graph is matcher-agnostic and **index-based**: the caller passes
+``match_fn(i, j) -> dict`` where the dict has keys ``ok`` (bool), ``R``
+(3x3), ``t`` (3,), ``inlier_ratio`` and ``n_matches``. Indices are opaque
+increasing frame ids (stride-frame ids for the evaluator, frame counters for
+the sample); the graph stores no images, only poses/keyframes/priors, so the
+caller owns whatever features it needs to answer the matches.
 
 Pose convention matches ``Trajectory.add_relative_pose``: the relative
 measurement ``(R, t)`` is a world-to-camera point transform
 (``x_curr = R @ x_prev + t``, as returned by ``cv2.recoverPose``).
 """
 
+from __future__ import annotations
+
 import numpy as np
 
+from .loop_closure import confirmed_loop_hits, edge_key
 from .se3_window import SlidingWindowOptimizer
 
 # Default parameters for the online sequential graph (optuna-tuned seq_opt1).
@@ -31,6 +42,10 @@ DEFAULT_PARAMS = {
     "tsvd_ratio": 0.0, "scale_kf": False,
     "graph_mode": "kf_prior", "max_keyframes": 3, "seq_tsvd_ratio": 0.0,
     "nl_reg": True, "nl_reg_c": 10.0, "nl_reg_tau": 10.0, "nl_reg_length": 1.0,
+    # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
+    # 2 * max_keyframes. Loop closures additionally trigger one global reduced
+    # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
+    "held_cap": None, "global_opt_on_loop": True, "global_opt_period": 0,
 }
 
 
@@ -50,13 +65,28 @@ def _rot_deg(R):
     return float(np.degrees(np.arccos(np.clip(co, -1.0, 1.0))))
 
 
+def _trans_consistent(dT, t, gate_deg):
+    """True when the chain translation and the measured one agree in direction."""
+    if gate_deg <= 0.0:
+        return True
+    d = np.asarray(dT[:3, 3], float).reshape(3)
+    t = np.asarray(t, float).reshape(3)
+    n = np.linalg.norm(d) * np.linalg.norm(t)
+    if n < 1e-12:
+        return True
+    cos = float(np.clip(float(d @ t) / n, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos))) <= gate_deg
+
+
 class OnlinePoseGraph:
     """Online sequential pose graph.
 
     Parameters are read from a plain dict (defaults come from
-    ``eval.rustuna_tune_loop.SEQ_OPT1_DEFAULTS`` upstream). The graph keeps
-    at most ``max_keyframes`` active keyframes; transient frames are
-    marginalized into relative priors when a new keyframe is promoted.
+    ``DEFAULT_PARAMS``). The graph keeps at most ``max_keyframes`` active
+    keyframes; transient frames are marginalized into relative priors when a
+    new keyframe is promoted, and exited keyframes are deferred (option 1)
+    until their Markov blanket is active, then marginalized into multi-node
+    priors.
     """
 
     def __init__(self, params, cam, match_fn):
@@ -66,68 +96,109 @@ class OnlinePoseGraph:
         self.kf_min_gap = 4
         self.kf_max_gap = int(params.get("kf_max_gap", 16))
         self.max_kf = params.get("max_keyframes")
-        self._next = 0
-        self._img = {}
-        self._T = {}          # odom chain camera-to-world
+        self._T = {}            # odom chain camera-to-world
         self._kf = []
-        self._est = {}        # optimized keyframe poses
+        self._est = {}          # optimized keyframe poses
         self._last = None
-        self._seg = []        # transient ids since the last keyframe
-        self._odom = {}       # frame id -> (R, t) relative to the previous frame
-        self._spoke = {}      # frame id -> (ref_kf, R, t, inlier, n_matches)
-        self._priors = []     # pairwise transient priors (a, b, G, Omega)
+        self._prev = {}         # frame id -> previous frame id (chain)
+        self._step = 1          # index step between consecutive frames
+        self._seg = []          # transient ids since the last keyframe
+        self._odom = {}         # frame id -> (R, t) relative to the previous frame
+        self._spoke = {}        # frame id -> (ref_kf, R, t, inlier, n_matches)
+        self._priors = []       # pairwise transient priors (a, b, G, Omega)
         self._node_priors = []  # multi-node priors (ids, H, b, x0)
-        self._hits = []       # per-keyframe loop hits (temporal confirmation)
+        self._hits = []         # per-keyframe loop hits (temporal confirmation)
+        self._added = set()     # edge_key set (odometry + accepted closures)
+        self._loops = []        # accepted loop edges (a, b, R, t, sig)
+        self._pending_global = False  # a loop arrived; Tier-2 pass is owed
+        self.n_loop = 0
+        self.last_n_nodes = 0
+        self._held_cap = params.get("held_cap")
+        if self._held_cap is None and self.max_kf:
+            self._held_cap = 2 * int(self.max_kf)
+        self._eliminated = set()  # keyframes Schur-marginalized out
+        self._rel = {}            # closed transient id -> (anchor_kf, rel transform)
+        self.n_dropped_held = 0   # unique held keyframes dropped by the cap
+        self._dropped_held = set()
+        self._last_global_kf = 0  # keyframe count at the last Tier-2 pass
         self.last_stats = {"ok": True, "inlier_ratio": 1.0, "n_matches": 0}
 
     # -- public -------------------------------------------------------------
 
-    def add_frame(self, image):
-        """Process one frame and return its camera-to-world 4x4 pose."""
-        fid = self._next
-        self._next += 1
+    @property
+    def n_kf(self):
+        return len(self._kf)
+
+    @property
+    def keyframes(self):
+        """Current keyframe ids (for callers that cache per-frame features)."""
+        return list(self._kf)
+
+    def add_frame(self, idx, odom=None):
+        """Process one frame ``idx`` and return its camera-to-world 4x4 pose.
+
+        ``odom`` optionally supplies the chain measurement ``(R, t)`` from the
+        previous frame; when omitted it is obtained from ``match_fn``. The
+        evaluator injects its precomputed odometry this way.
+        """
+        idx = int(idx)
         if self._last is None:
-            self._img[fid] = image
-            self._T[fid] = np.eye(4)
-            self._kf = [fid]
-            self._est[fid] = np.eye(4)
-            self._last = fid
+            self._T[idx] = np.eye(4)
+            self._kf = [idx]
+            self._est[idx] = np.eye(4)
+            self._last = idx
+            self.last_stats = {"ok": True, "inlier_ratio": 1.0, "n_matches": 0}
             return np.eye(4)
 
-        # Odometry: chain from the previous frame.
-        res = self.match(self._img[self._last], image)
-        self.last_stats = {
-            "ok": bool(res and res.get("ok")),
-            "inlier_ratio": float(res.get("inlier_ratio", 0.0)) if res else 0.0,
-            "n_matches": int(res.get("n_matches", 0)) if res else 0,
-        }
-        T = self._T[self._last]
-        if res and res.get("ok"):
-            self._odom[fid] = (np.asarray(res["R"], float),
-                               np.asarray(res["t"], float).reshape(3))
-            T = _compose(T, res["R"], res["t"])
-        self._T[fid] = T
+        prev = self._last
+        if odom is None:
+            res = self.match(prev, idx)
+            ok = bool(res and res.get("ok"))
+            R = np.asarray(res["R"], float) if ok else None
+            t = np.asarray(res["t"], float).reshape(3) if ok else None
+            inl = float(res.get("inlier_ratio", 0.0)) if res else 0.0
+            nm = int(res.get("n_matches", 0)) if res else 0
+        else:
+            ok = odom[0] is not None
+            R = np.asarray(odom[0], float) if ok else None
+            t = np.asarray(odom[1], float).reshape(3) if ok else None
+            inl = float(odom[2]) if len(odom) > 2 else 1.0
+            nm = int(odom[3]) if len(odom) > 3 else -1
+        self.last_stats = {"ok": bool(ok), "inlier_ratio": inl, "n_matches": nm}
 
-        # Spoke: match against the current keyframe (for the KF edge later).
-        last_kf = self._kf[-1]
-        sres = self.match(self._img[last_kf], image)
-        if sres and sres.get("ok"):
-            self._spoke[fid] = (last_kf, np.asarray(sres["R"], float),
+        self._prev[idx] = prev
+        self._step = idx - prev
+        T = self._T[prev]
+        if ok:
+            self._odom[idx] = (R, t)
+            T = _compose(T, R, t)
+        self._T[idx] = T
+
+        # Additive keyframe spokes: constrain the frame to the last K keyframes
+        # (K=1 keeps the previous single-hub behaviour).
+        gate_deg = float(self.p.get("trans_gate_deg", 0.0))
+        min_inl = float(self.p.get("kf_edge_min_inlier", 0.0))
+        for ref in self._kf[-max(1, int(self.p.get("kf_local_map_k", 1))):]:
+            if ref == prev:
+                continue
+            sres = self.match(ref, idx)
+            if not (sres and sres.get("ok")):
+                continue
+            if float(sres.get("inlier_ratio", 0.0)) < min_inl:
+                continue
+            dT = np.linalg.inv(self._T[idx]) @ self._T[ref]
+            if not _trans_consistent(dT, sres.get("t"), gate_deg):
+                continue
+            self._spoke[idx] = (int(ref), np.asarray(sres["R"], float),
                                 np.asarray(sres["t"], float).reshape(3),
                                 float(sres.get("inlier_ratio", 0.0)),
                                 int(sres.get("n_matches", -1)))
 
-        # Bookkeeping: keep keyframe images and only the newest frame image.
-        self._img[fid] = image
-        if self._last not in self._kf:
-            self._img.pop(self._last, None)
-        self._last = fid
-        self._seg.append(fid)
-
-        # Keyframe promotion (motion criterion).
-        if self._promote(fid):
-            self._close_segment(fid)
-        return self._pose_of(fid)
+        self._last = idx
+        self._seg.append(idx)
+        if self._promote(idx):
+            self._close_segment(idx)
+        return self._pose_of(idx)
 
     def pose(self, frame_id=None):
         return self._pose_of(self._last if frame_id is None else frame_id)
@@ -147,83 +218,208 @@ class OnlinePoseGraph:
                      or rot >= self.p.get("kf_rot_thresh", 10.0)))
 
     def _close_segment(self, new_kf):
-        """Optimize [prev_kf, transients, new_kf], marginalize the transients."""
+        """Optimize [prev_kf, transients, new_kf], marginalize the transients.
+
+        Mirrors the eval driver's option-1 scheme: exited keyframes referenced
+        by a prior are kept (as free nodes) until their Markov blanket is fully
+        active, then Schur-marginalized into a multi-node prior and dropped.
+        """
         a = self._kf[-1]
         b = new_kf
-        trans = [i for i in self._seg if i != b]
-        active, boundary = self._window()
-        node_set = set(active) | set(trans) | {b}
-        if boundary is not None:
-            node_set.add(boundary)
+        trans = [i for i in self._seg if i != b and i != a]
+        # Active (free) keyframes: the last ``max_keyframes - 1`` existing
+        # keyframes plus the new one, matching the legacy driver's window
+        # (which includes b).
+        if self.max_kf:
+            n = max(1, int(self.max_kf))
+            free_kf = (self._kf[-(n - 1):] if n > 1 else []) + [b]
+        else:
+            free_kf = list(self._kf) + [b]
+        free_set = set(free_kf)
+        # Held keyframes (bounded): exited keyframes that an existing prior
+        # still links to a free node. Only one hop from the priors is used --
+        # transitive propagation along KF-KF adjacency, which would pull in the
+        # whole trajectory and defeat max_keyframes, is deliberately avoided.
+        # Eliminated keyframes are never reintroduced.
+        trans_set = set(trans)
+        if a not in free_set:
+            free_set.add(a)
+        held = set()
+        for (x, y, *_r) in self._priors:
+            if x in free_set and y not in free_set and y not in self._eliminated:
+                held.add(y)
+            if y in free_set and x not in free_set and x not in self._eliminated:
+                held.add(x)
+        for (ids, *_r) in self._node_priors:
+            if any(nd in free_set for nd in ids):
+                for nd in ids:
+                    if (nd not in free_set and nd not in trans_set
+                            and nd not in self._eliminated):
+                        held.add(nd)
+        # Hard cap: node set is bounded by construction. The oldest held
+        # keyframes beyond the cap are dropped (their pending priors are then
+        # skipped); counted so the loss is observable, not silent.
+        if self._held_cap is not None and len(held) > int(self._held_cap):
+            keep = int(self._held_cap)
+            excess = set(sorted(held)[:len(held) - keep])
+            self.n_dropped_held += len(excess - self._dropped_held)
+            self._dropped_held |= excess
+            held = set(sorted(held)[len(held) - keep:]) if keep > 0 else set()
+        node_set = set(free_kf) | held | trans_set | {a, b}
         nodes = sorted(node_set)
+        self.last_n_nodes = len(node_set)
 
         act = self._new_window()
         for nd in nodes:
-            act.add_node(nd, self._est.get(nd, self._T[nd]),
-                         fixed=(nd == boundary))
+            act.add_node(nd, self._est.get(nd, self._T[nd]))
         for (x, y, G, Om) in self._priors:
             if x in node_set and y in node_set:
                 act.add_edge(x, y, G, omega=Om)
         for (ids, H, bb, x0) in self._node_priors:
             if all(nd in node_set for nd in ids):
                 act.add_prior_factor(ids, H, bb, x0)
-        # Chain edges (consecutive frames) and spokes (frame -> last keyframe,
-        # which for the new keyframe b is the direct a-b measurement).
+        # Chain edges (consecutive frames) and spokes (frame -> keyframe).
         for v in trans + [b]:
             if v in self._odom:
                 R, t = self._odom[v]
-                act.add_edge(v - 1, v, self._meas(R, t), scale_free=True)
+                p = self._prev[v]
+                act.add_edge(p, v, self._meas(R, t), scale_free=True)
+                self._added.add(edge_key(p, v))
         for v in trans + [b]:
             if v in self._spoke:
                 ref, R, t, _inl, _n = self._spoke[v]
-                if ref in node_set and ref != v - 1:
+                if ref in node_set and ref != self._prev.get(v):
                     act.add_edge(ref, v, self._meas(R, t), scale_free=True)
-        # Loop edges among active keyframes (simple: spoke of each KF to a).
-        self._add_loops(act, node_set, b)
-        if self.p.get("nl_reg", True):
+                    self._added.add(edge_key(ref, v))
+        self._add_loops(b)
+        # Re-inject every accepted loop edge whose endpoints are both active,
+        # exactly like the legacy driver's ``loop_edges``: a loop measured once
+        # keeps constraining later windows instead of being used a single time.
+        present = set()
+        for v in trans + [b]:
+            if v in self._odom:
+                present.add(edge_key(self._prev[v], v))
+            if v in self._spoke:
+                present.add(edge_key(self._spoke[v][0], v))
+        for (la, lb, lR, lt, lsig) in self._loops:
+            k = edge_key(la, lb)
+            if la in node_set and lb in node_set and k not in present:
+                act.add_edge(la, lb, self._meas(lR, lt), scale_free=True,
+                             **lsig)
+                present.add(k)
+        nl_reg = bool(self.p.get("nl_reg", True))
+        if nl_reg:
             act.add_nl_regularization(self.p.get("nl_reg_c", 10.0),
                                       self.p.get("nl_reg_tau", 10.0),
                                       self.p.get("nl_reg_length", 1.0))
         act.optimize()
+        # NL-Reg is a solver-only regularizer: remove it before marginalizing so
+        # it is neither counted as a blanket edge nor baked into the prior.
+        if nl_reg:
+            act.pop_last_prior_factor()
         if trans:
             aa, bb2, G, Om = act.marginalize_relative(trans, [a, b],
                                                       fix_scales=True)
             self._priors.append((aa, bb2, G, Om))
+        # Only keyframes keep absolute optimized poses; transients are stored as
+        # relative transforms from their anchor keyframe so a later global
+        # update (Tier 2) moves them consistently.
         for nd in nodes:
-            if nd != boundary:
+            if nd in self._kf or nd == b:
                 self._est[nd] = act.get_pose(nd)
-        # Promote: drop transients, extend keyframes, bound the window.
+        # Marginalize a held keyframe once its blanket is fully active. The
+        # eliminated keyframe is recorded so it is never reintroduced.
+        referenced = {nd for (ids, *_r) in self._node_priors for nd in ids
+                      if nd not in self._eliminated}
+        for E in sorted(held):
+            if E in self._eliminated or E not in act.pose_ids:
+                continue
+            if E in referenced:
+                continue
+            nbr = set()
+            for (i, j, *_r) in act.edges:
+                if i == E:
+                    nbr.add(j)
+                elif j == E:
+                    nbr.add(i)
+            for (ids, *_r) in act.prior_factors:
+                if E in ids:
+                    nbr |= (set(ids) - {E})
+            nbr = {x for x in nbr if x in node_set and x not in trans
+                   and x not in self._eliminated}
+            if nbr and nbr <= free_set:
+                keep_ids, H_r, b_r = act.marginalize_general([E], sorted(nbr))
+                self._node_priors.append(
+                    (tuple(keep_ids), H_r, b_r,
+                     [act.get_pose(k) for k in keep_ids]))
+                self._eliminated.add(E)
+        # Prune priors/loops fully consumed by elimination so the per-window
+        # scan stays proportional to the bounded active set, not to N.
+        if self._eliminated:
+            self._priors = [pr for pr in self._priors
+                            if not (pr[0] in self._eliminated
+                                    and pr[1] in self._eliminated)]
+            self._loops = [lp for lp in self._loops
+                           if not (lp[0] in self._eliminated
+                                   and lp[1] in self._eliminated)]
+        # Drop transients (keeping their anchor-relative transform).
         for i in trans:
-            self._img.pop(i, None)
+            self._rel[i] = (a, np.linalg.inv(self._T[a]) @ self._T[i])
             self._T.pop(i, None)
             self._spoke.pop(i, None)
         self._kf.append(b)
         self._seg = []  # transients of the next segment start after b
-        self._evict()
+        # Tier 2: a loop closure owes one (heavier, occasional) global pass
+        # over all keyframes + accumulated priors + loop edges.
+        if self._pending_global:
+            period = int(self.p.get("global_opt_period", 0) or 0)
+            if period <= 0 or len(self._kf) - self._last_global_kf >= period:
+                self._pending_global = False
+                self._last_global_kf = len(self._kf)
+                self._global_reduce_optimize()
 
-    def _window(self):
-        if self.max_kf is None:
-            return list(self._kf), None
-        w = max(1, int(self.max_kf))
-        active = self._kf[-w:]
-        boundary = self._kf[-w - 1] if len(self._kf) > w else None
-        return active, boundary
-
-    def _evict(self):
-        """Option 1: keep exited keyframes fixed until their blanket is ready."""
-        active, _ = self._window()
-        # Nothing to do here for the simple version: window is bounded by
-        # max_keyframes and older keyframes are dropped with their priors kept
-        # only while referenced. (Multi-node marginalization of exited KFs is
-        # the next step; for now bound the kept image/pose memory.)
-        keep = set(active)
-        for (x, y, *_r) in self._priors:
-            keep.add(x)
-            keep.add(y)
-        for nd in list(self._est):
-            if nd not in keep and nd not in self._kf[-1:]:
-                # keep estimates for reporting; images already dropped
-                pass
+    def _add_loops(self, b):
+        # Loop closure with the temporal-consistency gate: match the new
+        # keyframe against older keyframes in the window, then keep only hits
+        # confirmed by the previous ``loop_temporal_k - 1`` keyframes.
+        window = int(self.p.get("loop_window", 80))
+        min_gap = int(self.p.get("loop_min_gap", 30))
+        min_inl = float(self.p.get("loop_min_inlier", 0.4))
+        need = max(1, int(self.p.get("loop_temporal_k", 1)))
+        hits = []
+        for a in self._kf[-window:]:
+            if a == b or b - a < min_gap or a in self._eliminated:
+                continue
+            # Detect against every keyframe in the window, not only the active
+            # ones: a far loop endpoint may have left the bounded node set, in
+            # which case Tier 2 applies the edge to the global reduced graph.
+            r = self.match(a, b)
+            if r and r.get("ok") and r.get("inlier_ratio", 0.0) >= min_inl:
+                hits.append((int(a), np.asarray(r["R"], float),
+                             np.asarray(r["t"], float).reshape(3),
+                             float(r.get("inlier_ratio", 0.0)),
+                             int(r.get("n_matches", -1))))
+        bi = len(self._kf)  # index of the new keyframe
+        while len(self._hits) < bi:
+            self._hits.append([])
+        self._hits.append(hits)
+        gaps = [self._kf[i + 1] - self._kf[i] for i in range(len(self._kf) - 1)]
+        gaps.append(b - self._kf[-1])
+        kf_step = max(gaps) if gaps else self._step
+        margin = max(int(1.5 * kf_step), kf_step)
+        accepted = confirmed_loop_hits(b, hits, bi, self._hits, need, margin,
+                                       self._added)
+        sig_scale = float(self.p.get("loop_sigma_scale", 0.0))
+        for (a, R, t, _inl, _n) in accepted:
+            sig = {}
+            if sig_scale > 0:
+                sig = {"sigma_t": self.p.get("step_scale_t", 0.1) * sig_scale,
+                       "sigma_r": self.p.get("step_scale_t", 0.1) * sig_scale}
+            self._loops.append((int(a), int(b), np.asarray(R, float),
+                                np.asarray(t, float).reshape(3), sig))
+            self._added.add(edge_key(a, b))
+            self.n_loop += 1
+            self._pending_global = True
 
     def _new_window(self):
         return SlidingWindowOptimizer(
@@ -234,22 +430,66 @@ class OnlinePoseGraph:
             step_scale_r=self.p.get("step_scale_t", 0.1),
             optimize_scale=True,
             scale_prior_sigma=self.p.get("scale_prior_sigma", 2.0),
-            tsvd_ratio=0.0)
+            tsvd_ratio=(0.0 if self.p.get("nl_reg", True)
+                        else self.p.get("seq_tsvd_ratio", 0.0)))
 
-    def _add_loops(self, act, node_set, b):
-        # Simple loop closure: try matching the new keyframe against the
-        # previous keyframes in the window and add accepted edges.
-        window = int(self.p.get("loop_window", 80))
-        min_gap = int(self.p.get("loop_min_gap", 30))
-        min_inl = float(self.p.get("loop_min_inlier", 0.4))
-        for a in self._kf[-window:]:
-            if a == b or b - a < min_gap:
-                continue
-            if a not in node_set or a not in self._img:
-                continue
-            r = self.match(self._img[a], self._img[b])
-            if r and r.get("ok") and r.get("inlier_ratio", 0.0) >= min_inl:
-                act.add_edge(a, b, self._meas(r["R"], r["t"]), scale_free=True)
+    def _global_reduce_optimize(self):
+        """Tier 2: occasional global pass over the reduced keyframe graph.
+
+        Nodes are all keyframes, factors are the accumulated pairwise/multi-node
+        priors and every accepted loop edge. This distributes a new loop
+        constraint across the whole trajectory without running a full-graph
+        solve on every keyframe. NL-Reg is intentionally skipped here to keep
+        the occasional pass affordable.
+        """
+        if not self.p.get("global_opt_on_loop", True) or len(self._kf) < 2:
+            return
+        # Eliminated keyframes are represented only through their marginal
+        # priors, so they must not be re-added here (that would double count).
+        kfs = [k for k in self._kf if k not in self._eliminated and k in self._est]
+        if len(kfs) < 2:
+            return
+        act = self._new_window()
+        for k in kfs:
+            act.add_node(k, self._est[k])
+        for (x, y, G, Om) in self._priors:
+            if x in act.pose_ids and y in act.pose_ids:
+                act.add_edge(x, y, G, omega=Om)
+        for (ids, H, bb, x0) in self._node_priors:
+            if all(nd in act.pose_ids for nd in ids):
+                act.add_prior_factor(ids, H, bb, x0)
+        for (a, b, R, t, sig) in self._loops:
+            if a in act.pose_ids and b in act.pose_ids:
+                act.add_edge(a, b, self._meas(R, t), scale_free=True, **sig)
+        act.optimize()
+        for k in kfs:
+            self._est[k] = act.get_pose(k)
+
+    def _pose_of(self, fid):
+        if fid in self._est:
+            return self._est[fid].copy()
+        # Transient: propagate from its anchor keyframe, rescaling the segment
+        # translation (scale-free KF edges). Closed transients use the stored
+        # anchor-relative transform so later global updates stay consistent.
+        if fid in self._rel:
+            p, rel = self._rel[fid]
+            rel = rel.copy()
+        else:
+            p = max(k for k in self._kf if k <= fid)
+            rel = np.linalg.inv(self._T[p]) @ self._T[fid]
+        rel[:3, 3] *= self._seg_alpha(p)
+        return self._est[p] @ rel
+
+    def _seg_alpha(self, p):
+        i = self._kf.index(p)
+        if i + 1 >= len(self._kf):
+            return 1.0
+        q = self._kf[i + 1]
+        if p not in self._est or q not in self._est:
+            return 1.0
+        d_opt = float(np.linalg.norm(self._est[q][:3, 3] - self._est[p][:3, 3]))
+        d_odom = float(np.linalg.norm(self._T[q][:3, 3] - self._T[p][:3, 3]))
+        return d_opt / d_odom if d_odom > 1e-9 else 1.0
 
     @staticmethod
     def _meas(R, t):
@@ -257,11 +497,3 @@ class OnlinePoseGraph:
         M[:3, :3] = np.asarray(R, float)
         M[:3, 3] = np.asarray(t, float).reshape(3)
         return M
-
-    def _pose_of(self, fid):
-        if fid in self._est:
-            return self._est[fid].copy()
-        # Transient: propagate from the nearest (last) keyframe along the chain.
-        p = self._kf[-1]
-        rel = np.linalg.inv(self._T[p]) @ self._T[fid]
-        return self._est[p] @ rel

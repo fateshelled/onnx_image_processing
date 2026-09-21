@@ -151,6 +151,7 @@ def load_cache(cache_dir, seq):
 # shared with the online graph module. Callers that need the batch graph must
 # pass graph_mode="stride" explicitly.
 from vo.online_graph import DEFAULT_PARAMS as _SEQ_DEFAULTS  # noqa: E402
+from vo.online_graph import OnlinePoseGraph  # noqa: E402
 
 SEQ_OPT1_DEFAULTS = {
     **_SEQ_DEFAULTS,
@@ -301,6 +302,41 @@ def _sequential_kf_priors(opt, kf, keys, params):
     return red
 
 
+def _eval_online_kf_prior(c, params, cam, match_frames):
+    """Drive ``OnlinePoseGraph`` over a cached sequence (the online driver).
+
+    The precomputed per-frame odometry is injected so the chain is identical to
+    the legacy evaluator; every other match (keyframe spokes + loop closures)
+    goes through the shared, memoized ``match_frames``. ATE is over all stride
+    frames, with intermediate frames propagated by the graph itself.
+    """
+    stride = int(c["stride"])
+    graph = OnlinePoseGraph(params, cam, match_frames)
+    graph.add_frame(0)
+    keys = [0]
+    for n, o in enumerate(c["odom"]):
+        idx = (n + 1) * stride
+        # Always pass the odometry slot; ``R is None`` means "failed, keep the
+        # previous pose without adding an edge" (legacy behaviour). Passing
+        # ``odom=None`` would instead ask the graph to match on its own.
+        if o.get("ok"):
+            od = (o.get("R"), o.get("t"), float(o.get("inlier", 1.0)))
+        else:
+            od = (None, None, 0.0)
+        graph.add_frame(idx, odom=od)
+        keys.append(idx)
+    est = np.array([graph.pose(k)[:3, 3] for k in keys])
+    gt_pos = c["gt_pos"]
+    gt = np.array([gt_pos[k // stride] for k in keys])
+    if len(est) >= 3:
+        s, R_a, t_a = umeyama(est, gt, with_scale=True)
+        aligned = s * (est @ R_a.T) + t_a
+        ate = float(np.median(np.linalg.norm(aligned - gt, axis=1)))
+    else:
+        ate = float("nan")
+    return {"ATE_median": ate, "n_loop": graph.n_loop, "n_kf": graph.n_kf}
+
+
 # --------------------------------------------------------------------------
 # Evaluator (mirrors run_vo's loop-closure block)
 # --------------------------------------------------------------------------
@@ -342,6 +378,11 @@ def eval_seq(c, params, cam, desc_matcher, match_cache=None, diag=None):
             cached = {"ok": False, "n_matches": int(res.get("n_matches", -1))}
         match_cache[key] = cached
         return cached
+
+    # The tuned/production graph mode is driven by the shared online graph, so
+    # the evaluator and the streaming sample run exactly the same code.
+    if params.get("graph_mode") == "kf_prior":
+        return _eval_online_kf_prior(c, params, cam, match_frames)
 
     # --- odometry pass (chain) + optional additive keyframe edges ---
     traj = Trajectory()

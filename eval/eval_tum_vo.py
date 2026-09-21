@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 import cv2  # noqa: E402
 import onnxruntime as ort  # noqa: E402
 
-from vo.outlier_filters import dustbin_margin_filter  # noqa: E402
+from vo.onnx_matcher import extract_matches  # noqa: E402,F401
 from vo.sinkhorn_numpy import NumpySinkhornMatcher  # noqa: E402
 from vo.pose_estimation import (  # noqa: E402
     estimate_pose_ransac,
@@ -173,31 +173,7 @@ def quat_to_se3(t, q):
 # --------------------------------------------------------------------------
 # Matching
 # --------------------------------------------------------------------------
-def extract_matches(kpts1, kpts2, P, threshold, max_matches, dbin_margin):
-    """Mutual-NN + dustbin-margin filter + top-K. Returns (kpts1, kpts2, scores)."""
-    P = P[0]  # (K+1, K+1)
-    k1 = kpts1[0]  # (K, 2) (y, x)
-    k2 = kpts2[0]
-    K = k1.shape[0]
-    Pc = P[:K, :K]
-    max_j = np.argmax(Pc, axis=1)
-    max_i = np.argmax(Pc, axis=0)
-    mutual = np.arange(K) == max_i[max_j]
-    scores = Pc[np.arange(K), max_j]
-
-    dbin = dustbin_margin_filter(P, dbin_margin)  # mask over K source pts
-    pad = (k1[:, 0] >= 0) & (k1[:, 1] >= 0) & (k2[:, 0] >= 0) & (k2[:, 1] >= 0)
-    valid = mutual & dbin & pad & (scores >= threshold)
-
-    idx_i = np.where(valid)[0]
-    if len(idx_i) == 0:
-        return k1[:0], k2[:0], np.array([])
-    j = max_j[idx_i]
-    sc = scores[idx_i]
-    order = np.argsort(sc)[::-1][:max_matches]
-    idx_i = idx_i[order]
-    j = j[order]
-    return k1[idx_i], k2[j], sc
+# extract_matches now lives in vo.onnx_matcher (shared with the online graph).
 
 
 # --------------------------------------------------------------------------
