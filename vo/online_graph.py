@@ -311,12 +311,14 @@ class OnlinePoseGraph:
                 present.add(edge_key(self._prev[v], v))
             if v in self._spoke:
                 present.add(edge_key(self._spoke[v][0], v))
+        loop_act_ei = {}  # edge_key -> index in act.edges (for the local naive)
         for (la, lb, lR, lt, lsig) in self._loops:
             k = edge_key(la, lb)
             if la in node_set and lb in node_set and k not in present:
                 act.add_edge(la, lb, self._meas(lR, lt), scale_free=True,
                              **lsig)
                 present.add(k)
+                loop_act_ei[k] = len(act.edges) - 1
         nl_reg = bool(self.p.get("nl_reg", True))
         if nl_reg:
             act.add_nl_regularization(self.p.get("nl_reg_c", 10.0),
@@ -348,22 +350,22 @@ class OnlinePoseGraph:
         for E in sorted(held):
             if E in self._eliminated or E not in act.pose_ids:
                 continue
-            # Factors incident to E. Those actually present in the current
-            # solve (both endpoints live) supply the marginal; all of them are
-            # removed because a factor with an eliminated endpoint can never be
-            # applied again.
-            inc_pri_all = [pr for pr in self._priors[:n_pri]
-                           if E in (pr[0], pr[1])]
-            inc_loop_all = [lp for lp in self._loops if E in (lp[0], lp[1])]
-            inc_npri_all = [npr for npr in self._node_priors if E in npr[0]]
-            if not (inc_pri_all or inc_loop_all or inc_npri_all):
+            # Only incident factors whose endpoints are ALL in the current
+            # window enter the marginal (they were in `act`), so only those may
+            # be removed. Incident factors reaching outside the window are not
+            # represented by H_r; they are kept so Tier 2 (which re-adds their
+            # far endpoints, possibly as fixed landmarks) can still use them.
+            inc_pri = [pr for pr in self._priors[:n_pri]
+                       if E in (pr[0], pr[1])
+                       and pr[0] in node_set and pr[1] in node_set]
+            inc_loop = [lp for lp in self._loops
+                        if E in (lp[0], lp[1])
+                        and lp[0] in node_set and lp[1] in node_set]
+            inc_npri = [npr for npr in self._node_priors
+                        if E in npr[0]
+                        and all(nd in node_set for nd in npr[0])]
+            if not (inc_pri or inc_loop or inc_npri):
                 continue
-            inc_pri = [pr for pr in inc_pri_all
-                       if pr[0] in node_set and pr[1] in node_set]
-            inc_loop = [lp for lp in inc_loop_all
-                        if lp[0] in node_set and lp[1] in node_set]
-            inc_npri = [npr for npr in inc_npri_all
-                        if all(nd in node_set for nd in npr[0])]
             nbr = set()
             for (x, y, *_r) in inc_pri:
                 nbr.add(x if y == E else y)
@@ -374,31 +376,29 @@ class OnlinePoseGraph:
             nbr.discard(E)
             nbr = {x for x in nbr if x in node_set and x not in trans
                    and x not in self._eliminated}
-            closure = set(nbr) | {E}
-            # A multi-node prior that extends past the closure cannot be
-            # represented by a marginal over nbr alone: defer elimination.
-            # Pairwise/loop factors whose far endpoint already left the window
-            # (eliminated or dropped) are dead, so they are simply removed.
-            if any(not set(npr[0]) <= closure for npr in inc_npri_all):
-                continue
             if not nbr or not nbr <= free_set:
                 continue
             sub = self._new_window()
-            for nd in sorted(closure):
+            for nd in sorted(set(nbr) | {E}):
                 sub.add_node(nd, act.get_pose(nd))
             for (x, y, G, Om) in inc_pri:
                 sub.add_edge(x, y, G, omega=Om)
             for (la, lb, R, t, sig) in inc_loop:
-                sub.add_edge(la, lb, self._meas(R, t), scale_free=True, **sig)
+                # Carry the scale optimized in `act` so the local linearization
+                # is consistent with the window solution. The edge index was
+                # recorded when the loop was re-injected, so it is unambiguous.
+                ei = loop_act_ei.get(edge_key(la, lb))
+                scale = float(act.get_scale(ei)) if ei is not None else 1.0
+                sub.add_edge(la, lb, self._meas(R, t), scale=scale, **sig)
             for (ids, H, bb, x0) in inc_npri:
                 sub.add_prior_factor(ids, H, bb, x0)
             keep_ids, H_r, b_r = sub.marginalize_general([E], sorted(nbr))
             new_npri.append((tuple(keep_ids), H_r, b_r,
                              [act.get_pose(k) for k in keep_ids]))
             self._eliminated.add(E)
-            remove_pri_ids |= {id(pr) for pr in inc_pri_all}
-            remove_loop_ids |= {id(lp) for lp in inc_loop_all}
-            remove_npri_ids |= {id(npr) for npr in inc_npri_all}
+            remove_pri_ids |= {id(pr) for pr in inc_pri}
+            remove_loop_ids |= {id(lp) for lp in inc_loop}
+            remove_npri_ids |= {id(npr) for npr in inc_npri}
         if remove_pri_ids:
             self._priors = [pr for pr in self._priors
                             if id(pr) not in remove_pri_ids]
