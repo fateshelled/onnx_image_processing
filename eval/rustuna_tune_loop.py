@@ -147,23 +147,17 @@ def load_cache(cache_dir, seq):
             "stride": int(z["stride"]), "n_frames": int(z["n_frames"])}
 
 
-# Default parameters for the sequential fixed-lag graph (seq_opt1 + NL-Reg).
-# These are the optuna-tuned values (eval/results/tune_seq_opt1.json, trial 17);
-# they are used for any key a caller does not provide. Existing baseline tools
-# that need the batch graph must pass graph_mode="stride" explicitly.
+# Default parameters for the sequential fixed-lag graph (seq_opt1 + NL-Reg),
+# shared with the online graph module. Callers that need the batch graph must
+# pass graph_mode="stride" explicitly.
+from vo.online_graph import DEFAULT_PARAMS as _SEQ_DEFAULTS  # noqa: E402
+
 SEQ_OPT1_DEFAULTS = {
-    "odom_ref": "kf", "kf_mode": "motion", "keyframe_decim": 15,
-    "kf_trans_thresh": 8.0, "kf_rot_thresh": 10.0,
-    "kf_local_map_k": 1, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
-    "loop_window": 80, "loop_min_gap": 30, "loop_min_inlier": 0.4,
-    "loop_temporal_k": 1, "loop_sigma_scale": 2.0,
-    "scale_prior_sigma": 2.0, "step_scale_t": 0.1, "loop_iterations": 10,
-    "tsvd_ratio": 0.0, "scale_kf": False, "scale_kf_q": 1e-3,
-    "scale_kf_r": 0.1, "scale_kf_sigma": 0.5, "scale_kf_adaptive": False,
-    "scale_kf_innov_tau": 3.0, "scale_kf_adapt_loop_ratio": 0.0,
+    **_SEQ_DEFAULTS,
+    "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
+    "scale_kf_adaptive": False, "scale_kf_innov_tau": 3.0,
+    "scale_kf_adapt_loop_ratio": 0.0,
     "loop_rot_only": False, "cycle_threshold_deg": 0.0,
-    "graph_mode": "kf_prior", "max_keyframes": 3, "seq_tsvd_ratio": 0.0,
-    "nl_reg": True, "nl_reg_c": 10.0, "nl_reg_tau": 10.0, "nl_reg_length": 1.0,
 }
 
 

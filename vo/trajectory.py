@@ -32,6 +32,12 @@ class Trajectory:
         self.poses: List[np.ndarray] = [np.eye(4, dtype=np.float64)]
         self.positions: List[np.ndarray] = [np.zeros(3, dtype=np.float64)]
 
+    def add_pose(self, T: np.ndarray) -> None:
+        """Append an absolute camera-to-world pose (4x4)."""
+        T = np.asarray(T, dtype=np.float64).copy()
+        self.poses.append(T)
+        self.positions.append(T[:3, 3].copy())
+
     def add_relative_pose(self, R: np.ndarray, t: np.ndarray) -> None:
         """
         Add a new pose relative to the last pose.

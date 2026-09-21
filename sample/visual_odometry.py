@@ -59,6 +59,8 @@ from vo import (
     Trajectory,
     create_camera,
 )
+from vo.online_graph import DEFAULT_PARAMS as GRAPH_DEFAULTS, OnlinePoseGraph
+from vo.onnx_matcher import OnnxSessionMatcher
 from provider_utils import create_session
 
 
@@ -507,6 +509,29 @@ class VideoReader:
         return self.total_frames
 
 
+def _output_indices(output_names):
+    """Resolve model outputs by name (robust to extra outputs / ordering).
+
+    Returns a dict with keys ``k1``, ``k2``, ``probs`` and ``e`` (None when
+    absent). Detecting by name keeps models with extra outputs (e.g.
+    descriptors) from being misread as an Essential matrix.
+    """
+    low = {n.lower(): i for i, n in enumerate(output_names)}
+
+    def pick(*cands):
+        for c in cands:
+            if c in low:
+                return low[c]
+        return None
+
+    return {
+        "k1": pick("keypoints1", "keypoints_1", "kp1"),
+        "k2": pick("keypoints2", "keypoints_2", "kp2"),
+        "probs": pick("matching_probs", "matching_probabilities", "probs"),
+        "e": pick("essential_matrix", "e_matrix", "e"),
+    }
+
+
 def run_visual_odometry(
     session: ort.InferenceSession,
     reader: VideoReader,
@@ -525,6 +550,7 @@ def run_visual_odometry(
     max_frames: int = None,
     verbose: bool = True,
     display: bool = False,
+    use_graph: bool = False,
 ) -> Trajectory:
     """
     Run visual odometry on video/image sequence/webcam.
@@ -574,10 +600,25 @@ def run_visual_odometry(
     input_names = [inp.name for inp in session.get_inputs()]
     output_names = [out.name for out in session.get_outputs()]
 
-    # Detect model type by number of outputs:
-    #   3 outputs → Sinkhorn-only model  (keypoints1, keypoints2, matching_probs)
-    #   4 outputs → Combined model       (keypoints1, keypoints2, matching_probs, E)
-    has_essential_matrix = len(output_names) >= 4
+    # Model outputs are resolved by name, so models with extra outputs
+    # (descriptors) or different ordering work unchanged.
+    oi = _output_indices(output_names)
+    e_idx = oi["e"]
+    has_essential_matrix = e_idx is not None
+
+    # Optional online pose graph: all graph logic lives in vo.online_graph;
+    # here we only provide a matcher that runs the ONNX session on two images.
+    graph = None
+    if use_graph:
+        # Matching mirrors the eval pipeline (mutual-NN + dustbin margin +
+        # top-K, then MAGSAC Essential solve). All of it lives in vo/.
+        matcher = OnnxSessionMatcher(
+            session, camera_intrinsics, input_names, oi,
+            match_threshold=match_threshold, max_matches=max(1024, max_matches),
+            dbin=0.1, method="magsac", ransac_threshold=ransac_threshold,
+            min_matches=min_matches, min_inlier_ratio=0.0)
+        graph = OnlinePoseGraph(dict(GRAPH_DEFAULTS), camera_intrinsics,
+                                matcher.match)
 
     # Warm up camera (allow auto-exposure/auto-focus to stabilize)
     if reader.is_camera:
@@ -630,16 +671,29 @@ def run_visual_odometry(
         # Convert current frame to model input
         curr_image = load_image_from_array(curr_frame, model_height, model_width)
 
+        if use_graph:
+            # Online pose graph path: the graph requests matches itself and
+            # returns the current camera-to-world pose.
+            T = graph.add_frame(curr_image)
+            trajectory.add_pose(T)
+            st = graph.last_stats
+            if verbose and processed_count % 10 == 0:
+                print(f"Frame {frame_count}: "
+                      f"position={trajectory.get_current_position()} "
+                      f"odom_ok={st['ok']} ratio={st['inlier_ratio']:.2f} "
+                      f"inl={st['n_matches']}")
+            continue
+
         # Run feature matching
         results = session.run(
             output_names,
             {input_names[0]: prev_image, input_names[1]: curr_image},
         )
 
-        keypoints1 = results[0]      # (1, K, 2)
-        keypoints2 = results[1]      # (1, K, 2)
-        matching_probs = results[2]  # (1, K+1, K+1)
-        E_onnx = results[3] if has_essential_matrix else None  # (3, 3) or None
+        keypoints1 = results[oi["k1"]]      # (1, K, 2)
+        keypoints2 = results[oi["k2"]]      # (1, K, 2)
+        matching_probs = results[oi["probs"]]  # (1, K+1, K+1)
+        E_onnx = results[e_idx] if has_essential_matrix else None  # (3, 3) or None
 
         # Extract matches
         matched_kpts1, matched_kpts2, _scores, pose_kpts1, pose_kpts2, pose_map = extract_matches(
@@ -979,6 +1033,12 @@ def parse_args():
         help="Display frames and trajectory in real-time (press 'q' to quit, 's' to save)"
     )
     parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Use the online keyframe pose graph (vo.online_graph) instead of "
+             "plain relative-pose chaining. Graph logic lives in vo/."
+    )
+    parser.add_argument(
         "--quiet", "-q",
         action="store_true",
         help="Suppress progress output"
@@ -1001,11 +1061,11 @@ def main():
     model_height = input_shape[2]
     model_width = input_shape[3]
 
-    has_essential_matrix = len(outputs) >= 4
+    has_essential_matrix = _output_indices([o.name for o in outputs])["e"] is not None
     model_type = (
-        "Sinkhorn + Essential Matrix (4-output)"
+        "Sinkhorn + Essential Matrix"
         if has_essential_matrix
-        else "Sinkhorn (3-output)"
+        else "Sinkhorn (no Essential Matrix output)"
     )
     print(f"Model input size: {model_height}x{model_width}")
     print(f"Model type: {model_type}")
@@ -1114,6 +1174,7 @@ def main():
             max_frames=args.max_frames,
             verbose=not args.quiet,
             display=args.display,
+            use_graph=args.graph,
         )
     finally:
         reader.release()
