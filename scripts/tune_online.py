@@ -65,6 +65,8 @@ FIXED = {
     "scale_kf": False, "scale_kf_adaptive": False,
     "scale_kf_adapt_loop_ratio": 0.0, "scale_kf_innov_tau": 3.0,
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
+    # The online odometry-chain rotation gate is diagnostic-only: a 0/2/5/10
+    # degree A/B rejected valid corrective loops and worsened all train sets.
     "loop_rot_only": False, "cycle_threshold_deg": 0.0,
     "graph_mode": "kf_prior", "seq_tsvd_ratio": 0.0,
     "nl_reg": True, "global_opt_on_loop": True,
@@ -136,7 +138,8 @@ def objective(trial):
     for s in seqs:
         r = rtl.eval_seq(caches[s], params, cams[s], matcher, mcaches[s])
         per[s] = r["ATE_median"]
-        meta[s] = {"n_loop": r["n_loop"], "n_kf": r["n_kf"]}
+        meta[s] = {"n_loop": r["n_loop"], "n_kf": r["n_kf"],
+                   "n_cycle_reject": r.get("n_cycle_reject", 0)}
     vals = [per[s] for s in seqs]
     mean = float(np.mean(vals))
     worst = float(np.max(vals))

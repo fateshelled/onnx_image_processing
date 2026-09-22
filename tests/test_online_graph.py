@@ -104,6 +104,68 @@ def test_scale_kf_path_runs_and_zero_sigma_is_safe():
         assert graph._scale_kf.k > 0.0
 
 
+def test_rotation_cycle_gate_rejects_inconsistent_loop():
+    """The online path must honor cycle_threshold_deg before accepting loops."""
+    gt = [np.eye(4)]
+    step = se3_exp(np.array([0.0, 0.0, 0.01, 0.05, 0.0, 0.0]))
+    for _ in range(39):
+        gt.append(gt[-1] @ step)
+
+    def match_fn(a, b):
+        R, t = _relative(gt[a], gt[b])
+        if b - a >= 8:
+            bad = se3_exp(np.array(
+                [0.0, 0.0, np.radians(25.0), 0.0, 0.0, 0.0]))[:3, :3]
+            R = R @ bad
+        return {"ok": True, "R": R, "t": t, "inlier_ratio": 1.0,
+                "n_matches": 300}
+
+    params = {"kf_max_gap": 4, "max_keyframes": 3,
+              "kf_trans_thresh": 0.0, "kf_rot_thresh": 0.0,
+              "loop_iterations": 3, "step_scale_t": 0.1,
+              "scale_prior_sigma": 2.0, "loop_window": 20,
+              "loop_min_gap": 8, "loop_min_inlier": 0.4,
+              "loop_temporal_k": 1, "cycle_threshold_deg": 5.0,
+              "global_opt_on_loop": False, "nl_reg": False}
+    graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
+    for k in range(len(gt)):
+        graph.add_frame(k)
+
+    assert graph.n_cycle_rejected > 0
+    assert graph.n_loop == 0
+
+
+def test_rotation_cycle_gate_can_be_disabled():
+    """A zero threshold preserves the pre-existing loop acceptance behavior."""
+    gt = [np.eye(4)]
+    step = se3_exp(np.array([0.0, 0.0, 0.01, 0.05, 0.0, 0.0]))
+    for _ in range(23):
+        gt.append(gt[-1] @ step)
+
+    def match_fn(a, b):
+        R, t = _relative(gt[a], gt[b])
+        if b - a >= 8:
+            bad = se3_exp(np.array(
+                [0.0, 0.0, np.radians(25.0), 0.0, 0.0, 0.0]))[:3, :3]
+            R = R @ bad
+        return {"ok": True, "R": R, "t": t, "inlier_ratio": 1.0,
+                "n_matches": 300}
+
+    params = {"kf_max_gap": 4, "max_keyframes": 3,
+              "kf_trans_thresh": 0.0, "kf_rot_thresh": 0.0,
+              "loop_iterations": 3, "step_scale_t": 0.1,
+              "scale_prior_sigma": 2.0, "loop_window": 20,
+              "loop_min_gap": 8, "loop_min_inlier": 0.4,
+              "loop_temporal_k": 1, "cycle_threshold_deg": 0.0,
+              "global_opt_on_loop": False, "nl_reg": False}
+    graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
+    for k in range(len(gt)):
+        graph.add_frame(k)
+
+    assert graph.n_cycle_rejected == 0
+    assert graph.n_loop > 0
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from .cycle_consistency import rotation_angle_deg
 from .loop_closure import confirmed_loop_hits, edge_key
 from .scale_kf import ScaleKF
 from .se3_window import SlidingWindowOptimizer
@@ -43,6 +44,10 @@ DEFAULT_PARAMS = {
     "kf_local_map_k": 2, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
     "loop_window": 60, "loop_min_gap": 20, "loop_min_inlier": 0.5,
     "loop_temporal_k": 2, "loop_sigma_scale": 1.0,
+    # Rotation-only odometry-cycle gate. Zero keeps it disabled; non-zero
+    # values reject loop measurements whose rotation disagrees with the
+    # independently accumulated odometry chain by more than this many degrees.
+    "cycle_threshold_deg": 0.0,
     "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 10,
     "tsvd_ratio": 0.0, "scale_kf": False,
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
@@ -125,6 +130,7 @@ class OnlinePoseGraph:
                                      params.get("scale_kf_r", 0.1))
         self._pending_global = False  # a loop arrived; Tier-2 pass is owed
         self.n_loop = 0
+        self.n_cycle_rejected = 0
         self.last_n_nodes = 0
         self._held_cap = params.get("held_cap")
         if self._held_cap is None and self.max_kf:
@@ -476,6 +482,7 @@ class OnlinePoseGraph:
         window = int(self.p.get("loop_window", 80))
         min_gap = int(self.p.get("loop_min_gap", 30))
         min_inl = float(self.p.get("loop_min_inlier", 0.4))
+        cycle_deg = float(self.p.get("cycle_threshold_deg", 0.0))
         need = max(1, int(self.p.get("loop_temporal_k", 1)))
         hits = []
         for a in self._kf[-window:]:
@@ -503,6 +510,19 @@ class OnlinePoseGraph:
         margin = max(int(1.5 * kf_step), kf_step)
         accepted = confirmed_loop_hits(b, hits, bi, self._hits, need, margin,
                                        self._added)
+        if cycle_deg > 0.0:
+            cycle_accepted = []
+            for hit in accepted:
+                a, R, _t, _inl, _n = hit
+                # Compare against the odometry-only chain, before any graph
+                # optimization can make a bad loop appear self-consistent.
+                # Rotation is scale-free, so this remains meaningful for mono.
+                R_chain = (np.linalg.inv(self._T[b]) @ self._T[a])[:3, :3]
+                if rotation_angle_deg(R, R_chain) > cycle_deg:
+                    self.n_cycle_rejected += 1
+                else:
+                    cycle_accepted.append(hit)
+            accepted = cycle_accepted
         sig_scale = float(self.p.get("loop_sigma_scale", 0.0))
         for (a, R, t, _inl, _n) in accepted:
             sig = {}
