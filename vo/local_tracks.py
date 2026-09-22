@@ -8,6 +8,7 @@ from itertools import combinations
 import numpy as np
 
 from .onnx_matcher import extract_match_indices
+from .sim3_verification import triangulate_local
 
 
 Observation = tuple[int, int]
@@ -109,6 +110,20 @@ class TrackBuildResult:
     n_accepted_edges: int
     n_conflicts: int
     n_duplicates: int
+
+
+@dataclass(frozen=True)
+class TriangulatedTrack:
+    track_id: int
+    point: np.ndarray
+    initial_pair: tuple[int, int]
+    hard_valid: bool
+    parallax_deg: float
+    condition_ratio: float
+    positive_depth_fraction: float
+    reprojection_median_px: float
+    reprojection_p90_px: float
+    max_depth_baselines: float
 
 
 def pair_matches_from_sinkhorn(frame_i, frame_j, kpts_i, kpts_j, probs, *,
@@ -233,3 +248,117 @@ def select_covisible_neighbors(frame_id, counts, *, max_neighbors,
             neighbors.append((int(neighbor), int(shared)))
     neighbors.sort(key=lambda item: (-item[1], item[0]))
     return tuple(neighbors[:max_neighbors])
+
+
+def _relative_pose(pose_i, pose_j):
+    """Return i-to-j pose from anchor-to-camera poses."""
+    R_i, t_i = pose_i
+    R_j, t_j = pose_j
+    rotation = R_j @ R_i.T
+    return rotation, t_j - rotation @ t_i
+
+
+def _dlt_condition_ratio(point_i_yx, point_j_yx, rotation, translation,
+                         camera_matrix):
+    """Second-smallest DLT singular value relative to its largest value."""
+    Kinv = np.linalg.inv(camera_matrix)
+    xy_i = Kinv @ np.array([point_i_yx[1], point_i_yx[0], 1.0])
+    xy_j = Kinv @ np.array([point_j_yx[1], point_j_yx[0], 1.0])
+    P_i = np.hstack([np.eye(3), np.zeros((3, 1))])
+    P_j = np.hstack([rotation, translation[:, None]])
+    A = np.vstack([
+        xy_i[0] * P_i[2] - P_i[0],
+        xy_i[1] * P_i[2] - P_i[1],
+        xy_j[0] * P_j[2] - P_j[0],
+        xy_j[1] * P_j[2] - P_j[1],
+    ])
+    singular = np.linalg.svd(A, compute_uv=False)
+    return float(singular[-2] / singular[0]) if singular[0] > 0.0 else 0.0
+
+
+def triangulate_feature_track(track, keypoints, poses, camera_matrix,
+                              image_size):
+    """Initialize one multi-view track in the common anchor camera gauge.
+
+    ``poses[frame]`` maps anchor coordinates into that camera.  The viable
+    frame pair with maximum ray parallax is used; all observations then
+    contribute to the quality metrics.
+    """
+    K = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
+    width, height = image_size
+    observations = tuple(sorted(track.observations))
+    if len(observations) < 2:
+        raise ValueError("triangulation requires at least two observations")
+    frames = [frame for frame, _feature in observations]
+    if len(frames) != len(set(frames)):
+        raise ValueError("a track cannot contain duplicate frame IDs")
+    if width <= 0 or height <= 0:
+        raise ValueError("image dimensions must be positive")
+
+    pixels = {}
+    for frame, feature in observations:
+        if frame not in poses or frame not in keypoints:
+            raise ValueError(f"missing pose or keypoints for frame {frame}")
+        frame_points = np.asarray(keypoints[frame], dtype=float)
+        if (frame_points.ndim != 2 or frame_points.shape[1] != 2
+                or feature < 0 or feature >= len(frame_points)):
+            raise ValueError(f"invalid feature {feature} for frame {frame}")
+        pixels[frame] = frame_points[feature]
+
+    candidates = []
+    for (frame_i, _), (frame_j, _) in combinations(observations, 2):
+        rotation, translation = _relative_pose(poses[frame_i], poses[frame_j])
+        tri = triangulate_local(
+            pixels[frame_i][None], pixels[frame_j][None], rotation,
+            translation, K, min_parallax_deg=0.0,
+            max_depth_baselines=np.inf)
+        if tri.valid[0]:
+            candidates.append((frame_i, frame_j, rotation, translation, tri))
+    if not candidates:
+        return None
+
+    selected = min(
+        candidates,
+        key=lambda item: (-float(item[4].parallax_deg[0]),
+                          -abs(item[1] - item[0]), item[0], item[1]))
+
+    frame_i, frame_j, rotation, translation, tri = selected
+    R_i, t_i = poses[frame_i]
+    point = R_i.T @ (tri.points[0] - t_i)
+    errors = []
+    positive = 0
+    in_image = True
+    depths = []
+    for frame, _feature in observations:
+        pixel = pixels[frame]
+        in_image &= bool(0.0 <= pixel[1] < width and 0.0 <= pixel[0] < height)
+        R, t = poses[frame]
+        camera_point = R @ point + t
+        depths.append(float(camera_point[2]))
+        positive += camera_point[2] > 0.0
+        if camera_point[2] <= 0.0 or not np.all(np.isfinite(camera_point)):
+            errors.append(np.inf)
+            continue
+        projected = K @ camera_point
+        projected_yx = projected[[1, 0]] / projected[2]
+        errors.append(float(np.linalg.norm(projected_yx - pixel)))
+
+    errors = np.asarray(errors)
+    finite_errors = errors[np.isfinite(errors)]
+    baseline = float(np.linalg.norm(translation))
+    finite_point = bool(np.all(np.isfinite(point)))
+    hard_valid = bool(finite_point and in_image and positive == len(observations))
+    return TriangulatedTrack(
+        track_id=int(track.track_id), point=point,
+        initial_pair=(frame_i, frame_j), hard_valid=hard_valid,
+        parallax_deg=float(tri.parallax_deg[0]),
+        condition_ratio=_dlt_condition_ratio(
+            pixels[frame_i], pixels[frame_j], rotation, translation, K),
+        positive_depth_fraction=float(positive / len(observations)),
+        reprojection_median_px=(float(np.median(finite_errors))
+                                if len(finite_errors) else np.inf),
+        reprojection_p90_px=(float(np.percentile(finite_errors, 90))
+                             if len(finite_errors) else np.inf),
+        max_depth_baselines=(float(max(depths) / baseline)
+                             if baseline > 1e-12 else np.inf),
+    )

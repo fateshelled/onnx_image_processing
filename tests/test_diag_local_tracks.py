@@ -24,6 +24,65 @@ def test_histogram_uses_json_keys():
     assert histogram([]) == {}
 
 
+def test_percentile_summary_filters_nonfinite_values_for_strict_json():
+    assert diag.percentile_summary([np.inf, np.nan]) == {
+        "median": None, "p90": None,
+    }
+    summary = diag.percentile_summary([1.0, np.inf, 3.0])
+    assert summary == {"median": 2.0, "p90": 2.8}
+    json.dumps(summary, allow_nan=False)
+
+
+def test_anchor_poses_scales_multistep_pair_bridge_to_equal_step_gauge():
+    invalid = {"ok": False, "R": None, "t": None}
+    valid = {"ok": True, "R": np.eye(3), "t": [-1.0, 0.0, 0.0]}
+    cache = {"stride": 2, "odom": [valid, invalid, valid]}
+    poses, bridges = diag.anchor_poses(
+        cache, [0, 2, 6],
+        [(2, 6, np.eye(3), np.array([-1.0, 0.0, 0.0]))],
+        return_bridges=True)
+
+    np.testing.assert_allclose(poses[0][1], [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(poses[2][1], [-1.0, 0.0, 0.0])
+    np.testing.assert_allclose(poses[6][1], [-3.0, 0.0, 0.0])
+    assert bridges == [[2, 6]]
+
+
+def test_anchor_poses_handles_reverse_rotated_bridge():
+    angle = np.deg2rad(20.0)
+    rotation = np.array([[np.cos(angle), -np.sin(angle), 0.0],
+                         [np.sin(angle), np.cos(angle), 0.0],
+                         [0.0, 0.0, 1.0]])
+    cache = {"stride": 2, "odom": [
+        {"ok": True, "R": np.eye(3), "t": [-1.0, 0.0, 0.0]},
+        {"ok": False, "R": None, "t": None},
+    ]}
+    poses = diag.anchor_poses(
+        cache, [0, 2, 4],
+        [(4, 2, rotation, np.array([1.0, 0.0, 0.0]))])
+    inverse_rotation, inverse_translation = diag._inverse_pose(
+        rotation, np.array([1.0, 0.0, 0.0]))
+
+    np.testing.assert_allclose(poses[4][0], inverse_rotation)
+    np.testing.assert_allclose(
+        poses[4][1], inverse_rotation @ np.array([-1.0, 0.0, 0.0])
+        + inverse_translation)
+
+
+def test_anchor_poses_prefers_complete_odometry_and_rejects_disconnection():
+    valid = {"ok": True, "R": np.eye(3), "t": [-1.0, 0.0, 0.0]}
+    poses, bridges = diag.anchor_poses(
+        {"stride": 2, "odom": [valid, valid]}, [0, 2, 4],
+        [(0, 4, np.eye(3), np.array([1.0, 0.0, 0.0]))],
+        return_bridges=True)
+    np.testing.assert_allclose(poses[4][1], [-2.0, 0.0, 0.0])
+    assert bridges == []
+
+    with pytest.raises(RuntimeError, match="no pose path"):
+        diag.anchor_poses(
+            {"stride": 2, "odom": []}, [0, 2], pair_poses=[])
+
+
 def _opts(**overrides):
     values = dict(
         cache_dir="unused", dataset_root="unused", max_frames=3,
@@ -40,7 +99,10 @@ def test_evaluate_sequence_uses_inliers_and_track_length_for_covisibility(
     keypoints = np.zeros((1, 2, 2), dtype=float)
     descriptors = np.zeros((1, 2, 4), dtype=float)
     cache = {"feat": {frame: (keypoints, descriptors)
-                      for frame in (0, 2, 4)}}
+                      for frame in (0, 2, 4)},
+             "stride": 2,
+             "odom": [{"ok": True, "R": np.eye(3), "t": [-1, 0, 0]},
+                      {"ok": True, "R": np.eye(3), "t": [-1, 0, 0]}]}
     monkeypatch.setattr(diag, "load_cache", lambda *_args: cache)
     monkeypatch.setattr(diag, "intrinsics_for",
                         lambda *_args: (525.0, 525.0, 320.0, 240.0))
@@ -72,6 +134,8 @@ def test_evaluate_sequence_uses_inliers_and_track_length_for_covisibility(
         return real_build(pairs)
 
     monkeypatch.setattr(diag, "build_feature_tracks", capture_build)
+    monkeypatch.setattr(diag, "triangulate_feature_track",
+                        lambda *_args: None)
     report = diag.evaluate_sequence("syn", _opts(), Matcher())
     assert report["n_pairs"] == 3
     assert report["pose_failures"] == 1
@@ -91,7 +155,8 @@ def test_evaluate_sequence_uses_inliers_and_track_length_for_covisibility(
 def test_evaluate_sequence_rejects_pose_mask_mismatch(monkeypatch):
     keypoints = np.zeros((1, 2, 2), dtype=float)
     descriptors = np.zeros((1, 2, 4), dtype=float)
-    cache = {"feat": {frame: (keypoints, descriptors) for frame in (0, 2)}}
+    cache = {"feat": {frame: (keypoints, descriptors) for frame in (0, 2)},
+             "stride": 2, "odom": []}
     monkeypatch.setattr(diag, "load_cache", lambda *_args: cache)
     monkeypatch.setattr(diag, "intrinsics_for",
                         lambda *_args: (525.0, 525.0, 320.0, 240.0))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import sys
 from pathlib import Path
@@ -21,7 +22,9 @@ from vo.local_tracks import (  # noqa: E402
     build_feature_tracks,
     covisibility_counts,
     select_covisible_neighbors,
+    triangulate_feature_track,
 )
+from vo.loop_sim3_verifier import compose_odom  # noqa: E402
 from vo.onnx_matcher import extract_match_indices  # noqa: E402
 from vo.pose_estimation import CameraIntrinsics  # noqa: E402
 
@@ -39,6 +42,99 @@ def histogram(values):
     return {str(value): values.count(value) for value in sorted(set(values))}
 
 
+def percentile_summary(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return {"median": None, "p90": None}
+    return {"median": float(np.median(values)),
+            "p90": float(np.percentile(values, 90))}
+
+
+def _inverse_pose(rotation, translation):
+    inverse_rotation = rotation.T
+    return inverse_rotation, -inverse_rotation @ translation
+
+
+def anchor_poses(cache, frames, pair_poses=(), *, return_bridges=False):
+    """Build anchor-to-camera poses using an explicit equal-step gauge.
+
+    Cached odometry translations have unit norm per stride.  A fallback pair
+    spanning multiple strides is therefore scaled by its stride count.  This
+    is only the same equal-step approximation already used by composed cached
+    odometry; it is not a metric scale estimate.
+    """
+    stride = int(cache["stride"])
+    if stride < 1 or any(frame % stride for frame in frames):
+        raise ValueError("feature frames must align with the positive cache stride")
+    frame_set = set(frames)
+    graph = {frame: [] for frame in frames}
+
+    def add_edge(frame_i, frame_j, rotation, translation, cost, bridge=False):
+        rotation = np.asarray(rotation, dtype=float).reshape(3, 3)
+        translation = np.asarray(translation, dtype=float).reshape(3)
+        graph[frame_i].append(
+            (cost, frame_j, rotation, translation, bridge, (frame_i, frame_j)))
+        inverse = _inverse_pose(rotation, translation)
+        graph[frame_j].append(
+            (cost, frame_i, inverse[0], inverse[1], bridge, (frame_i, frame_j)))
+
+    for frame_i, frame_j in zip(frames, frames[1:]):
+        if frame_j - frame_i != stride:
+            continue
+        pose = compose_odom(cache["odom"], frame_i // stride,
+                            frame_j // stride)
+        if pose is not None:
+            add_edge(frame_i, frame_j, pose[0], pose[1], 1)
+    for frame_i, frame_j, rotation, translation in pair_poses:
+        if frame_i in frame_set and frame_j in frame_set:
+            steps = abs(frame_j - frame_i) // stride
+            if steps < 1:
+                continue
+            # Prefer any path through cached odometry over an estimated bridge.
+            add_edge(frame_i, frame_j, rotation, translation,
+                     1000 + steps, bridge=True)
+            graph[frame_i][-1] = (*graph[frame_i][-1][:3],
+                                  graph[frame_i][-1][3] * steps,
+                                  *graph[frame_i][-1][4:])
+            graph[frame_j][-1] = (*graph[frame_j][-1][:3],
+                                  graph[frame_j][-1][3] * steps,
+                                  *graph[frame_j][-1][4:])
+
+    first = frames[0]
+    best = {first: (0, (first,))}
+    poses = {first: (np.eye(3), np.zeros(3))}
+    predecessor = {}
+    queue = [(0, (first,), first)]
+    while queue:
+        cost, path, frame = heapq.heappop(queue)
+        if best.get(frame) != (cost, path):
+            continue
+        R_frame, t_frame = poses[frame]
+        for edge_cost, neighbor, R_edge, t_edge, bridge, source_pair in graph[frame]:
+            candidate = (cost + edge_cost, path + (neighbor,))
+            if neighbor in best and best[neighbor] <= candidate:
+                continue
+            best[neighbor] = candidate
+            poses[neighbor] = (R_edge @ R_frame,
+                               R_edge @ t_frame + t_edge)
+            predecessor[neighbor] = (frame, bridge, source_pair)
+            heapq.heappush(queue, (candidate[0], candidate[1], neighbor))
+    missing = sorted(frame_set - poses.keys())
+    if missing:
+        raise RuntimeError(f"no pose path to frames {missing}")
+    used_bridges = set()
+    for frame in frames:
+        cursor = frame
+        while cursor != first:
+            parent, bridge, source_pair = predecessor[cursor]
+            if bridge:
+                used_bridges.add(source_pair)
+            cursor = parent
+    bridges = [list(pair) for pair in sorted(used_bridges)]
+    return (poses, bridges) if return_bridges else poses
+
+
 def evaluate_sequence(seq, opts, matcher):
     cache = load_cache(opts.cache_dir, seq)
     frames = sorted(cache["feat"])[:opts.max_frames]
@@ -47,6 +143,7 @@ def evaluate_sequence(seq, opts, matcher):
         opts.dataset_root, seq, (opts.fx, opts.fy, opts.cx, opts.cy))
     cam = CameraIntrinsics(fx, fy, cx, cy, opts.width, opts.height)
     pair_matches = []
+    pair_poses = []
     pose_failures = 0
     pair_rows = []
     for frame_i, frame_j in pairs:
@@ -63,6 +160,8 @@ def evaluate_sequence(seq, opts, matcher):
             if len(mask) != len(idx_i):
                 raise RuntimeError(
                     f"pose mask length mismatch for ({frame_i}, {frame_j})")
+            if pose.get("R") is not None and pose.get("t") is not None:
+                pair_poses.append((frame_i, frame_j, pose["R"], pose["t"]))
         else:
             pose_failures += 1
             mask = np.zeros(len(idx_i), dtype=bool)
@@ -79,6 +178,15 @@ def evaluate_sequence(seq, opts, matcher):
         track for track in built.tracks
         if len(track.observations) >= opts.min_track_length)
     counts = covisibility_counts(selected_tracks)
+    poses, pose_bridges = anchor_poses(
+        cache, frames, pair_poses, return_bridges=True)
+    keypoints = {frame: np.asarray(cache["feat"][frame][0][0], dtype=float)
+                 for frame in frames}
+    triangulated = [
+        result for track in selected_tracks
+        if (result := triangulate_feature_track(
+            track, keypoints, poses, cam.K, (opts.width, opts.height))) is not None
+    ]
     observations_per_frame = {
         int(frame): sum(frame in {item[0] for item in track.observations}
                         for track in selected_tracks)
@@ -95,6 +203,14 @@ def evaluate_sequence(seq, opts, matcher):
     }
     lengths = [len(track.observations) for track in built.tracks]
     shared_values = list(counts.values())
+    parallax = [result.parallax_deg for result in triangulated]
+    condition = [result.condition_ratio for result in triangulated]
+    positive = [result.positive_depth_fraction for result in triangulated]
+    reprojection_median = [result.reprojection_median_px
+                           for result in triangulated]
+    reprojection_p90 = [result.reprojection_p90_px
+                        for result in triangulated]
+    depth_baselines = [result.max_depth_baselines for result in triangulated]
     return {
         "sequence": seq,
         "frames": [int(frame) for frame in frames],
@@ -107,6 +223,16 @@ def evaluate_sequence(seq, opts, matcher):
         "duplicates": built.n_duplicates,
         "tracks": len(built.tracks),
         "selected_tracks": len(selected_tracks),
+        "triangulated_tracks": len(triangulated),
+        "hard_valid_tracks": sum(result.hard_valid for result in triangulated),
+        "pose_bridges": pose_bridges,
+        "pose_bridge_scale_model": "equal unit translation per cache stride",
+        "parallax_deg": percentile_summary(parallax),
+        "condition_ratio": percentile_summary(condition),
+        "positive_depth_fraction": percentile_summary(positive),
+        "reprojection_median_px": percentile_summary(reprojection_median),
+        "reprojection_p90_px": percentile_summary(reprojection_p90),
+        "max_depth_baselines": percentile_summary(depth_baselines),
         "track_length_histogram": histogram(lengths),
         "covisibility_pairs": len(counts),
         "shared_tracks_median": (float(np.median(shared_values))
