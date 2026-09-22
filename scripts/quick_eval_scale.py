@@ -38,4 +38,6 @@ params.update(json.loads(args.overrides))
 r = rtl.eval_seq(c, params, cam, matcher, mc)
 tag = "scale_kf=ON" if args.scale_kf else "scale_kf=OFF"
 print(f"{args.seq} {tag}: ATE={r['ATE_median']:.5f} n_loop={r['n_loop']} "
-      f"n_kf={r['n_kf']} overrides={args.overrides}", flush=True)
+      f"n_kf={r['n_kf']} "
+      f"robust_downweight_samples={r.get('n_robust_downweighted', 0)} "
+      f"overrides={args.overrides}", flush=True)

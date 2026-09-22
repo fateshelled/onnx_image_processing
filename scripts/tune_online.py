@@ -139,7 +139,8 @@ def objective(trial):
         r = rtl.eval_seq(caches[s], params, cams[s], matcher, mcaches[s])
         per[s] = r["ATE_median"]
         meta[s] = {"n_loop": r["n_loop"], "n_kf": r["n_kf"],
-                   "n_cycle_reject": r.get("n_cycle_reject", 0)}
+                   "n_cycle_reject": r.get("n_cycle_reject", 0),
+                   "n_robust_downweighted": r.get("n_robust_downweighted", 0)}
     vals = [per[s] for s in seqs]
     mean = float(np.mean(vals))
     worst = float(np.max(vals))

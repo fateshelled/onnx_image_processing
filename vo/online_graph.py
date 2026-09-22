@@ -44,6 +44,8 @@ DEFAULT_PARAMS = {
     "kf_local_map_k": 2, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
     "loop_window": 60, "loop_min_gap": 20, "loop_min_inlier": 0.5,
     "loop_temporal_k": 2, "loop_sigma_scale": 1.0,
+    "loop_robust": "none", "loop_robust_phi": 1.0,
+    "loop_robust_min_weight": 0.0,
     # Rotation-only odometry-cycle gate. Zero keeps it disabled; non-zero
     # values reject loop measurements whose rotation disagrees with the
     # independently accumulated odometry chain by more than this many degrees.
@@ -131,6 +133,7 @@ class OnlinePoseGraph:
         self._pending_global = False  # a loop arrived; Tier-2 pass is owed
         self.n_loop = 0
         self.n_cycle_rejected = 0
+        self.n_robust_downweighted = 0
         self.last_n_nodes = 0
         self._held_cap = params.get("held_cap")
         if self._held_cap is None and self.max_kf:
@@ -351,7 +354,7 @@ class OnlinePoseGraph:
             k = edge_key(la, lb)
             if la in node_set and lb in node_set and k not in present:
                 act.add_edge(la, lb, self._meas(lR, lt), scale_free=True,
-                             **lsig)
+                             robust=True, **lsig)
                 present.add(k)
                 loop_act_ei[k] = len(act.edges) - 1
         nl_reg = bool(self.p.get("nl_reg", True))
@@ -360,6 +363,7 @@ class OnlinePoseGraph:
                                       self.p.get("nl_reg_tau", 10.0),
                                       self.p.get("nl_reg_length", 1.0))
         act.optimize()
+        self.n_robust_downweighted += act.n_robust_downweighted
         # Kalman-filter update from the optimised spoke scale (z = s / m). The
         # filtered k_hat recentres the next keyframe's spoke scale prior.
         if (kf_spoke is not None
@@ -430,7 +434,8 @@ class OnlinePoseGraph:
                 # recorded when the loop was re-injected, so it is unambiguous.
                 ei = loop_act_ei.get(edge_key(la, lb))
                 scale = float(act.get_scale(ei)) if ei is not None else 1.0
-                sub.add_edge(la, lb, self._meas(R, t), scale=scale, **sig)
+                sub.add_edge(la, lb, self._meas(R, t), scale=scale,
+                             robust=True, **sig)
             for (ids, H, bb, x0) in inc_npri:
                 sub.add_prior_factor(ids, H, bb, x0)
             keep_ids, H_r, b_r = sub.marginalize_general([E], sorted(nbr))
@@ -545,7 +550,10 @@ class OnlinePoseGraph:
             optimize_scale=True,
             scale_prior_sigma=self.p.get("scale_prior_sigma", 2.0),
             tsvd_ratio=(0.0 if self.p.get("nl_reg", True)
-                        else self.p.get("seq_tsvd_ratio", 0.0)))
+                        else self.p.get("seq_tsvd_ratio", 0.0)),
+            loop_robust=self.p.get("loop_robust", "none"),
+            loop_robust_phi=self.p.get("loop_robust_phi", 1.0),
+            loop_robust_min_weight=self.p.get("loop_robust_min_weight", 0.0))
 
     def _global_reduce_optimize(self):
         """Tier 2: occasional global pass over the reduced keyframe graph.
@@ -576,8 +584,10 @@ class OnlinePoseGraph:
                 act.add_prior_factor(ids, H, bb, x0)
         for (a, b, R, t, sig) in self._loops:
             if a in act.pose_ids and b in act.pose_ids:
-                act.add_edge(a, b, self._meas(R, t), scale_free=True, **sig)
+                act.add_edge(a, b, self._meas(R, t), scale_free=True,
+                             robust=True, **sig)
         act.optimize()
+        self.n_robust_downweighted += act.n_robust_downweighted
         for k in kfs:
             if k not in self._eliminated and k in act.pose_ids:
                 self._est[k] = act.get_pose(k)

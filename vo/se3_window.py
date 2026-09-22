@@ -68,6 +68,9 @@ class SlidingWindowOptimizer:
         scale_prior_sigma: float = 0.0,
         tsvd_ratio: float = 0.0,
         dense_max_cols: int = 1500,
+        loop_robust: str = "none",
+        loop_robust_phi: float = 1.0,
+        loop_robust_min_weight: float = 0.0,
     ) -> None:
         if window_size is not None and window_size < 2:
             raise ValueError(f"window_size must be >= 2 or None, got {window_size}")
@@ -85,6 +88,15 @@ class SlidingWindowOptimizer:
         # Normal equations are dense below this many variables and sparse
         # (scipy) above it, keeping the exact legacy solver for small windows.
         self.dense_max_cols = int(dense_max_cols)
+        if loop_robust not in ("none", "dcs"):
+            raise ValueError(f"unsupported loop_robust mode: {loop_robust}")
+        self.loop_robust = loop_robust
+        self.loop_robust_phi = float(loop_robust_phi)
+        self.loop_robust_min_weight = float(loop_robust_min_weight)
+        if self.loop_robust_phi <= 0.0:
+            raise ValueError("loop_robust_phi must be positive")
+        if not 0.0 <= self.loop_robust_min_weight <= 1.0:
+            raise ValueError("loop_robust_min_weight must be in [0, 1]")
         # Above this many variables the TSVD eigendecomposition is skipped
         # (a dense eigendecomposition would need ~n^2 memory and OOM).
         self.tsvd_dense_max_cols = 12000
@@ -100,6 +112,11 @@ class SlidingWindowOptimizer:
         # information Omega = W^T W). None -> diagonal 1/sigma per axis.
         # Used for marginalization (relative) priors.
         self.edge_whiten: list[np.ndarray | None] = []
+        # Only accepted loop-closure edges opt into the additional robust
+        # kernel. Odometry, spokes and marginalized priors keep legacy weights.
+        self.edge_robust: list[bool] = []
+        self.last_robust_weights: list[float] = []
+        self.n_robust_downweighted: int = 0
         # Dense marginalization priors: each entry is (ids, L, mu, x0) with
         # cost ||L (delta - mu)||^2 over right-increments delta_i =
         # Log(x0_i^-1 T_i). Used to project an eliminated subgraph onto its
@@ -140,6 +157,7 @@ class SlidingWindowOptimizer:
         scale_prior_mean: float = 0.0,
         omega: np.ndarray | None = None,
         scale_prior_sigma: float | None = None,
+        robust: bool = False,
     ) -> None:
         if i not in self.T or j not in self.T:
             raise KeyError("edge endpoints must be live nodes in the window")
@@ -159,6 +177,7 @@ class SlidingWindowOptimizer:
             self.step_scale_t if sigma_t is None else sigma_t,
             self.step_scale_r if sigma_r is None else sigma_r,
         ))
+        self.edge_robust.append(bool(robust))
         s = float(scale)
         if s <= 0.0:
             s = 1.0
@@ -257,6 +276,7 @@ class SlidingWindowOptimizer:
                     if e[0] != drop and e[1] != drop]
             self.edges = [self.edges[k] for k in keep]
             self.edge_whiten = [self.edge_whiten[k] for k in keep]
+            self.edge_robust = [self.edge_robust[k] for k in keep]
             self.edge_scale = [self.edge_scale[k] for k in keep]
             self.edge_scale_sigma = [self.edge_scale_sigma[k] for k in keep]
             self.scale_prior_mean = [self.scale_prior_mean[k] for k in keep]
@@ -345,16 +365,37 @@ class SlidingWindowOptimizer:
         if not self.edges:
             return np.zeros(0)
         w = np.ones(6 * len(self.edges))
+        robust_weights = []
         for k, (i, j, M, st, sr) in enumerate(self.edges):
             e = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
             n = float(np.linalg.norm(self._apply_weight(k, e)))
             if n > self.huber:
                 w[6 * k: 6 * k + 6] = self.huber / max(n, 1e-12)
+            rw = self._loop_robust_weight(k, n)
+            w[6 * k: 6 * k + 6] *= rw
+            if self.edge_robust[k]:
+                robust_weights.append(rw)
+        self.last_robust_weights = robust_weights
+        self.n_robust_downweighted = sum(x < 0.5 for x in robust_weights)
         if self._n_prior():
             w = np.concatenate([w, np.ones(self._n_prior())])
         for fac in self.prior_factors:
             w = np.concatenate([w, np.ones(6 * len(fac[0]))])
         return w
+
+    def _loop_robust_weight(self, k: int, norm: float) -> float:
+        """DCS information weight for an opted-in loop edge.
+
+        DCS leaves small residuals unchanged and smoothly reduces the
+        information of inconsistent constraints. The returned scalar is
+        multiplied with the existing Huber information weight.
+        """
+        if not self.edge_robust[k] or self.loop_robust == "none":
+            return 1.0
+        n2 = float(norm) * float(norm)
+        phi = self.loop_robust_phi
+        weight = min(1.0, 2.0 * phi / (phi + n2))
+        return max(self.loop_robust_min_weight, weight)
 
     def _cost(self) -> float:
         r = self._residuals()

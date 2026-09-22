@@ -335,7 +335,8 @@ def _eval_online_kf_prior(c, params, cam, match_frames):
     else:
         ate = float("nan")
     return {"ATE_median": ate, "n_loop": graph.n_loop, "n_kf": graph.n_kf,
-            "n_cycle_reject": graph.n_cycle_rejected}
+            "n_cycle_reject": graph.n_cycle_rejected,
+            "n_robust_downweighted": graph.n_robust_downweighted}
 
 
 # --------------------------------------------------------------------------

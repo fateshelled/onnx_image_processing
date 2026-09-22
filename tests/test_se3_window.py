@@ -22,6 +22,52 @@ def rand_T(rng, max_t=1.0, max_rot=0.5):
     return T
 
 
+class TestLoopRobustWeights:
+    def _optimizer_with_edge(self, **kwargs):
+        opt = SlidingWindowOptimizer(window_size=None, **kwargs)
+        opt.add_node(0, np.eye(4))
+        opt.add_node(1, np.eye(4))
+        opt.add_edge(0, 1, np.eye(4), robust=True)
+        return opt
+
+    def test_default_mode_preserves_legacy_weight(self):
+        opt = self._optimizer_with_edge(loop_robust="none")
+        assert opt._loop_robust_weight(0, 100.0) == 1.0
+        assert np.allclose(opt._huber_weights(), np.ones(6))
+
+    def test_dcs_formula_and_floor(self):
+        opt = self._optimizer_with_edge(loop_robust="dcs",
+                                        loop_robust_phi=2.0,
+                                        loop_robust_min_weight=0.1)
+        assert opt._loop_robust_weight(0, 0.0) == 1.0
+        assert opt._loop_robust_weight(0, np.sqrt(2.0)) == 1.0
+        assert opt._loop_robust_weight(0, np.sqrt(6.0)) == pytest.approx(0.5)
+        assert opt._loop_robust_weight(0, 1e6) == pytest.approx(0.1)
+
+    def test_only_flagged_edge_is_downweighted(self):
+        opt = SlidingWindowOptimizer(window_size=None, loop_robust="dcs",
+                                     loop_robust_phi=1.0, huber=1e9)
+        for i in range(3):
+            opt.add_node(i, np.eye(4))
+        bad = se3_exp(np.array([0.0, 0.0, 0.0, 10.0, 0.0, 0.0]))
+        opt.add_edge(0, 1, bad, robust=False)
+        opt.add_edge(1, 2, bad, robust=True)
+        weights = opt._huber_weights()
+        assert np.allclose(weights[:6], 1.0)
+        assert np.all(weights[6:12] < 0.5)
+        assert opt.n_robust_downweighted == 1
+
+    def test_drop_oldest_keeps_robust_flags_aligned(self):
+        opt = SlidingWindowOptimizer(window_size=3, loop_robust="dcs")
+        for i in range(3):
+            opt.add_node(i, np.eye(4))
+        opt.add_edge(0, 1, np.eye(4), robust=True)
+        opt.add_edge(1, 2, np.eye(4), robust=False)
+        opt.add_node(3, np.eye(4))
+        assert len(opt.edges) == len(opt.edge_robust) == 1
+        assert opt.edge_robust == [False]
+
+
 class TestPerEdgeScalePriorSigma:
     def test_per_edge_sigma_and_zero_sigma_safe(self):
         rng = np.random.default_rng(7)
