@@ -127,6 +127,39 @@ class TestLoopRobustWeights:
         opt.optimize()
         assert opt._gnc_mu == pytest.approx(opt.loop_gm_mu)
 
+    def test_mad_scale_leave_one_out_and_clamps(self):
+        hist = {"rot": {(0, 2): 0.1, (1, 3): 1.0, (2, 4): 2.0,
+                        (3, 5): 3.0},
+                "dir": {}}
+        opt = SlidingWindowOptimizer(
+            window_size=None, loop_robust="gm", loop_scale_mode="mad",
+            loop_robust_hist=hist, loop_mad_min_samples=2,
+            loop_scale_floor=0.01, loop_scale_max_rot=10.0)
+        opt.add_node(0, np.eye(4))
+        opt.add_node(2, np.eye(4))
+        opt.add_edge(0, 2, np.eye(4), robust=True)
+        # Target edge's 0.1 is excluded. Including it would give median 1.5.
+        assert opt._mad_scale("rot", 0) == pytest.approx(1.4826 * 2.0)
+
+    def test_mad_scale_fallback_and_zero_floor(self):
+        opt = SlidingWindowOptimizer(
+            window_size=None, loop_scale_mode="mad", loop_rot_sigma=0.12,
+            loop_robust_hist={"rot": {(1, 2): 0.0, (2, 3): 0.0}, "dir": {}},
+            loop_mad_min_samples=2, loop_scale_floor=0.01)
+        opt.add_node(0, np.eye(4))
+        opt.add_node(1, np.eye(4))
+        opt.add_edge(0, 1, np.eye(4), robust=True)
+        assert opt._mad_scale("rot", 0) == pytest.approx(0.01)
+
+        fallback = SlidingWindowOptimizer(
+            window_size=None, loop_scale_mode="mad", loop_rot_sigma=0.12,
+            loop_robust_hist={"rot": {(2, 3): 0.5}, "dir": {}},
+            loop_mad_min_samples=2)
+        fallback.add_node(0, np.eye(4))
+        fallback.add_node(1, np.eye(4))
+        fallback.add_edge(0, 1, np.eye(4), robust=True)
+        assert fallback._mad_scale("rot", 0) == pytest.approx(0.12)
+
 
 class TestPerEdgeScalePriorSigma:
     def test_per_edge_sigma_and_zero_sigma_safe(self):

@@ -338,7 +338,10 @@ def _eval_online_kf_prior(c, params, cam, match_frames):
             "n_cycle_reject": graph.n_cycle_rejected,
             "n_robust_downweighted": graph.n_robust_downweighted,
             "n_robust_rot_downweighted": graph.n_robust_rot_downweighted,
-            "n_robust_dir_downweighted": graph.n_robust_dir_downweighted}
+            "n_robust_dir_downweighted": graph.n_robust_dir_downweighted,
+            "loop_rot_scale": graph.loop_rot_scale,
+            "loop_dir_scale": graph.loop_dir_scale,
+            "n_mad_samples": len(graph._hist_rot)}
 
 
 # --------------------------------------------------------------------------

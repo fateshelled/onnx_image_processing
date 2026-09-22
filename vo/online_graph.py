@@ -26,6 +26,8 @@ measurement ``(R, t)`` is a world-to-camera point transform
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import numpy as np
 
 from .cycle_consistency import rotation_angle_deg
@@ -48,6 +50,10 @@ DEFAULT_PARAMS = {
     "loop_robust_min_weight": 0.0,
     "loop_gm_mu": 11.34, "loop_dir_sigma": 0.4,
     "loop_robust_gnc_gamma": 1.4,
+    "loop_scale_mode": "fixed", "loop_rot_sigma": 0.1,
+    "loop_mad_min_samples": 5, "loop_mad_window": 64,
+    "loop_scale_floor": 1e-3, "loop_scale_max_rot": 0.5,
+    "loop_scale_max_dir": 1.0,
     # Rotation-only odometry-cycle gate. Zero keeps it disabled; non-zero
     # values reject loop measurements whose rotation disagrees with the
     # independently accumulated odometry chain by more than this many degrees.
@@ -138,6 +144,10 @@ class OnlinePoseGraph:
         self.n_robust_downweighted = 0
         self.n_robust_rot_downweighted = 0
         self.n_robust_dir_downweighted = 0
+        self._hist_rot = OrderedDict()
+        self._hist_dir = OrderedDict()
+        self.loop_rot_scale = float(params.get("loop_rot_sigma", 0.1))
+        self.loop_dir_scale = float(params.get("loop_dir_sigma", 0.4))
         self.last_n_nodes = 0
         self._held_cap = params.get("held_cap")
         if self._held_cap is None and self.max_kf:
@@ -367,6 +377,7 @@ class OnlinePoseGraph:
                                       self.p.get("nl_reg_tau", 10.0),
                                       self.p.get("nl_reg_length", 1.0))
         act.optimize()
+        harvested_loops = act.harvest_robust_residuals()
         self.n_robust_downweighted += act.n_robust_downweighted
         self.n_robust_rot_downweighted += act.n_robust_rot_downweighted
         self.n_robust_dir_downweighted += act.n_robust_dir_downweighted
@@ -484,7 +495,9 @@ class OnlinePoseGraph:
             if period <= 0 or len(self._kf) - self._last_global_kf >= period:
                 self._pending_global = False
                 self._last_global_kf = len(self._kf)
-                self._global_reduce_optimize()
+                harvested_loops.extend(self._global_reduce_optimize())
+        if self.p.get("loop_scale_mode", "fixed") == "mad":
+            self._commit_loop_history(harvested_loops)
 
     def _add_loops(self, b):
         # Loop closure with the temporal-consistency gate: match the new
@@ -562,7 +575,35 @@ class OnlinePoseGraph:
             loop_robust_min_weight=self.p.get("loop_robust_min_weight", 0.0),
             loop_gm_mu=self.p.get("loop_gm_mu", 11.34),
             loop_dir_sigma=self.p.get("loop_dir_sigma", 0.4),
-            loop_robust_gnc_gamma=self.p.get("loop_robust_gnc_gamma", 1.4))
+            loop_robust_gnc_gamma=self.p.get("loop_robust_gnc_gamma", 1.4),
+            loop_scale_mode=self.p.get("loop_scale_mode", "fixed"),
+            loop_rot_sigma=self.p.get("loop_rot_sigma", 0.1),
+            loop_robust_hist={"rot": self._hist_rot, "dir": self._hist_dir},
+            loop_mad_min_samples=self.p.get("loop_mad_min_samples", 5),
+            loop_scale_floor=self.p.get("loop_scale_floor", 1e-3),
+            loop_scale_max_rot=self.p.get("loop_scale_max_rot", 0.5),
+            loop_scale_max_dir=self.p.get("loop_scale_max_dir", 1.0))
+
+    def _commit_loop_history(self, samples):
+        """Commit post-solve loop residuals once per unique edge, bounded."""
+        cap = max(1, int(self.p.get("loop_mad_window", 64)))
+        for i, j, r_rot, r_dir in samples:
+            key = edge_key(i, j)
+            if key in self._hist_rot:
+                continue
+            self._hist_rot[key] = float(r_rot)
+            self._hist_dir[key] = float(r_dir)
+            while len(self._hist_rot) > cap:
+                old, _ = self._hist_rot.popitem(last=False)
+                self._hist_dir.pop(old, None)
+        floor = float(self.p.get("loop_scale_floor", 1e-3))
+        if self._hist_rot:
+            self.loop_rot_scale = float(np.clip(
+                1.4826 * np.median(list(self._hist_rot.values())), floor,
+                float(self.p.get("loop_scale_max_rot", 0.5))))
+            self.loop_dir_scale = float(np.clip(
+                1.4826 * np.median(list(self._hist_dir.values())), floor,
+                float(self.p.get("loop_scale_max_dir", 1.0))))
 
     def _global_reduce_optimize(self):
         """Tier 2: occasional global pass over the reduced keyframe graph.
@@ -574,10 +615,10 @@ class OnlinePoseGraph:
         the occasional pass affordable.
         """
         if not self.p.get("global_opt_on_loop", True) or len(self._kf) < 2:
-            return
+            return []
         kfs = [k for k in self._kf if k in self._est]
         if len(kfs) < 2:
-            return
+            return []
         act = self._new_window()
         for k in kfs:
             # Eliminated keyframes are already summarized by their marginal
@@ -596,12 +637,14 @@ class OnlinePoseGraph:
                 act.add_edge(a, b, self._meas(R, t), scale_free=True,
                              robust=True, **sig)
         act.optimize()
+        harvested = act.harvest_robust_residuals()
         self.n_robust_downweighted += act.n_robust_downweighted
         self.n_robust_rot_downweighted += act.n_robust_rot_downweighted
         self.n_robust_dir_downweighted += act.n_robust_dir_downweighted
         for k in kfs:
             if k not in self._eliminated and k in act.pose_ids:
                 self._est[k] = act.get_pose(k)
+        return harvested
 
     def _pose_of(self, fid):
         if fid in self._est:

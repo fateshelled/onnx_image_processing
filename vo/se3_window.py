@@ -34,6 +34,7 @@ import scipy.linalg as sla
 from scipy import sparse as sp
 from scipy.sparse.linalg import splu
 
+from .loop_closure import edge_key
 from .se3 import (
     se3_ad,
     se3_exp,
@@ -74,6 +75,13 @@ class SlidingWindowOptimizer:
         loop_gm_mu: float = 11.34,
         loop_dir_sigma: float = 0.4,
         loop_robust_gnc_gamma: float = 1.4,
+        loop_scale_mode: str = "fixed",
+        loop_rot_sigma: float = 0.1,
+        loop_robust_hist: dict | None = None,
+        loop_mad_min_samples: int = 5,
+        loop_scale_floor: float = 1e-3,
+        loop_scale_max_rot: float = 0.5,
+        loop_scale_max_dir: float = 1.0,
     ) -> None:
         if window_size is not None and window_size < 2:
             raise ValueError(f"window_size must be >= 2 or None, got {window_size}")
@@ -100,6 +108,15 @@ class SlidingWindowOptimizer:
         self.loop_dir_sigma = float(loop_dir_sigma)
         self.loop_robust_gnc_gamma = float(loop_robust_gnc_gamma)
         self._gnc_mu = self.loop_gm_mu
+        if loop_scale_mode not in ("fixed", "mad"):
+            raise ValueError(f"unsupported loop_scale_mode: {loop_scale_mode}")
+        self.loop_scale_mode = loop_scale_mode
+        self.loop_rot_sigma = float(loop_rot_sigma)
+        self.loop_robust_hist = loop_robust_hist or {"rot": {}, "dir": {}}
+        self.loop_mad_min_samples = int(loop_mad_min_samples)
+        self.loop_scale_floor = float(loop_scale_floor)
+        self.loop_scale_max_rot = float(loop_scale_max_rot)
+        self.loop_scale_max_dir = float(loop_scale_max_dir)
         if self.loop_robust_phi <= 0.0:
             raise ValueError("loop_robust_phi must be positive")
         if not 0.0 <= self.loop_robust_min_weight <= 1.0:
@@ -108,6 +125,13 @@ class SlidingWindowOptimizer:
             raise ValueError("loop_gm_mu and loop_dir_sigma must be positive")
         if self.loop_robust_gnc_gamma <= 1.0:
             raise ValueError("loop_robust_gnc_gamma must be > 1")
+        if self.loop_rot_sigma <= 0.0 or self.loop_mad_min_samples < 1:
+            raise ValueError("loop_rot_sigma must be positive and MAD samples >= 1")
+        if (self.loop_scale_floor <= 0.0
+                or self.loop_scale_max_rot < self.loop_scale_floor
+                or self.loop_scale_max_dir < self.loop_scale_floor):
+            raise ValueError(
+                "MAD scale floor must be positive and no greater than its maxima")
         # Above this many variables the TSVD eigendecomposition is skipped
         # (a dense eigendecomposition would need ~n^2 memory and OOM).
         self.tsvd_dense_max_cols = 12000
@@ -426,21 +450,55 @@ class SlidingWindowOptimizer:
         weight = min(1.0, 2.0 * phi / (phi + n2))
         return max(self.loop_robust_min_weight, weight)
 
-    def _loop_block_norms(self, k: int, e: np.ndarray) -> tuple[float, float]:
-        """Observable loop residuals: rotation and translation direction."""
-        i, j, _M, _st, sr = self.edges[k]
+    def _loop_raw_norms(self, k: int, e: np.ndarray) -> tuple[float, float]:
+        """Raw observable loop residuals in radians."""
+        i, j, _M, _st, _sr = self.edges[k]
         Ms = self._scaled_M(k)
         P = np.linalg.inv(self.T[j]) @ self.T[i]
-        x_rot = float(np.linalg.norm(e[:3])) / max(float(sr), 1e-12)
+        r_rot = float(np.linalg.norm(e[:3]))
         tm = np.asarray(Ms[:3, 3], float)
         tp = np.asarray(P[:3, 3], float)
         denom = float(np.linalg.norm(tm) * np.linalg.norm(tp))
         if denom < 1e-12:
-            x_dir = 0.0
+            r_dir = 0.0
         else:
             cosine = float(np.clip(tm @ tp / denom, -1.0, 1.0))
-            x_dir = float(np.arccos(cosine)) / self.loop_dir_sigma
-        return x_rot, x_dir
+            r_dir = float(np.arccos(cosine))
+        return r_rot, r_dir
+
+    def _mad_scale(self, block: str, k: int) -> float:
+        """Robust zero-centered scale: 1.4826 * median residual magnitude."""
+        fallback = self.loop_rot_sigma if block == "rot" else self.loop_dir_sigma
+        if self.loop_scale_mode != "mad":
+            return fallback
+        i, j, *_ = self.edges[k]
+        target = edge_key(i, j)
+        values = [float(v) for key, v in self.loop_robust_hist[block].items()
+                  if key != target and np.isfinite(v)]
+        if len(values) < self.loop_mad_min_samples:
+            return fallback
+        scale = 1.4826 * float(np.median(values))
+        upper = self.loop_scale_max_rot if block == "rot" \
+            else self.loop_scale_max_dir
+        return float(np.clip(scale, self.loop_scale_floor, upper))
+
+    def _loop_block_norms(self, k: int, e: np.ndarray) -> tuple[float, float]:
+        """MAD- or fixed-standardized rotation and direction residuals."""
+        r_rot, r_dir = self._loop_raw_norms(k, e)
+        return (r_rot / self._mad_scale("rot", k),
+                r_dir / self._mad_scale("dir", k))
+
+    def harvest_robust_residuals(self) -> list[tuple[int, int, float, float]]:
+        """Return raw residuals at current poses; the graph commits them later."""
+        out = []
+        for k, robust in enumerate(self.edge_robust):
+            if not robust:
+                continue
+            i, j, _M, _st, _sr = self.edges[k]
+            e = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
+            rr, rd = self._loop_raw_norms(k, e)
+            out.append((int(i), int(j), rr, rd))
+        return out
 
     def _loop_block_weights(self, k: int, e: np.ndarray) -> tuple[float, float]:
         x_rot, x_dir = self._loop_block_norms(k, e)

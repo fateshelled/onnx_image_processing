@@ -42,4 +42,7 @@ print(f"{args.seq} {tag}: ATE={r['ATE_median']:.5f} n_loop={r['n_loop']} "
       f"robust_downweight_samples={r.get('n_robust_downweighted', 0)} "
       f"robust_rot={r.get('n_robust_rot_downweighted', 0)} "
       f"robust_dir={r.get('n_robust_dir_downweighted', 0)} "
+      f"mad_scale={r.get('loop_rot_scale', 0):.5f}/"
+      f"{r.get('loop_dir_scale', 0):.5f} "
+      f"mad_n={r.get('n_mad_samples', 0)} "
       f"overrides={args.overrides}", flush=True)

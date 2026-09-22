@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -164,6 +165,19 @@ def test_rotation_cycle_gate_can_be_disabled():
 
     assert graph.n_cycle_rejected == 0
     assert graph.n_loop > 0
+
+
+def test_loop_mad_history_is_bounded_and_unique():
+    params = {"loop_mad_window": 3, "loop_rot_sigma": 0.1,
+              "loop_dir_sigma": 0.4}
+    graph = OnlinePoseGraph(params, cam=None, match_fn=lambda _a, _b: None)
+    graph._commit_loop_history([
+        (0, 2, 0.1, 0.2), (1, 3, 0.2, 0.3), (2, 4, 0.3, 0.4),
+        (3, 5, 0.4, 0.5), (3, 5, 9.0, 9.0),
+    ])
+    assert list(graph._hist_rot) == [(1, 3), (2, 4), (3, 5)]
+    assert graph._hist_rot[(3, 5)] == pytest.approx(0.4)
+    assert len(graph._hist_rot) == len(graph._hist_dir) == 3
 
 
 if __name__ == "__main__":
