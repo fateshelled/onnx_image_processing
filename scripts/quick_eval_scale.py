@@ -40,4 +40,6 @@ tag = "scale_kf=ON" if args.scale_kf else "scale_kf=OFF"
 print(f"{args.seq} {tag}: ATE={r['ATE_median']:.5f} n_loop={r['n_loop']} "
       f"n_kf={r['n_kf']} "
       f"robust_downweight_samples={r.get('n_robust_downweighted', 0)} "
+      f"robust_rot={r.get('n_robust_rot_downweighted', 0)} "
+      f"robust_dir={r.get('n_robust_dir_downweighted', 0)} "
       f"overrides={args.overrides}", flush=True)

@@ -46,6 +46,8 @@ DEFAULT_PARAMS = {
     "loop_temporal_k": 2, "loop_sigma_scale": 1.0,
     "loop_robust": "none", "loop_robust_phi": 1.0,
     "loop_robust_min_weight": 0.0,
+    "loop_gm_mu": 11.34, "loop_dir_sigma": 0.4,
+    "loop_robust_gnc_gamma": 1.4,
     # Rotation-only odometry-cycle gate. Zero keeps it disabled; non-zero
     # values reject loop measurements whose rotation disagrees with the
     # independently accumulated odometry chain by more than this many degrees.
@@ -134,6 +136,8 @@ class OnlinePoseGraph:
         self.n_loop = 0
         self.n_cycle_rejected = 0
         self.n_robust_downweighted = 0
+        self.n_robust_rot_downweighted = 0
+        self.n_robust_dir_downweighted = 0
         self.last_n_nodes = 0
         self._held_cap = params.get("held_cap")
         if self._held_cap is None and self.max_kf:
@@ -364,6 +368,8 @@ class OnlinePoseGraph:
                                       self.p.get("nl_reg_length", 1.0))
         act.optimize()
         self.n_robust_downweighted += act.n_robust_downweighted
+        self.n_robust_rot_downweighted += act.n_robust_rot_downweighted
+        self.n_robust_dir_downweighted += act.n_robust_dir_downweighted
         # Kalman-filter update from the optimised spoke scale (z = s / m). The
         # filtered k_hat recentres the next keyframe's spoke scale prior.
         if (kf_spoke is not None
@@ -553,7 +559,10 @@ class OnlinePoseGraph:
                         else self.p.get("seq_tsvd_ratio", 0.0)),
             loop_robust=self.p.get("loop_robust", "none"),
             loop_robust_phi=self.p.get("loop_robust_phi", 1.0),
-            loop_robust_min_weight=self.p.get("loop_robust_min_weight", 0.0))
+            loop_robust_min_weight=self.p.get("loop_robust_min_weight", 0.0),
+            loop_gm_mu=self.p.get("loop_gm_mu", 11.34),
+            loop_dir_sigma=self.p.get("loop_dir_sigma", 0.4),
+            loop_robust_gnc_gamma=self.p.get("loop_robust_gnc_gamma", 1.4))
 
     def _global_reduce_optimize(self):
         """Tier 2: occasional global pass over the reduced keyframe graph.
@@ -588,6 +597,8 @@ class OnlinePoseGraph:
                              robust=True, **sig)
         act.optimize()
         self.n_robust_downweighted += act.n_robust_downweighted
+        self.n_robust_rot_downweighted += act.n_robust_rot_downweighted
+        self.n_robust_dir_downweighted += act.n_robust_dir_downweighted
         for k in kfs:
             if k not in self._eliminated and k in act.pose_ids:
                 self._est[k] = act.get_pose(k)

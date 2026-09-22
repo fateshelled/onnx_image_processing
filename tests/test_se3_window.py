@@ -67,6 +67,66 @@ class TestLoopRobustWeights:
         assert len(opt.edges) == len(opt.edge_robust) == 1
         assert opt.edge_robust == [False]
 
+    def test_gm_formula_and_block_separation(self):
+        opt = SlidingWindowOptimizer(window_size=None, loop_robust="gm",
+                                     loop_gm_mu=4.0, loop_dir_sigma=0.4,
+                                     huber=1e9)
+        opt.add_node(0, np.eye(4))
+        T1 = np.eye(4)
+        T1[:3, 3] = [1.0, 0.0, 0.0]
+        opt.add_node(1, T1)
+        M = np.linalg.inv(T1)
+        M[:3, 3] = [0.0, 1.0, 0.0]
+        opt.add_edge(0, 1, M, robust=True)
+        e = _edge_residual(opt.T[0], opt.T[1], opt._scaled_M(0))
+        wr, wt = opt._loop_block_weights(0, e)
+        assert wr == pytest.approx(1.0)
+        assert wt < 0.5
+        # Pin the actual implementation at x=sqrt(mu): GM weight = 0.25.
+        assert (4.0 / (4.0 + 4.0)) ** 2 == pytest.approx(0.25)
+        opt._loop_block_norms = lambda _k, _e: (0.0, 2.0)
+        assert opt._loop_block_weights(0, e)[1] == pytest.approx(0.25)
+
+    def test_block_mode_is_per_block_huber_only(self):
+        opt = self._optimizer_with_edge(loop_robust="block", huber=1.0)
+        opt._loop_block_norms = lambda _k, _e: (0.5, 2.0)
+        wr, wt = opt._loop_block_weights(0, np.zeros(6))
+        assert wr == pytest.approx(1.0)
+        assert wt == pytest.approx(0.5)
+
+    def test_direction_weight_is_scale_invariant(self):
+        opt = SlidingWindowOptimizer(window_size=None, loop_robust="gm")
+        opt.add_node(0, np.eye(4))
+        T1 = np.eye(4)
+        T1[:3, 3] = [1.0, 1.0, 0.0]
+        opt.add_node(1, T1)
+        M = np.eye(4)
+        M[:3, 3] = [-1.0, 0.0, 0.0]
+        opt.add_edge(0, 1, M, robust=True)
+        vals = []
+        for scale in (0.2, 1.0, 5.0):
+            opt.edge_scale[0] = scale
+            e = _edge_residual(opt.T[0], opt.T[1], opt._scaled_M(0))
+            vals.append(opt._loop_block_weights(0, e)[1])
+        assert np.allclose(vals, vals[0], atol=1e-12)
+
+    def test_gnc_schedule_reaches_final_mu(self):
+        opt = SlidingWindowOptimizer(window_size=None, loop_robust="gnc_gm",
+                                     loop_gm_mu=11.34)
+        opt.add_node(0, np.eye(4))
+        opt.add_node(1, np.eye(4))
+        bad = se3_exp(np.array([0.5, 0.0, 0.0, 1.0, 0.0, 0.0]))
+        opt.add_edge(0, 1, bad, robust=True)
+        schedule = opt._gnc_schedule()
+        assert all(a >= b for a, b in zip(schedule, schedule[1:]))
+        assert schedule[-1] == pytest.approx(11.34)
+        assert len(schedule) <= 8
+        # Exercise dispatcher and final-mu restoration, not only the helper.
+        opt.add_node(2, np.eye(4))
+        opt.add_edge(1, 2, np.eye(4))
+        opt.optimize()
+        assert opt._gnc_mu == pytest.approx(opt.loop_gm_mu)
+
 
 class TestPerEdgeScalePriorSigma:
     def test_per_edge_sigma_and_zero_sigma_safe(self):

@@ -71,6 +71,9 @@ class SlidingWindowOptimizer:
         loop_robust: str = "none",
         loop_robust_phi: float = 1.0,
         loop_robust_min_weight: float = 0.0,
+        loop_gm_mu: float = 11.34,
+        loop_dir_sigma: float = 0.4,
+        loop_robust_gnc_gamma: float = 1.4,
     ) -> None:
         if window_size is not None and window_size < 2:
             raise ValueError(f"window_size must be >= 2 or None, got {window_size}")
@@ -88,15 +91,23 @@ class SlidingWindowOptimizer:
         # Normal equations are dense below this many variables and sparse
         # (scipy) above it, keeping the exact legacy solver for small windows.
         self.dense_max_cols = int(dense_max_cols)
-        if loop_robust not in ("none", "dcs"):
+        if loop_robust not in ("none", "dcs", "block", "gm", "gnc_gm"):
             raise ValueError(f"unsupported loop_robust mode: {loop_robust}")
         self.loop_robust = loop_robust
         self.loop_robust_phi = float(loop_robust_phi)
         self.loop_robust_min_weight = float(loop_robust_min_weight)
+        self.loop_gm_mu = float(loop_gm_mu)
+        self.loop_dir_sigma = float(loop_dir_sigma)
+        self.loop_robust_gnc_gamma = float(loop_robust_gnc_gamma)
+        self._gnc_mu = self.loop_gm_mu
         if self.loop_robust_phi <= 0.0:
             raise ValueError("loop_robust_phi must be positive")
         if not 0.0 <= self.loop_robust_min_weight <= 1.0:
             raise ValueError("loop_robust_min_weight must be in [0, 1]")
+        if self.loop_gm_mu <= 0.0 or self.loop_dir_sigma <= 0.0:
+            raise ValueError("loop_gm_mu and loop_dir_sigma must be positive")
+        if self.loop_robust_gnc_gamma <= 1.0:
+            raise ValueError("loop_robust_gnc_gamma must be > 1")
         # Above this many variables the TSVD eigendecomposition is skipped
         # (a dense eigendecomposition would need ~n^2 memory and OOM).
         self.tsvd_dense_max_cols = 12000
@@ -117,6 +128,8 @@ class SlidingWindowOptimizer:
         self.edge_robust: list[bool] = []
         self.last_robust_weights: list[float] = []
         self.n_robust_downweighted: int = 0
+        self.n_robust_rot_downweighted: int = 0
+        self.n_robust_dir_downweighted: int = 0
         # Dense marginalization priors: each entry is (ids, L, mu, x0) with
         # cost ||L (delta - mu)||^2 over right-increments delta_i =
         # Log(x0_i^-1 T_i). Used to project an eliminated subgraph onto its
@@ -366,17 +379,33 @@ class SlidingWindowOptimizer:
             return np.zeros(0)
         w = np.ones(6 * len(self.edges))
         robust_weights = []
+        robust_rot_weights = []
+        robust_dir_weights = []
         for k, (i, j, M, st, sr) in enumerate(self.edges):
             e = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
             n = float(np.linalg.norm(self._apply_weight(k, e)))
             if n > self.huber:
                 w[6 * k: 6 * k + 6] = self.huber / max(n, 1e-12)
-            rw = self._loop_robust_weight(k, n)
-            w[6 * k: 6 * k + 6] *= rw
+            if self.edge_robust[k] and self.loop_robust in (
+                    "block", "gm", "gnc_gm"):
+                wr, wt = self._loop_block_weights(k, e)
+                w[6 * k: 6 * k + 3] = wr
+                w[6 * k + 3: 6 * k + 6] = wt
+                rw = min(wr, wt)
+                robust_rot_weights.append(wr)
+                robust_dir_weights.append(wt)
+            else:
+                rw = self._loop_robust_weight(k, n)
+                w[6 * k: 6 * k + 6] *= rw
             if self.edge_robust[k]:
                 robust_weights.append(rw)
+                if self.loop_robust not in ("block", "gm", "gnc_gm"):
+                    robust_rot_weights.append(rw)
+                    robust_dir_weights.append(rw)
         self.last_robust_weights = robust_weights
         self.n_robust_downweighted = sum(x < 0.5 for x in robust_weights)
+        self.n_robust_rot_downweighted = sum(x < 0.5 for x in robust_rot_weights)
+        self.n_robust_dir_downweighted = sum(x < 0.5 for x in robust_dir_weights)
         if self._n_prior():
             w = np.concatenate([w, np.ones(self._n_prior())])
         for fac in self.prior_factors:
@@ -396,6 +425,53 @@ class SlidingWindowOptimizer:
         phi = self.loop_robust_phi
         weight = min(1.0, 2.0 * phi / (phi + n2))
         return max(self.loop_robust_min_weight, weight)
+
+    def _loop_block_norms(self, k: int, e: np.ndarray) -> tuple[float, float]:
+        """Observable loop residuals: rotation and translation direction."""
+        i, j, _M, _st, sr = self.edges[k]
+        Ms = self._scaled_M(k)
+        P = np.linalg.inv(self.T[j]) @ self.T[i]
+        x_rot = float(np.linalg.norm(e[:3])) / max(float(sr), 1e-12)
+        tm = np.asarray(Ms[:3, 3], float)
+        tp = np.asarray(P[:3, 3], float)
+        denom = float(np.linalg.norm(tm) * np.linalg.norm(tp))
+        if denom < 1e-12:
+            x_dir = 0.0
+        else:
+            cosine = float(np.clip(tm @ tp / denom, -1.0, 1.0))
+            x_dir = float(np.arccos(cosine)) / self.loop_dir_sigma
+        return x_rot, x_dir
+
+    def _loop_block_weights(self, k: int, e: np.ndarray) -> tuple[float, float]:
+        x_rot, x_dir = self._loop_block_norms(k, e)
+        weights = []
+        for x in (x_rot, x_dir):
+            huber = min(1.0, self.huber / max(x, 1e-12))
+            gm = 1.0
+            if self.loop_robust in ("gm", "gnc_gm"):
+                mu = self._gnc_mu if self.loop_robust == "gnc_gm" \
+                    else self.loop_gm_mu
+                gm = (mu / (mu + x * x)) ** 2
+            weights.append(max(self.loop_robust_min_weight, huber * gm))
+        return float(weights[0]), float(weights[1])
+
+    def _gnc_schedule(self) -> list[float]:
+        x2max = 0.0
+        for k, robust in enumerate(self.edge_robust):
+            if not robust:
+                continue
+            i, j, _M, _st, _sr = self.edges[k]
+            e = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
+            xr, xt = self._loop_block_norms(k, e)
+            x2max = max(x2max, xr * xr, xt * xt)
+        final = self.loop_gm_mu
+        start = max(final, 2.0 * x2max)
+        if start <= final * (1.0 + 1e-12):
+            return [final]
+        steps = min(8, max(2, int(np.ceil(
+            np.log(start / final) / np.log(self.loop_robust_gnc_gamma))) + 1))
+        return [float(final * (start / final) ** ((steps - 1 - g) / (steps - 1)))
+                for g in range(steps)]
 
     def _cost(self) -> float:
         r = self._residuals()
@@ -669,6 +745,16 @@ class SlidingWindowOptimizer:
     # -- solver ---------------------------------------------------------------
 
     def optimize(self, verbose: bool = False) -> float:
+        if self.loop_robust == "gnc_gm" and any(self.edge_robust):
+            cost = self.last_cost
+            for mu in self._gnc_schedule():
+                self._gnc_mu = mu
+                cost = self._optimize_once(verbose)
+            self._gnc_mu = self.loop_gm_mu
+            return cost
+        return self._optimize_once(verbose)
+
+    def _optimize_once(self, verbose: bool = False) -> float:
         live = list(self.pose_ids)
         free = [nd for nd in live if nd not in self.fixed_ids]
         if len(live) < 3 or not self.edges or not free:

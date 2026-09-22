@@ -140,7 +140,11 @@ def objective(trial):
         per[s] = r["ATE_median"]
         meta[s] = {"n_loop": r["n_loop"], "n_kf": r["n_kf"],
                    "n_cycle_reject": r.get("n_cycle_reject", 0),
-                   "n_robust_downweighted": r.get("n_robust_downweighted", 0)}
+                   "n_robust_downweighted": r.get("n_robust_downweighted", 0),
+                   "n_robust_rot_downweighted": r.get(
+                       "n_robust_rot_downweighted", 0),
+                   "n_robust_dir_downweighted": r.get(
+                       "n_robust_dir_downweighted", 0)}
     vals = [per[s] for s in seqs]
     mean = float(np.mean(vals))
     worst = float(np.max(vals))
