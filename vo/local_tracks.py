@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 
 import numpy as np
 
@@ -197,3 +198,38 @@ def build_feature_tracks(pair_matches, *, min_observations=2):
         n_conflicts=conflicts,
         n_duplicates=duplicates,
     )
+
+
+def covisibility_counts(tracks):
+    """Count tracks shared by each unordered frame pair."""
+    counts = {}
+    for track in tracks:
+        frames = sorted(frame for frame, _feature in track.observations)
+        if len(frames) != len(set(frames)):
+            raise ValueError("a track cannot contain duplicate frame IDs")
+        for frame_i, frame_j in combinations(frames, 2):
+            key = (frame_i, frame_j)
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def select_covisible_neighbors(frame_id, counts, *, max_neighbors,
+                                min_shared_tracks):
+    """Select strongest covisible frames with deterministic tie-breaking."""
+    frame_id = _frame_id(frame_id)
+    if (not isinstance(max_neighbors, (int, np.integer)) or max_neighbors < 0
+            or not isinstance(min_shared_tracks, (int, np.integer))
+            or min_shared_tracks < 1):
+        raise ValueError("invalid covisibility selection limits")
+    neighbors = []
+    for (frame_i, frame_j), shared in counts.items():
+        if frame_i == frame_id:
+            neighbor = frame_j
+        elif frame_j == frame_id:
+            neighbor = frame_i
+        else:
+            continue
+        if shared >= min_shared_tracks:
+            neighbors.append((int(neighbor), int(shared)))
+    neighbors.sort(key=lambda item: (-item[1], item[0]))
+    return tuple(neighbors[:max_neighbors])

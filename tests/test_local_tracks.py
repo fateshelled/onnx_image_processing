@@ -6,7 +6,9 @@ import pytest
 from vo.local_tracks import (
     PairMatches,
     build_feature_tracks,
+    covisibility_counts,
     pair_matches_from_sinkhorn,
+    select_covisible_neighbors,
 )
 from vo.onnx_matcher import extract_match_indices, extract_matches
 
@@ -172,3 +174,26 @@ def test_extract_match_indices_handles_empty_and_invalid_inputs():
     with pytest.raises(ValueError, match="max_matches"):
         extract_match_indices(_keypoints(1), _keypoints(1),
                               _sinkhorn([[0.8]]), max_matches=-1)
+
+
+def test_covisibility_counts_and_neighbor_selection():
+    tracks = (
+        type("Track", (), {"observations": ((0, 0), (2, 1), (4, 2))})(),
+        type("Track", (), {"observations": ((0, 3), (2, 4))})(),
+        type("Track", (), {"observations": ((0, 5), (4, 6))})(),
+    )
+    counts = covisibility_counts(tracks)
+    assert counts == {(0, 2): 2, (0, 4): 2, (2, 4): 1}
+    assert select_covisible_neighbors(
+        0, counts, max_neighbors=2, min_shared_tracks=1) == ((2, 2), (4, 2))
+    assert select_covisible_neighbors(
+        2, counts, max_neighbors=3, min_shared_tracks=2) == ((0, 2),)
+
+
+def test_covisibility_rejects_duplicate_frames_and_invalid_limits():
+    track = type("Track", (), {"observations": ((0, 0), (0, 1))})()
+    with pytest.raises(ValueError, match="duplicate frame"):
+        covisibility_counts([track])
+    with pytest.raises(ValueError, match="selection limits"):
+        select_covisible_neighbors(0, {}, max_neighbors=-1,
+                                    min_shared_tracks=1)
