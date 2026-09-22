@@ -14,34 +14,66 @@ from .outlier_filters import dustbin_margin_filter
 from .pose_estimation import estimate_pose_ransac
 
 
-def extract_matches(kpts1, kpts2, P, threshold=0.1, max_matches=1024,
-                    dbin_margin=0.1):
-    """Mutual-NN + dustbin-margin filter + top-K (eval convention).
+def extract_match_indices(kpts1, kpts2, P, threshold=0.1, max_matches=1024,
+                          dbin_margin=0.1):
+    """Return canonical feature indices after the eval match filters.
 
     ``P`` is the (1, K+1, K+1) Sinkhorn matrix; keypoints are (1, K, 2) as
-    (y, x). Returns ``(kpts1, kpts2, scores)``.
+    (y, x).  The returned indices refer to those original per-frame arrays and
+    therefore remain suitable as feature IDs for multi-pair track building.
     """
+    kpts1 = np.asarray(kpts1)
+    kpts2 = np.asarray(kpts2)
+    P = np.asarray(P)
+    if (kpts1.ndim != 3 or kpts2.ndim != 3 or kpts1.shape[0] != 1
+            or kpts2.shape[0] != 1 or kpts1.shape[2] != 2
+            or kpts2.shape[2] != 2):
+        raise ValueError("keypoints must have shape (1, K, 2)")
+    if P.ndim != 3 or P.shape[0] != 1:
+        raise ValueError("Sinkhorn probabilities must have shape (1, K+1, K+1)")
+    if not np.isfinite(threshold) or not np.isfinite(dbin_margin):
+        raise ValueError("match thresholds must be finite")
+    if not isinstance(max_matches, (int, np.integer)) or max_matches < 0:
+        raise ValueError("max_matches must be a non-negative integer")
+    if not np.all(np.isfinite(P)):
+        raise ValueError("Sinkhorn probabilities must be finite")
     P = P[0]
     k1 = kpts1[0]
     k2 = kpts2[0]
     K = k1.shape[0]
+    if k2.shape[0] != K or P.shape != (K + 1, K + 1):
+        raise ValueError("keypoint and Sinkhorn dimensions must agree")
+    if K == 0:
+        return (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=float))
     Pc = P[:K, :K]
     max_j = np.argmax(Pc, axis=1)
     max_i = np.argmax(Pc, axis=0)
     mutual = np.arange(K) == max_i[max_j]
     scores = Pc[np.arange(K), max_j]
     dbin = dustbin_margin_filter(P, dbin_margin)
-    pad = (k1[:, 0] >= 0) & (k1[:, 1] >= 0) & (k2[:, 0] >= 0) & (k2[:, 1] >= 0)
+    valid_k1 = np.all(np.isfinite(k1), axis=1) & np.all(k1 >= 0, axis=1)
+    valid_k2 = np.all(np.isfinite(k2), axis=1) & np.all(k2 >= 0, axis=1)
+    pad = valid_k1 & valid_k2[max_j]
     valid = mutual & dbin & pad & (scores >= threshold)
     idx_i = np.where(valid)[0]
     if len(idx_i) == 0:
-        return k1[:0], k2[:0], np.array([])
+        return (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=float))
     j = max_j[idx_i]
     sc = scores[idx_i]
-    order = np.argsort(sc)[::-1][:max_matches]
+    order = np.lexsort((j, idx_i, -sc))[:max_matches]
     idx_i = idx_i[order]
     j = j[order]
-    return k1[idx_i], k2[j], sc
+    return idx_i, j, sc[order]
+
+
+def extract_matches(kpts1, kpts2, P, threshold=0.1, max_matches=1024,
+                    dbin_margin=0.1):
+    """Mutual-NN + dustbin-margin filter + top-K (eval convention)."""
+    idx_i, idx_j, scores = extract_match_indices(
+        kpts1, kpts2, P, threshold, max_matches, dbin_margin)
+    return kpts1[0][idx_i], kpts2[0][idx_j], scores
 
 
 class OnnxSessionMatcher:
