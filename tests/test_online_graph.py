@@ -180,6 +180,17 @@ def test_loop_mad_history_is_bounded_and_unique():
     assert len(graph._hist_rot) == len(graph._hist_dir) == 3
 
 
+def test_loop_verifier_hook_counts_rejects_and_abstains():
+    graph = OnlinePoseGraph({}, cam=None, match_fn=lambda _a, _b: None)
+    verdicts = {0: False, 10: None, 20: True}
+    graph.loop_verifier = lambda a, b: verdicts[a]
+    hits = [(a, np.eye(3), np.zeros(3), 1.0, 10) for a in (0, 10, 20)]
+    verified = graph._verified_hits(30, hits)
+    assert [hit[0] for hit in verified] == [10, 20]
+    assert graph.n_verifier_rejected == 1
+    assert graph.n_verifier_abstained == 1
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-q"]))

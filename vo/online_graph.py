@@ -139,8 +139,11 @@ class OnlinePoseGraph:
             self._scale_kf = ScaleKF(params.get("scale_kf_q", 1e-3),
                                      params.get("scale_kf_r", 0.1))
         self._pending_global = False  # a loop arrived; Tier-2 pass is owed
+        self.loop_verifier = None  # optional callable(a, b) -> bool|None
         self.n_loop = 0
         self.n_cycle_rejected = 0
+        self.n_verifier_rejected = 0
+        self.n_verifier_abstained = 0
         self.n_robust_downweighted = 0
         self.n_robust_rot_downweighted = 0
         self.n_robust_dir_downweighted = 0
@@ -547,6 +550,8 @@ class OnlinePoseGraph:
                 else:
                     cycle_accepted.append(hit)
             accepted = cycle_accepted
+        if self.loop_verifier is not None:
+            accepted = self._verified_hits(b, accepted)
         sig_scale = float(self.p.get("loop_sigma_scale", 0.0))
         for (a, R, t, _inl, _n) in accepted:
             sig = {}
@@ -558,6 +563,26 @@ class OnlinePoseGraph:
             self._added.add(edge_key(a, b))
             self.n_loop += 1
             self._pending_global = True
+
+    def _verified_hits(self, b, hits):
+        """Apply the optional ``loop_verifier`` to accepted loop hits.
+
+        The verifier returns ``True`` (accept), ``False`` (reject) or ``None``
+        (abstain: keep the current decision, because the candidate cannot be
+        evaluated, e.g. too little local parallax).
+        """
+        verified = []
+        for hit in hits:
+            a = int(hit[0])
+            verdict = self.loop_verifier(a, b)
+            if verdict is None:
+                self.n_verifier_abstained += 1
+                verified.append(hit)
+            elif verdict:
+                verified.append(hit)
+            else:
+                self.n_verifier_rejected += 1
+        return verified
 
     def _new_window(self):
         return SlidingWindowOptimizer(

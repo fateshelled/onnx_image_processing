@@ -54,6 +54,7 @@ from vo.loop_closure import (  # noqa: E402
     local_candidate,
 )
 from vo.cycle_consistency import chain_residual_deg, cumulative_rotations  # noqa: E402
+from vo.loop_sim3_verifier import Sim3LoopVerifier  # noqa: E402
 from vo.sinkhorn_numpy import NumpySinkhornMatcher  # noqa: E402
 from vo.trajectory import Trajectory  # noqa: E402
 from vo.se3_window import SlidingWindowOptimizer  # noqa: E402
@@ -159,6 +160,9 @@ SEQ_OPT1_DEFAULTS = {
     "scale_kf_adaptive": False, "scale_kf_innov_tau": 3.0,
     "scale_kf_adapt_loop_ratio": 0.0,
     "loop_rot_only": False, "cycle_threshold_deg": 0.0,
+    "loop_verifier": "sim3", "loop_verifier_gate": 6,
+    "loop_verifier_window": 4, "loop_verifier_abstain": "accept",
+    "loop_verifier_keyframes": True,
 }
 
 
@@ -302,7 +306,34 @@ def _sequential_kf_priors(opt, kf, keys, params):
     return red
 
 
-def _eval_online_kf_prior(c, params, cam, match_frames):
+def _keyframe_windows(graph, endpoint):
+    """Candidate local windows from the nearest previous keyframes (S1).
+
+    Baselines between keyframes are longer than stride windows and reuse the
+    chain poses the graph already carries (``graph._T``), so the gauge matches
+    the odometry windows.  Failed odometry steps are bridged as identity by
+    the chain, as elsewhere in the graph, and longer baselines also accumulate
+    more of the unit-norm composition approximation; both are acceptable here
+    because a bad window only weakens the Sim(3) evidence.
+    """
+    endpoint_pose = graph._T.get(endpoint)
+    if endpoint_pose is None:
+        return []
+    previous = [frame for frame in graph.keyframes
+                if frame < endpoint and frame in graph._T][-2:]
+    windows = []
+    for first in previous:
+        # ``_T`` is camera-to-world, and the window convention is
+        # ``x_endpoint = R @ x_first + t``, so the relative pose is
+        # ``inv(T_endpoint) @ T_first``.
+        relative = np.linalg.inv(endpoint_pose) @ graph._T[first]
+        windows.append((int(first), int(endpoint),
+                        relative[:3, :3].copy(), relative[:3, 3].copy(),
+                        False))
+    return windows
+
+
+def _eval_online_kf_prior(c, params, cam, match_frames, raw_match_frames=None):
     """Drive ``OnlinePoseGraph`` over a cached sequence (the online driver).
 
     The precomputed per-frame odometry is injected so the chain is identical to
@@ -312,6 +343,22 @@ def _eval_online_kf_prior(c, params, cam, match_frames):
     """
     stride = int(c["stride"])
     graph = OnlinePoseGraph(params, cam, match_frames)
+    if params.get("loop_verifier") == "sim3":
+        if raw_match_frames is None:
+            raise ValueError("loop_verifier=sim3 requires raw_match_frames")
+        window_fn = None
+        if params.get("loop_verifier_keyframes",
+                      SEQ_OPT1_DEFAULTS["loop_verifier_keyframes"]):
+            def window_fn(endpoint):
+                return _keyframe_windows(graph, endpoint)
+        graph.loop_verifier = Sim3LoopVerifier(
+            c["odom"], raw_match_frames, cam.K, stride,
+            gate=int(params.get("loop_verifier_gate", 6)),
+            window_strides=int(params.get("loop_verifier_window", 4)),
+            abstain_policy=str(params.get(
+                "loop_verifier_abstain",
+                SEQ_OPT1_DEFAULTS["loop_verifier_abstain"])),
+            window_fn=window_fn)
     graph.add_frame(0)
     keys = [0]
     for n, o in enumerate(c["odom"]):
@@ -334,14 +381,30 @@ def _eval_online_kf_prior(c, params, cam, match_frames):
         ate = float(np.median(np.linalg.norm(aligned - gt, axis=1)))
     else:
         ate = float("nan")
-    return {"ATE_median": ate, "n_loop": graph.n_loop, "n_kf": graph.n_kf,
-            "n_cycle_reject": graph.n_cycle_rejected,
-            "n_robust_downweighted": graph.n_robust_downweighted,
-            "n_robust_rot_downweighted": graph.n_robust_rot_downweighted,
-            "n_robust_dir_downweighted": graph.n_robust_dir_downweighted,
-            "loop_rot_scale": graph.loop_rot_scale,
-            "loop_dir_scale": graph.loop_dir_scale,
-            "n_mad_samples": len(graph._hist_rot)}
+    # ``n_verifier_*`` are graph-side counters.  The Sim3 verifier folds
+    # abstains into its policy verdict (bool), so ``n_verifier_abstained`` is
+    # always 0 for it; the real abstain breakdown is in ``verifier_abstain*``.
+    result = {"ATE_median": ate, "n_loop": graph.n_loop, "n_kf": graph.n_kf,
+              "n_cycle_reject": graph.n_cycle_rejected,
+              "n_verifier_rejected": graph.n_verifier_rejected,
+              "n_verifier_abstained": graph.n_verifier_abstained,
+              "n_robust_downweighted": graph.n_robust_downweighted,
+              "n_robust_rot_downweighted": graph.n_robust_rot_downweighted,
+              "n_robust_dir_downweighted": graph.n_robust_dir_downweighted,
+              "loop_rot_scale": graph.loop_rot_scale,
+              "loop_dir_scale": graph.loop_dir_scale,
+              "n_mad_samples": len(graph._hist_rot)}
+    verifier = graph.loop_verifier
+    if verifier is not None:
+        result.update({
+            "verifier_accept": verifier.n_accept,
+            "verifier_reject": verifier.n_reject,
+            "verifier_abstain": verifier.n_abstain,
+            "verifier_abstain_no_cloud": verifier.n_abstain_no_cloud,
+            "verifier_abstain_no_match": verifier.n_abstain_no_match,
+            "verifier_abstain_few_tracks": verifier.n_abstain_few_tracks,
+        })
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -386,10 +449,23 @@ def eval_seq(c, params, cam, desc_matcher, match_cache=None, diag=None):
         match_cache[key] = cached
         return cached
 
+    def raw_match_frames(a, b):
+        # Raw correspondences for the optional Sim(3) loop verifier: no pose
+        # estimation here, the verifier's RANSAC is the outlier filter.
+        if a not in c["feat"] or b not in c["feat"]:
+            return None
+        kp_a, desc_a = c["feat"][a]
+        kp_b, desc_b = c["feat"][b]
+        P = desc_matcher.match_probs(desc_a[0], desc_b[0])
+        ma, mb, _ = extract_matches(kp_a, kp_b, P[None], pa.match_threshold,
+                                    pa.max_matches, pa.dbin)
+        return ma, mb
+
     # The tuned/production graph mode is driven by the shared online graph, so
     # the evaluator and the streaming sample run exactly the same code.
     if params.get("graph_mode") == "kf_prior":
-        return _eval_online_kf_prior(c, params, cam, match_frames)
+        return _eval_online_kf_prior(c, params, cam, match_frames,
+                                     raw_match_frames=raw_match_frames)
 
     # --- odometry pass (chain) + optional additive keyframe edges ---
     traj = Trajectory()

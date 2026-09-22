@@ -214,8 +214,10 @@ def _synthetic_opts(tmp_path, **overrides):
     values = dict(
         seq="syn", cache_dir=str(tmp_path), dataset_root="unused",
         max_candidates=10, min_gap=20, appearance_min=0.2, local_strides=1,
+        backward_only=True,
         min_parallax_deg=1.0, min_condition_ratio=1e-3, true_distance=0.5,
-        false_distance=1.0, min_inliers=8, residual_fraction=0.1,
+        false_distance=1.0, min_inliers=8, min_tracks=5,
+        residual_fraction=0.1,
         iterations=200, seed=0, fx=525.0, fy=525.0, cx=320.0, cy=240.0,
         width=640, height=480, output=None)
     values.update(overrides)
@@ -247,19 +249,19 @@ def test_evaluate_sequence_records_rows_and_gate(monkeypatch, tmp_path,
     with (tmp_path / cache_name).open("wb") as handle:
         pickle.dump(match_cache, handle)
 
-    keys_a = np.column_stack([np.arange(12) + 100.0, np.arange(12) + 200.0])
+    keys_a = np.column_stack([np.arange(6) + 100.0, np.arange(6) + 200.0])
     keys_b = keys_a + 1.0
-    false_keys = np.column_stack([np.arange(12) + 400.0,
-                                  np.arange(12) + 500.0])
-    structure = np.array([[float(index % 4), float(index // 4),
-                           float(index) * 0.1 + 1.0] for index in range(12)])
+    false_keys = np.column_stack([np.arange(6) + 400.0,
+                                  np.arange(6) + 500.0])
+    structure = np.array([[float(index % 3), float(index // 3),
+                           float(index) * 0.1 + 1.0] for index in range(6)])
     cloud_a = {diag._point_key(key): point
                for key, point in zip(keys_a, structure)}
     cloud_b = {diag._point_key(key): point
                for key, point in zip(keys_b, structure)}
     rng = np.random.default_rng(3)
     cloud_false = {diag._point_key(key): point
-                   for key, point in zip(false_keys, rng.normal(size=(12, 3)))}
+                    for key, point in zip(false_keys, rng.normal(size=(6, 3)))}
     clouds = {10: cloud_a, 40: cloud_b, 50: cloud_false}
 
     def fake_details(c, matcher, cam, a, b, args, require_pose=True):
@@ -270,18 +272,23 @@ def test_evaluate_sequence_records_rows_and_gate(monkeypatch, tmp_path,
         return None
 
     monkeypatch.setattr(diag, "_details", fake_details)
-    monkeypatch.setattr(
-        diag, "_local_cloud",
-        lambda c, matcher, cam, endpoint, stride, window_strides, args,
-        min_parallax_deg=1.0: clouds.get(int(endpoint)))
-    opts = _synthetic_opts(tmp_path)
+    backward_flags = []
+
+    def fake_local_cloud(c, matcher, cam, endpoint, stride, window_strides,
+                         args, min_parallax_deg=1.0, backward_only=False):
+        backward_flags.append(backward_only)
+        return clouds.get(int(endpoint))
+
+    monkeypatch.setattr(diag, "_local_cloud", fake_local_cloud)
+    opts = _synthetic_opts(tmp_path, min_inliers=6)
     report = diag.evaluate_sequence("syn", str(tmp_path), "unused", object(),
                                     opts)
     assert report["evaluated"] == 3
     assert report["true_accepted"] == 1
     assert report["false_accepted"] == 0
     assert report["accept_precision"] == 1.0
-    # The true pair fits with 12 inliers; the false pairs stay near zero.
+    assert backward_flags and all(backward_flags)
+    # Six-track candidates remain fitted so locked gate 6 can be re-aggregated.
     assert report["auc_inlier_count"] >= 0.9
     reasons = [row.get("reason") for row in report["rows"]]
     assert "no_pose" in reasons

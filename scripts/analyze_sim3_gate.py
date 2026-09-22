@@ -5,11 +5,17 @@ Reads the diag JSON reports (``rows``) and computes:
 - leave-one-sequence-out (LOSO) gate selection: pick the smallest gate with
   zero false accepts on the remaining sequences, then evaluate it on the
   held-out sequence
-- locked-gate (default 12) evaluation on every sequence
+- locked-gate (default 6) evaluation on every sequence
 - candidate-level Wilson CI vs the sequence-cluster view of false accepts
 
+The source diagnostic uses odometry windows only.  These statistics therefore
+describe that offline population, not the default-on online profile with
+keyframe-baseline windows; use ``scripts/ab_loop_verifier.py`` for deployment
+gate comparisons.
+
 Acceptance is a deterministic function of ``fit_ok``/``n_inliers`` in the
-rows, so this re-aggregation is exact; no re-run is needed.
+rows.  Re-aggregation is exact only when the diagnostic fit floor is no larger
+than the smallest requested gate; incompatible legacy reports are rejected.
 """
 
 from __future__ import annotations
@@ -47,6 +53,21 @@ def load_sequences(paths):
     return sequences
 
 
+def validate_fit_floor(reports, requested_gates):
+    """Reject reports that discarded candidates needed by a lower gate."""
+    minimum_gate = min(requested_gates)
+    for report in reports:
+        options = report.get("options", {})
+        # Reports before --min-tracks used --min-inliers as both fit floor and
+        # deployment gate, so that is the only safe legacy fallback.
+        floor = int(options.get("min_tracks", options.get("min_inliers", 0)))
+        if floor > minimum_gate:
+            raise SystemExit(
+                f"{report['sequence']}: diagnostic fit floor {floor} exceeds "
+                f"requested gate {minimum_gate}; rerun diag_loop_sim3.py "
+                f"with --min-tracks <= {minimum_gate}")
+
+
 def select_loso_gate(reports):
     """Smallest gate with no false accept on ``reports`` (None if unknown)."""
     false_fits = [row.get("n_inliers", 0) for report in reports
@@ -72,8 +93,8 @@ def true_accepts(report, gate):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reports", nargs="+")
-    parser.add_argument("--gates", default="8,9,10,11,12,15")
-    parser.add_argument("--locked-gate", type=int, default=12)
+    parser.add_argument("--gates", default="6,8,9,10,11,12,15")
+    parser.add_argument("--locked-gate", type=int, default=6)
     parser.add_argument("--uncertainty-gate", type=int, default=8,
                         help="gate used for the false-accept uncertainty "
                              "section")
@@ -81,6 +102,8 @@ def main():
 
     gates = [int(value) for value in opts.gates.split(",")]
     sequences = load_sequences(opts.reports)
+    validate_fit_floor(
+        sequences, gates + [opts.locked_gate, opts.uncertainty_gate])
 
     print("== gate sensitivity (true/false accepts per sequence)")
     header = "sequence".ljust(35) + "".join(f">={g:<7}" for g in gates)

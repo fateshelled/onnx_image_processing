@@ -2,9 +2,10 @@
 
 This is deliberately offline: ground truth is used only to label candidates
 after estimation.  Each loop endpoint is reconstructed from its own local
-feature track: the densest backward/forward window (up to ``--local-strides``
-stride pairs, cached odometry composed per window; ties go to the longer
-baseline).  Only one window is used because the cached per-stride translations
+feature track: the densest causal backward window by default, with future
+windows added only by ``--forward-windows`` (up to ``--local-strides`` stride
+pairs, cached odometry composed per window; ties go to the longer baseline).
+Only one window is used because the cached per-stride translations
 are unit-norm essential-matrix directions, so windows of different lengths do
 not share one metric gauge.  The fitted similarity scale is therefore
 observable and never reuses the pose graph's scale estimate. (Within one
@@ -28,6 +29,10 @@ pair pose is only a sanity gate; Sim(3) RANSAC rejects outliers), because
 essential-matrix inliers alone are too few to overlap the local tracks
 reliably.  The match cache must be stride-aligned with the ``.npz`` cache (see
 ``build_cache``); otherwise the GT labels and odometry slots silently shift.
+This diagnostic uses odometry windows only.  The default-on online profile also
+injects keyframe-baseline windows, so deployment calibration must use
+``scripts/ab_loop_verifier.py`` rather than treating these counts as
+numerically identical to online.
 """
 
 from __future__ import annotations
@@ -50,6 +55,14 @@ sys.path.insert(0, str(REPO / "eval"))
 from eval.rustuna_tune_loop import DEFAULT_ARGS, load_cache  # noqa: E402
 from eval.eval_tum_vo import estimate_pose_from_matches, intrinsics_for  # noqa: E402
 from eval.torch_sinkhorn import TorchSinkhornMatcher  # noqa: E402
+from vo.loop_sim3_verifier import (  # noqa: E402
+    build_local_cloud,
+    candidate_seed,
+    compose_odom,
+    local_windows,
+    loop_tracks,
+    point_key,
+)
 from vo.onnx_matcher import extract_matches  # noqa: E402
 from vo.pose_estimation import CameraIntrinsics  # noqa: E402
 from vo.sim3_verification import sim3_ransac, triangulate_local  # noqa: E402
@@ -73,110 +86,29 @@ def _details(c, matcher, cam, a, b, args, require_pose=True):
     return pa, pb, pose
 
 
-def _point_key(point):
-    # The loop pair and the local stride pair share keypoint arrays, so the
-    # rounded coordinates act as a join key across float32/float64 copies.
-    # Collisions resolve last-wins, which is harmless for identical tracks.
-    return tuple(np.round(np.asarray(point, dtype=float), 4))
-
-
-def _compose_odom(odom, first_slot, last_slot):
-    """Compose cached odometry into the pose from first_slot to last_slot.
-
-    Each entry ``odom[n]`` maps frame ``n * stride`` to ``(n + 1) * stride``
-    with ``x_next = R @ x_prev + t``.  Returns ``None`` when any entry in the
-    window is missing or invalid.
-    """
-    rotation = np.eye(3)
-    translation = np.zeros(3)
-    for slot in range(first_slot, last_slot):
-        if slot < 0 or slot >= len(odom):
-            return None
-        entry = odom[slot]
-        if (not entry.get("ok") or entry.get("R") is None
-                or entry.get("t") is None):
-            return None
-        R = np.asarray(entry["R"], dtype=float).reshape(3, 3)
-        t = np.asarray(entry["t"], dtype=float).reshape(3)
-        rotation = R @ rotation
-        translation = R @ translation + t
-    return rotation, translation
+# Thin aliases over the shared helpers in ``vo.loop_sim3_verifier`` so their
+# odometry-window primitives stay numerically identical.
+_point_key = point_key
+_compose_odom = compose_odom
+_candidate_seed = candidate_seed
 
 
 def _local_windows(c, endpoint, stride, window_strides):
-    """List local track windows around an endpoint, longest baseline first.
-
-    Each window is either backward (earlier frame -> endpoint) or forward
-    (endpoint -> later frame) with up to ``window_strides`` stride pairs, with
-    its composed odometry in the cached (unit-norm) step gauge.  Windows of
-    different lengths do not share one metric gauge, so the caller must use a
-    single window; this helper only enumerates candidates.  Windows whose
-    odometry is invalid are skipped.
-    """
-    endpoint_slot = endpoint // stride
-    windows = []
-    for steps in range(window_strides, 0, -1):
-        first_slot = endpoint_slot - steps
-        if first_slot >= 0:
-            pose = _compose_odom(c["odom"], first_slot, endpoint_slot)
-            if pose is not None:
-                windows.append((endpoint - steps * stride, endpoint,
-                                pose[0], pose[1], False))
-        last_slot = endpoint_slot + steps
-        pose = _compose_odom(c["odom"], endpoint_slot, last_slot)
-        if pose is not None:
-            windows.append((endpoint, endpoint + steps * stride,
-                            pose[0], pose[1], True))
-    return windows
+    return local_windows(c["odom"], endpoint, stride, window_strides)
 
 
 def _local_cloud(c, matcher, cam, endpoint, stride, window_strides, args,
-                 min_parallax_deg=1.0):
-    """Reconstruct the endpoint from its densest local window.
-
-    Exactly one window feeds the cloud: the one with the most valid tracks
-    (ties go to the longer baseline, because windows are enumerated longest
-    first and only strictly larger clouds replace the current best).  Using
-    one window keeps a single scale gauge, since the cached per-stride
-    translations are unit-norm essential-matrix directions rather than
-    metrically consistent displacements, and clouds from windows of different
-    lengths cannot be treated as the same gauge.  All candidate windows are
-    scanned so that a sparse long window does not hide a denser short one.
-    Baseline conditioning is not part of the score; among equally dense
-    windows the longer baseline wins (enumeration order).
-
-    The cached odometry is used deliberately (instead of the re-matched pair
-    pose): an essential-matrix translation is scale-free, so only the cache
-    keeps the local cloud comparable between endpoints.
-    """
-    best = None
-    for first_frame, last_frame, rotation, translation, forward in _local_windows(
-            c, endpoint, stride, window_strides):
+                 min_parallax_deg=1.0, backward_only=False):
+    def match_fn(first_frame, last_frame):
         pair = _details(c, matcher, cam, first_frame, last_frame, args,
                         require_pose=False)
-        if pair is None:
-            continue
-        p_first, p_last, _ = pair
-        tri = triangulate_local(p_first, p_last, rotation, translation, cam.K,
-                                min_parallax_deg=min_parallax_deg)
-        if forward:
-            # Camera 0 is the endpoint itself, so the points are already in
-            # the endpoint frame and the endpoint keypoints are the first
-            # argument.
-            points_endpoint = tri.points
-            keys = p_first
-        else:
-            # Move points from the previous camera into the endpoint camera.
-            # The map key is the endpoint keypoint shared with the loop
-            # correspondence.
-            points_endpoint = (rotation @ tri.points.T).T + translation
-            keys = p_last
-        cloud = {_point_key(keypoint): point
-                 for keypoint, point, valid in
-                 zip(keys, points_endpoint, tri.valid) if valid}
-        if best is None or len(cloud) > len(best):
-            best = cloud
-    return best or None
+        return None if pair is None else (pair[0], pair[1])
+
+    return build_local_cloud(c["odom"], endpoint, stride, window_strides,
+                             match_fn, cam.K,
+                             min_parallax_deg=min_parallax_deg,
+                             backward_only=backward_only,
+                             triangulate_fn=triangulate_local)
 
 
 def _auc(labels, scores):
@@ -199,11 +131,6 @@ def _finite_or_none(value):
 def _jsonable_options(opts):
     return {key: (str(value) if isinstance(value, Path) else value)
             for key, value in vars(opts).items()}
-
-
-def _candidate_seed(seed, a, b):
-    """Derive an independent RANSAC seed per candidate pair."""
-    return int((seed * 1_000_003 + a * 1_009 + b) % (2 ** 31 - 1))
 
 
 def _error_report(seq, exc, opts):
@@ -295,11 +222,13 @@ def evaluate_sequence(seq, cache_dir, dataset_root, matcher, opts):
         if a not in local_cache:
             local_cache[a] = _local_cloud(c, matcher, cam, a, stride,
                                           opts.local_strides, pose_args,
-                                          opts.min_parallax_deg)
+                                          opts.min_parallax_deg,
+                                          opts.backward_only)
         if b not in local_cache:
             local_cache[b] = _local_cloud(c, matcher, cam, b, stride,
                                           opts.local_strides, pose_args,
-                                          opts.min_parallax_deg)
+                                          opts.min_parallax_deg,
+                                          opts.backward_only)
         cloud_a, cloud_b = local_cache[a], local_cache[b]
         if not cloud_a or not cloud_b:
             rows.append({"a": a, "b": b, "label": label,
@@ -307,13 +236,8 @@ def evaluate_sequence(seq, cache_dir, dataset_root, matcher, opts):
                          "reason": "no_local_cloud", "n_tracks": 0,
                          "n_inliers": 0, "inlier_ratio": 0.0})
             continue
-        Xa, Xb = [], []
-        for point_a, point_b in zip(pa, pb):
-            ka, kb = _point_key(point_a), _point_key(point_b)
-            if ka in cloud_a and kb in cloud_b:
-                Xa.append(cloud_a[ka])
-                Xb.append(cloud_b[kb])
-        if len(Xa) < opts.min_inliers:
+        Xa, Xb = loop_tracks(pa, pb, cloud_a, cloud_b)
+        if len(Xa) < opts.min_tracks:
             rows.append({"a": a, "b": b, "label": label,
                          "gt_distance": float(gt_distance), "ok": False,
                          "reason": "too_few_tracks", "n_tracks": len(Xa),
@@ -328,7 +252,7 @@ def evaluate_sequence(seq, cache_dir, dataset_root, matcher, opts):
                           seed=_candidate_seed(opts.seed, a, b),
                           residual_fraction=opts.residual_fraction,
                           max_iterations=opts.iterations,
-                          min_inliers=5,
+                           min_inliers=opts.min_tracks,
                           min_condition_ratio=opts.min_condition_ratio)
         n_inliers = int(fit.inliers.sum()) if fit.ok else 0
         accepted = bool(fit.ok and n_inliers >= opts.min_inliers)
@@ -405,11 +329,17 @@ def main():
                              "gate leaves no false candidates on desk/desk2, "
                              "so the diagnostic targets the marginal band "
                              "where both classes exist")
-    parser.add_argument("--local-strides", type=int, default=2,
+    parser.add_argument("--local-strides", type=int, default=4,
                         help="maximum stride pairs per local track window; "
-                             "backward/forward candidates are all scanned and "
-                             "the densest single window (ties: longer "
-                             "baseline) is used")
+                             "causal backward candidates are scanned by "
+                             "default and the densest single window (ties: "
+                             "longer baseline) is used; --forward-windows "
+                             "also enables future windows")
+    parser.add_argument("--forward-windows", dest="backward_only",
+                        action="store_false",
+                        help="also use future windows (offline diagnostics "
+                             "only); the default is causal like online")
+    parser.set_defaults(backward_only=True)
     parser.add_argument("--min-parallax-deg", type=float, default=1.0)
     parser.add_argument("--min-condition-ratio", type=float, default=1e-2,
                         help="reject near-collinear 4-point samples (1e-3 was "
@@ -419,6 +349,10 @@ def main():
     parser.add_argument("--min-inliers", type=int, default=8,
                         help="accept gate on the best model's inlier count "
                              "(the score/AUC uses the raw count, not this)")
+    parser.add_argument("--min-tracks", type=int, default=5,
+                        help="minimum joined tracks and RANSAC fit floor; "
+                             "keep this no larger than any gate that will be "
+                             "re-aggregated")
     parser.add_argument("--residual-fraction", type=float, default=0.1,
                         help="RANSAC residual threshold as a fraction of the "
                              "median pairwise target distance; 0.05 turned "

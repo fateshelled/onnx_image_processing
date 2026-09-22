@@ -94,5 +94,15 @@ def test_load_sequences_skips_error_reports(tmp_path):
     assert [sequence["sequence"] for sequence in sequences] == ["good"]
 
 
+def test_validate_fit_floor_rejects_legacy_report_below_floor():
+    report = {**_report("legacy", []), "options": {"min_inliers": 8}}
+    with pytest.raises(SystemExit, match="fit floor 8 exceeds requested gate 6"):
+        gate.validate_fit_floor([report], [6, 8])
+
+    current = {**_report("current", []),
+               "options": {"min_inliers": 8, "min_tracks": 5}}
+    gate.validate_fit_floor([current], [6, 8])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
