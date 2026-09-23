@@ -9,6 +9,7 @@ import pytest
 
 from scripts import diag_local_tracks as diag
 from scripts.diag_local_tracks import frame_pairs, histogram
+from vo.local_tracks import FeatureTrack, TriangulatedTrack
 
 
 def test_frame_pairs_respects_local_radius():
@@ -88,7 +89,8 @@ def _opts(**overrides):
         cache_dir="unused", dataset_root="unused", max_frames=3,
         pair_radius=2, min_track_length=3, min_shared_tracks=1,
         max_neighbors=2, fx=525.0, fy=525.0, cx=320.0, cy=240.0,
-        width=640, height=480,
+        width=640, height=480, run_ba=False, ba_max_iterations=5,
+        ba_huber=3.0,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -136,6 +138,10 @@ def test_evaluate_sequence_uses_inliers_and_track_length_for_covisibility(
     monkeypatch.setattr(diag, "build_feature_tracks", capture_build)
     monkeypatch.setattr(diag, "triangulate_feature_track",
                         lambda *_args: None)
+    monkeypatch.setattr(
+        diag, "optimize_local_ba",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("BA must remain opt-in")))
     report = diag.evaluate_sequence("syn", _opts(), Matcher())
     assert report["n_pairs"] == 3
     assert report["pose_failures"] == 1
@@ -150,6 +156,12 @@ def test_evaluate_sequence_uses_inliers_and_track_length_for_covisibility(
         {"frame": 4, "shared_tracks": 1},
     ]
     json.dumps(report, allow_nan=False)
+
+    sentinel = {"ok": True, "reason": "wired"}
+    monkeypatch.setattr(diag, "_run_ba_diagnostic",
+                        lambda *_args: sentinel)
+    wired = diag.evaluate_sequence("syn", _opts(run_ba=True), Matcher())
+    assert wired["local_ba"] is sentinel
 
 
 def test_evaluate_sequence_rejects_pose_mask_mismatch(monkeypatch):
@@ -197,9 +209,99 @@ def test_main_returns_nonzero_after_writing_failure_json(
 @pytest.mark.parametrize(
     "args", [["--seq", ""], ["--pair-radius", "0"],
              ["--min-shared-tracks", "0"], ["--max-neighbors", "-1"],
-             ["--fx", "nan"], ["--width", "0"]])
+              ["--fx", "nan"], ["--width", "0"],
+              ["--ba-max-iterations", "0"], ["--ba-huber", "nan"]])
 def test_main_rejects_invalid_cli_values(monkeypatch, args):
     monkeypatch.setattr(sys, "argv", ["diag_local_tracks.py", *args])
     with pytest.raises(SystemExit) as exc:
         diag.main()
     assert exc.value.code == 2
+
+
+def test_largest_ba_component_is_deterministic():
+    poses = {frame: np.eye(4) for frame in range(4)}
+    landmarks = {track: np.ones(3) for track in range(4)}
+    observations = (
+        diag.BAObservation(0, 0, (1.0, 2.0)),
+        diag.BAObservation(1, 0, (1.0, 2.0)),
+        diag.BAObservation(0, 1, (1.0, 2.0)),
+        diag.BAObservation(1, 1, (1.0, 2.0)),
+        diag.BAObservation(2, 2, (1.0, 2.0)),
+        diag.BAObservation(3, 2, (1.0, 2.0)),
+        diag.BAObservation(2, 3, (1.0, 2.0)),
+        diag.BAObservation(3, 3, (1.0, 2.0)),
+    )
+    selected_poses, selected_landmarks, selected = diag._largest_ba_component(
+        poses, landmarks, tuple(reversed(observations)))
+    assert tuple(sorted(selected_poses)) == (0, 1)
+    assert tuple(sorted(selected_landmarks)) == (0, 1)
+    assert len(selected) == 4
+
+
+def test_run_ba_diagnostic_converts_and_aligns_problem(monkeypatch):
+    angle = np.deg2rad(15.0)
+    rotation = np.array([[np.cos(angle), 0.0, np.sin(angle)],
+                         [0.0, 1.0, 0.0],
+                         [-np.sin(angle), 0.0, np.cos(angle)]])
+    anchor_poses = {
+        0: (np.eye(3), np.zeros(3)),
+        2: (rotation, np.array([-1.0, 0.0, 0.0])),
+        4: (np.eye(3), np.array([-2.0, 0.0, 0.0])),
+    }
+    keypoints = {frame: np.array([[10.0 + frame, 20.0]])
+                 for frame in anchor_poses}
+    tracks = (
+        FeatureTrack(3, ((0, 0), (2, 0), (4, 0))),
+        FeatureTrack(9, ((0, 0), (2, 0))),
+    )
+    triangulated = (
+        TriangulatedTrack(3, np.array([0.0, 0.0, 4.0]), (0, 4), True,
+                          5.0, 0.2, 1.0, 1.0, 2.0, 4.0),
+        TriangulatedTrack(9, np.array([1.0, 0.0, 4.0]), (0, 2), False,
+                          2.0, 0.1, 1.0, 1.0, 2.0, 8.0),
+    )
+    captured = {}
+
+    def fake_optimize(poses, landmarks, observations, _cam, **kwargs):
+        captured.update(poses=poses, landmarks=landmarks,
+                        observations=observations, kwargs=kwargs)
+        return SimpleNamespace(
+            ok=True, reason="", poses={key: value.copy()
+                                       for key, value in poses.items()},
+            initial_cost=10.0, final_cost=2.0, iterations=2,
+            pose_ids=tuple(sorted(poses)))
+
+    monkeypatch.setattr(diag, "optimize_local_ba", fake_optimize)
+    report = diag._run_ba_diagnostic(
+        anchor_poses, keypoints, tracks, triangulated, object(), _opts())
+
+    expected = np.eye(4)
+    expected[:3, :3] = rotation.T
+    expected[:3, 3] = -rotation.T @ anchor_poses[2][1]
+    np.testing.assert_allclose(captured["poses"][2], expected)
+    assert tuple(captured["landmarks"]) == (3,)
+    assert {item.track_id for item in captured["observations"]} == {3}
+    assert [(item.frame_id, item.feature_id, item.pixel_yx)
+            for item in captured["observations"]] == [
+        (0, 0, (10.0, 20.0)),
+        (2, 0, (12.0, 20.0)),
+        (4, 0, (14.0, 20.0)),
+    ]
+    assert captured["kwargs"] == {"max_iterations": 5,
+                                    "huber_delta": 3.0}
+    assert report["ok"] and report["cost_ratio"] == 0.2
+    assert report["rotation_step_deg_max"] == pytest.approx(0.0, abs=1e-12)
+    assert report["translation_step_max"] == pytest.approx(0.0, abs=1e-12)
+    json.dumps(report, allow_nan=False)
+
+
+def test_run_ba_diagnostic_empty_problem_has_stable_json_schema():
+    report = diag._run_ba_diagnostic(
+        {0: (np.eye(3), np.zeros(3))}, {0: np.zeros((1, 2))}, (), (),
+        object(), _opts())
+    assert not report["ok"]
+    assert report["poses"] == report["landmarks"] == 0
+    assert report["initial_cost"] is None
+    assert report["rotation_step_deg_max"] is None
+    assert report["elapsed_ms"] >= 0.0
+    json.dumps(report, allow_nan=False)

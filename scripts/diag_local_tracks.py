@@ -6,6 +6,7 @@ import argparse
 import heapq
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -24,9 +25,11 @@ from vo.local_tracks import (  # noqa: E402
     select_covisible_neighbors,
     triangulate_feature_track,
 )
+from vo.local_ba import BAObservation, optimize_local_ba  # noqa: E402
 from vo.loop_sim3_verifier import compose_odom  # noqa: E402
 from vo.onnx_matcher import extract_match_indices  # noqa: E402
 from vo.pose_estimation import CameraIntrinsics  # noqa: E402
+from vo.se3 import se3_log  # noqa: E402
 
 
 def frame_pairs(frames, pair_radius):
@@ -135,6 +138,104 @@ def anchor_poses(cache, frames, pair_poses=(), *, return_bridges=False):
     return (poses, bridges) if return_bridges else poses
 
 
+def _camera_to_world_poses(anchor_to_camera):
+    poses = {}
+    for frame, (rotation, translation) in anchor_to_camera.items():
+        pose = np.eye(4)
+        pose[:3, :3] = rotation.T
+        pose[:3, 3] = -rotation.T @ translation
+        poses[frame] = pose
+    return poses
+
+
+def _largest_ba_component(poses, landmarks, observations):
+    adjacency = {}
+    for item in observations:
+        pose_node = ("p", item.frame_id)
+        landmark_node = ("l", item.track_id)
+        adjacency.setdefault(pose_node, set()).add(landmark_node)
+        adjacency.setdefault(landmark_node, set()).add(pose_node)
+    components = []
+    remaining = set(adjacency)
+    while remaining:
+        start = min(remaining)
+        reached = {start}
+        frontier = [start]
+        while frontier:
+            node = frontier.pop()
+            for neighbor in adjacency[node] - reached:
+                reached.add(neighbor)
+                frontier.append(neighbor)
+        remaining -= reached
+        component_observations = tuple(
+            item for item in observations
+            if (("p", item.frame_id) in reached
+                and ("l", item.track_id) in reached))
+        components.append((len(component_observations), reached,
+                           component_observations))
+    if not components:
+        return {}, {}, ()
+    _count, nodes, selected = max(
+        components, key=lambda item: (item[0], -min(node[1]
+                                                    for node in item[1])))
+    selected_poses = {frame: poses[frame] for kind, frame in nodes if kind == "p"}
+    selected_landmarks = {track: landmarks[track]
+                          for kind, track in nodes if kind == "l"}
+    return selected_poses, selected_landmarks, selected
+
+
+def _run_ba_diagnostic(anchor_poses, keypoints, tracks, triangulated, cam,
+                       opts):
+    started = time.perf_counter()
+    track_by_id = {track.track_id: track for track in tracks}
+    valid_points = {result.track_id: result.point
+                    for result in triangulated if result.hard_valid}
+    observations = tuple(
+        BAObservation(frame, track_id, tuple(keypoints[frame][feature]), feature)
+        for track_id in sorted(valid_points)
+        for frame, feature in track_by_id[track_id].observations)
+    poses, landmarks, observations = _largest_ba_component(
+        _camera_to_world_poses(anchor_poses), valid_points, observations)
+    base = {
+        "poses": len(poses), "landmarks": len(landmarks),
+        "observations": len(observations), "iterations": 0,
+        "initial_cost": None, "final_cost": None, "cost_ratio": None,
+        "rotation_step_deg_median": None, "rotation_step_deg_max": None,
+        "translation_step_median": None, "translation_step_max": None,
+    }
+    if len(poses) < 2 or not landmarks:
+        return {"ok": False, "reason": "no connected BA component", **base,
+                "elapsed_ms": 1000.0 * (time.perf_counter() - started)}
+
+    result = optimize_local_ba(
+        poses, landmarks, observations, cam,
+        max_iterations=opts.ba_max_iterations, huber_delta=opts.ba_huber)
+    movable = [frame for frame in sorted(poses) if frame != result.pose_ids[0]]
+    increments = [se3_log(np.linalg.inv(poses[frame]) @ result.poses[frame])
+                  for frame in movable]
+    rotation_steps = [float(np.degrees(np.linalg.norm(step[:3])))
+                      for step in increments]
+    translation_steps = [float(np.linalg.norm(step[3:]))
+                         for step in increments]
+    return {
+        "ok": result.ok, "reason": result.reason, **base,
+        "iterations": result.iterations,
+        "initial_cost": (result.initial_cost
+                         if np.isfinite(result.initial_cost) else None),
+        "final_cost": (result.final_cost
+                       if np.isfinite(result.final_cost) else None),
+        "cost_ratio": (result.final_cost / result.initial_cost
+                       if result.ok and result.initial_cost > 0.0 else None),
+        "rotation_step_deg_median": (float(np.median(rotation_steps))
+                                     if rotation_steps else None),
+        "rotation_step_deg_max": max(rotation_steps, default=None),
+        "translation_step_median": (float(np.median(translation_steps))
+                                    if translation_steps else None),
+        "translation_step_max": max(translation_steps, default=None),
+        "elapsed_ms": 1000.0 * (time.perf_counter() - started),
+    }
+
+
 def evaluate_sequence(seq, opts, matcher):
     cache = load_cache(opts.cache_dir, seq)
     frames = sorted(cache["feat"])[:opts.max_frames]
@@ -187,6 +288,10 @@ def evaluate_sequence(seq, opts, matcher):
         if (result := triangulate_feature_track(
             track, keypoints, poses, cam.K, (opts.width, opts.height))) is not None
     ]
+    ba_report = None
+    if getattr(opts, "run_ba", False):
+        ba_report = _run_ba_diagnostic(
+            poses, keypoints, selected_tracks, triangulated, cam, opts)
     observations_per_frame = {
         int(frame): sum(frame in {item[0] for item in track.observations}
                         for track in selected_tracks)
@@ -233,6 +338,7 @@ def evaluate_sequence(seq, opts, matcher):
         "reprojection_median_px": percentile_summary(reprojection_median),
         "reprojection_p90_px": percentile_summary(reprojection_p90),
         "max_depth_baselines": percentile_summary(depth_baselines),
+        "local_ba": ba_report,
         "track_length_histogram": histogram(lengths),
         "covisibility_pairs": len(counts),
         "shared_tracks_median": (float(np.median(shared_values))
@@ -261,13 +367,17 @@ def main():
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--run-ba", action="store_true")
+    parser.add_argument("--ba-max-iterations", type=int, default=15)
+    parser.add_argument("--ba-huber", type=float, default=3.0)
     opts = parser.parse_args()
     sequences = [value.strip() for value in opts.seq.split(",") if value.strip()]
     if not sequences:
         parser.error("--seq must contain at least one sequence")
     if (opts.max_frames < 2 or opts.min_track_length < 2
             or opts.pair_radius < 1 or opts.min_shared_tracks < 1
-            or opts.max_neighbors < 0):
+            or opts.max_neighbors < 0 or opts.ba_max_iterations < 1
+            or not np.isfinite(opts.ba_huber) or opts.ba_huber <= 0.0):
         parser.error("invalid frame, track, pair, or neighbor limit")
     if (not np.isfinite([opts.fx, opts.fy, opts.cx, opts.cy]).all()
             or opts.fx <= 0 or opts.fy <= 0
