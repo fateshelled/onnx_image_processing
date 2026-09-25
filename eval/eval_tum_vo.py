@@ -4,7 +4,9 @@ TUM RGB-D VO evaluation harness for the Shi-Tomasi+Angle+SparseBAD+Sinkhorn
 matcher (incl. pyramid variant).
 
 Modes:
-  vo      : end-to-end VO -> trajectory -> Umeyama(SE3, scaled) align to GT -> ATE/RPE.
+  vo      : end-to-end VO -> trajectory -> Umeyama(SE3, scaled) align to GT -> ATE.
+            The online kf_prior path additionally reports gauge-free RPE when GT
+            poses are attached (see relative_pose_errors).
             pose-source = essential uses monocular RANSAC/MAGSAC;
             pose-source = rgbd-pnp uses registered depth for metric PnP-RANSAC.
   gtcheck : per-pair Sampson residual of extracted matches vs GT-derived fundamental matrix.
@@ -195,6 +197,66 @@ def umeyama(X, Y, with_scale=True):
     s = np.trace(np.diag(D) @ S) / var_x if with_scale else 1.0
     t = mu_y - s * (R @ mu_x)
     return s, R, t
+
+
+RPE_SEGMENT_LENGTHS_M = (1.0, 2.0, 5.0, 10.0)
+
+
+def relative_pose_errors(est_poses, gt_poses,
+                         lengths_m=RPE_SEGMENT_LENGTHS_M):
+    """Gauge-free relative pose error over GT distance segments.
+
+    The estimated trajectory's global scale is fixed once from the whole
+    trajectory (Umeyama on the camera centers); rotations and the world gauge
+    cancel in the relative errors, so no other alignment is applied.  For each
+    segment length ``L`` meters, every start frame is paired with the first
+    frame at least ``L`` metres ahead along the GT path, and the relative
+    translation and rotation errors are reported.
+    """
+    est_poses = np.asarray(est_poses, dtype=np.float64)
+    gt_poses = np.asarray(gt_poses, dtype=np.float64)
+    n = min(len(est_poses), len(gt_poses))
+    if n < 3:
+        return {}
+    est_poses, gt_poses = est_poses[:n], gt_poses[:n]
+    est_pos, gt_pos = est_poses[:, :3, 3], gt_poses[:, :3, 3]
+    scale, _, _ = umeyama(est_pos, gt_pos, with_scale=True)
+    if not np.isfinite(scale) or scale <= 0.0:
+        return {}  # degenerate (e.g. a stationary trajectory) - no usable scale
+    est_scaled = scale * est_pos
+    cumulative = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(gt_pos, axis=0), axis=1))])
+    metrics = {}
+    for length in lengths_m:
+        tag = f"{length:g}m"
+        trans, rot = [], []
+        for i in range(n):
+            target = cumulative[i] + length
+            if target > cumulative[-1] + 1e-9:
+                break
+            j = int(np.searchsorted(cumulative, target, side="left"))
+            if j <= i or j >= n:
+                continue
+            delta_est = est_poses[i, :3, :3].T @ (est_scaled[j] - est_scaled[i])
+            delta_gt = gt_poses[i, :3, :3].T @ (gt_pos[j] - gt_pos[i])
+            trans.append(float(np.linalg.norm(delta_est - delta_gt)))
+            relative = est_poses[i, :3, :3].T @ est_poses[j, :3, :3]
+            reference = gt_poses[i, :3, :3].T @ gt_poses[j, :3, :3]
+            rot.append(float(np.degrees(np.linalg.norm(
+                cv2.Rodrigues(relative.T @ reference)[0]))))
+        if trans:
+            metrics[f"RPE_trans_{tag}_median"] = float(np.median(trans))
+            metrics[f"RPE_trans_{tag}_rmse"] = float(
+                np.sqrt(np.mean(np.square(trans))))
+            metrics[f"RPE_trans_{tag}_drift_pct"] = float(
+                100.0 * np.median(trans) / length)
+            metrics[f"RPE_rot_{tag}_median_deg"] = float(np.median(rot))
+        else:
+            metrics[f"RPE_trans_{tag}_median"] = float("nan")
+            metrics[f"RPE_trans_{tag}_rmse"] = float("nan")
+            metrics[f"RPE_trans_{tag}_drift_pct"] = float("nan")
+            metrics[f"RPE_rot_{tag}_median_deg"] = float("nan")
+    return metrics
 
 
 # --------------------------------------------------------------------------

@@ -16,6 +16,21 @@ import numpy as np
 
 from vo.sim3_verification import sim3_ransac, triangulate_local
 
+SCALE_RATIO_BIN_EDGES = (0.5, 0.8, 1.25, 2.0)
+
+
+def translation_angle_deg(first, second):
+    """Return the angle between two translation directions in degrees."""
+    first = np.asarray(first, dtype=float).reshape(3)
+    second = np.asarray(second, dtype=float).reshape(3)
+    first_norm = float(np.linalg.norm(first))
+    second_norm = float(np.linalg.norm(second))
+    if (not np.isfinite(first_norm) or not np.isfinite(second_norm)
+            or first_norm <= 1e-12 or second_norm <= 1e-12):
+        return None
+    cosine = float(np.dot(first, second) / (first_norm * second_norm))
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
 
 def point_key(point):
     # The loop pair and the local stride pair share keypoint arrays, so the
@@ -74,23 +89,18 @@ def local_windows(odom, endpoint, stride, window_strides):
     return windows
 
 
-def build_cloud_from_windows(windows, match_fn, camera_matrix, *,
-                             min_parallax_deg=1.0,
-                             triangulate_fn=triangulate_local):
-    """Reconstruct an endpoint cloud from candidate two-view windows.
+def build_cloud_from_windows_detailed(windows, match_fn, camera_matrix, *,
+                                      min_parallax_deg=1.0,
+                                      triangulate_fn=triangulate_local):
+    """Like :func:`build_cloud_from_windows` but also return the chosen window.
 
-    Exactly one window feeds the cloud: the one with the most valid tracks
-    (ties go to the first candidate, so callers pass longer baselines first).
-    Using one window keeps a single scale gauge, since the cached per-stride
-    translations are unit-norm essential-matrix directions rather than
-    metrically consistent displacements.  All candidates are scanned so that
-    a sparse long window does not hide a denser short one.
-
-    Each window is ``(first_frame, last_frame, rotation, translation,
-    forward)`` with ``x_last = R @ x_first + t``; ``match_fn(first, last)``
-    must return raw ``(points_first, points_last)`` matches or ``None``.
+    Returns ``(cloud, chosen)`` where ``chosen`` is ``(first_frame, last_frame,
+    rotation, translation, forward, p_first, p_last, triangulation)`` for the
+    window that produced ``cloud``, or ``None`` when every window is empty.
+    Callers that need per-track triangulation covariances use this to rebuild
+    the exact same cloud.
     """
-    best = None
+    best, chosen = None, None
     for first_frame, last_frame, rotation, translation, forward in windows:
         pair = match_fn(first_frame, last_frame)
         if pair is None:
@@ -115,7 +125,31 @@ def build_cloud_from_windows(windows, match_fn, camera_matrix, *,
                  zip(keys, points_endpoint, tri.valid) if valid}
         if best is None or len(cloud) > len(best):
             best = cloud
-    return best or None
+            chosen = (first_frame, last_frame, rotation, translation, forward,
+                      p_first, p_last, tri)
+    return (best or None), chosen
+
+
+def build_cloud_from_windows(windows, match_fn, camera_matrix, *,
+                             min_parallax_deg=1.0,
+                             triangulate_fn=triangulate_local):
+    """Reconstruct an endpoint cloud from candidate two-view windows.
+
+    Exactly one window feeds the cloud: the one with the most valid tracks
+    (ties go to the first candidate, so callers pass longer baselines first).
+    Using one window keeps a single scale gauge, since the cached per-stride
+    translations are unit-norm essential-matrix directions rather than
+    metrically consistent displacements.  All candidates are scanned so that
+    a sparse long window does not hide a denser short one.
+
+    Each window is ``(first_frame, last_frame, rotation, translation,
+    forward)`` with ``x_last = R @ x_first + t``; ``match_fn(first, last)``
+    must return raw ``(points_first, points_last)`` matches or ``None``.
+    """
+    cloud, _ = build_cloud_from_windows_detailed(
+        windows, match_fn, camera_matrix,
+        min_parallax_deg=min_parallax_deg, triangulate_fn=triangulate_fn)
+    return cloud
 
 
 def build_local_cloud(odom, endpoint, stride, window_strides, match_fn,
@@ -136,14 +170,25 @@ def build_local_cloud(odom, endpoint, stride, window_strides, match_fn,
         triangulate_fn=triangulate_fn)
 
 
-def loop_tracks(pa, pb, cloud_a, cloud_b):
-    """Join raw loop correspondences against both endpoint clouds."""
-    Xa, Xb = [], []
+def joined_tracks(pa, pb, cloud_a, cloud_b):
+    """Join raw loop correspondences against both endpoint clouds.
+
+    Returns ``(joined, Xa, Xb)`` where ``joined`` holds the ``(key_a, key_b)``
+    pairs so callers can look up per-track data (e.g. covariances) in order.
+    """
+    joined, Xa, Xb = [], [], []
     for point_a, point_b in zip(pa, pb):
         key_a, key_b = point_key(point_a), point_key(point_b)
         if key_a in cloud_a and key_b in cloud_b:
+            joined.append((key_a, key_b))
             Xa.append(cloud_a[key_a])
             Xb.append(cloud_b[key_b])
+    return joined, Xa, Xb
+
+
+def loop_tracks(pa, pb, cloud_a, cloud_b):
+    """Join raw loop correspondences against both endpoint clouds."""
+    _joined, Xa, Xb = joined_tracks(pa, pb, cloud_a, cloud_b)
     return Xa, Xb
 
 
@@ -169,11 +214,15 @@ class Sim3LoopVerifier:
     """
 
     def __init__(self, odom, match_fn, camera_matrix, stride, *, gate=6,
-                 window_strides=4, min_parallax_deg=1.0, min_tracks=5,
-                 min_condition_ratio=1e-2, residual_fraction=0.1,
-                 iterations=2000, seed=0, cache_size=64, backward_only=True,
-                 abstain_policy="reject", window_fn=None):
-        if gate < 1 or min_tracks < 3 or window_strides < 1 or cache_size < 1:
+                  window_strides=4, min_parallax_deg=1.0, min_tracks=5,
+                  min_condition_ratio=1e-2, residual_fraction=0.1,
+                  iterations=2000, seed=0, cache_size=64, backward_only=True,
+                  abstain_policy="reject", window_fn=None, pose_fn=None,
+                  max_translation_angle_deg=None):
+        if (gate < 1 or min_tracks < 3 or window_strides < 1 or cache_size < 1
+                or int(stride) <= 0 or iterations < 1
+                or residual_fraction <= 0.0 or min_condition_ratio < 0.0
+                or min_parallax_deg < 0.0):
             raise ValueError("invalid Sim3LoopVerifier parameters")
         if abstain_policy not in ("reject", "accept"):
             raise ValueError("abstain_policy must be 'reject' or 'accept'")
@@ -193,19 +242,33 @@ class Sim3LoopVerifier:
         self.backward_only = bool(backward_only)
         self.abstain_policy = abstain_policy
         self.window_fn = window_fn
+        self.pose_fn = pose_fn
+        self.max_translation_angle_deg = (None if max_translation_angle_deg is None
+                                          else float(max_translation_angle_deg))
+        if (self.max_translation_angle_deg is not None
+                and (not np.isfinite(self.max_translation_angle_deg)
+                     or self.max_translation_angle_deg <= 0.0
+                     or self.max_translation_angle_deg > 180.0)):
+            raise ValueError("max_translation_angle_deg must be positive")
+        if self.max_translation_angle_deg is not None and self.pose_fn is None:
+            raise ValueError("translation direction gate requires pose_fn")
         self._clouds = OrderedDict()
         self.n_accept = 0
         self.n_reject = 0
         self.n_abstain = 0
         self.n_abstain_no_cloud = 0
         self.n_abstain_no_match = 0
+        self.n_abstain_no_pose = 0
         self.n_abstain_few_tracks = 0
+        self.n_direction_rejected = 0
+        # Fixed-size distribution of the fitted ratio between the two local
+        # cloud gauges.  It is diagnostic, not a metric graph scale factor.
+        self.scale_ratio_hist = [0, 0, 0, 0, 0]
+        self.last_scale = None
+        self.last_translation_angle_deg = None
 
-    def _cloud(self, endpoint):
-        cached = self._clouds.get(endpoint)
-        if cached is not None or endpoint in self._clouds:
-            self._clouds.move_to_end(endpoint)
-            return cached
+    def _candidate_windows(self, endpoint):
+        """Ordered local windows for one endpoint (extra first, then odometry)."""
         windows = []
         if self.window_fn is not None:
             windows.extend(self.window_fn(endpoint))
@@ -217,40 +280,83 @@ class Sim3LoopVerifier:
         seen = {(window[0], window[1]) for window in windows}
         windows.extend(window for window in odom_windows
                        if (window[0], window[1]) not in seen)
+        return windows
+
+    def _cloud(self, endpoint):
+        cached = self._clouds.get(endpoint)
+        if cached is not None or endpoint in self._clouds:
+            self._clouds.move_to_end(endpoint)
+            return cached
         cloud = build_cloud_from_windows(
-            windows, self.match_fn, self.camera_matrix,
-            min_parallax_deg=self.min_parallax_deg)
+            self._candidate_windows(endpoint), self.match_fn,
+            self.camera_matrix, min_parallax_deg=self.min_parallax_deg)
         self._clouds[endpoint] = cloud
         while len(self._clouds) > self.cache_size:
             self._clouds.popitem(last=False)
         return cloud
 
+    def _abstain(self, reason):
+        self.n_abstain += 1
+        if reason == "no_cloud":
+            self.n_abstain_no_cloud += 1
+        elif reason == "no_match":
+            self.n_abstain_no_match += 1
+        elif reason == "few_tracks":
+            self.n_abstain_few_tracks += 1
+        elif reason == "no_pose":
+            self.n_abstain_no_pose += 1
+        else:
+            raise ValueError(f"unknown abstain reason: {reason}")
+        return self.abstain_policy == "accept"
+
+    def _fit(self, a, b, Xa, Xb, joined):
+        """Fit the loop Sim(3); subclasses may use the per-track join keys."""
+        return sim3_ransac(np.asarray(Xa), np.asarray(Xb),
+                           seed=candidate_seed(self.seed, a, b),
+                           residual_fraction=self.residual_fraction,
+                           max_iterations=self.iterations,
+                           min_inliers=self.min_tracks,
+                           min_condition_ratio=self.min_condition_ratio)
+
+    def _decide(self, a, b, fit, Xa, Xb, joined, cloud_a, cloud_b):
+        if not fit.ok:
+            self.n_reject += 1
+            return False
+        self.last_scale = float(fit.scale)
+        self.scale_ratio_hist[sum(self.last_scale >= edge for edge in
+                                  SCALE_RATIO_BIN_EDGES)] += 1
+        self.last_translation_angle_deg = None
+        if int(fit.inliers.sum()) < self.gate:
+            self.n_reject += 1
+            return False
+        if self.max_translation_angle_deg is not None:
+            pose = self.pose_fn(a, b)
+            if pose is None or not pose.get("ok") or pose.get("t") is None:
+                return self._abstain("no_pose")
+            angle = translation_angle_deg(fit.translation, pose.get("t"))
+            self.last_translation_angle_deg = angle
+            if angle is None:
+                return self._abstain("no_pose")
+            if angle > self.max_translation_angle_deg:
+                self.n_reject += 1
+                self.n_direction_rejected += 1
+                return False
+        self.n_accept += 1
+        return True
+
     def __call__(self, a, b):
         a, b = int(a), int(b)
+        self.last_scale = None
+        self.last_translation_angle_deg = None
         cloud_a, cloud_b = self._cloud(a), self._cloud(b)
         if not cloud_a or not cloud_b:
-            self.n_abstain += 1
-            self.n_abstain_no_cloud += 1
-            return self.abstain_policy == "accept"
+            return self._abstain("no_cloud")
         pair = self.match_fn(a, b)
         if pair is None:
-            self.n_abstain += 1
-            self.n_abstain_no_match += 1
-            return self.abstain_policy == "accept"
+            return self._abstain("no_match")
         pa, pb = pair
-        Xa, Xb = loop_tracks(pa, pb, cloud_a, cloud_b)
+        joined, Xa, Xb = joined_tracks(pa, pb, cloud_a, cloud_b)
         if len(Xa) < self.min_tracks:
-            self.n_abstain += 1
-            self.n_abstain_few_tracks += 1
-            return self.abstain_policy == "accept"
-        fit = sim3_ransac(np.asarray(Xa), np.asarray(Xb),
-                          seed=candidate_seed(self.seed, a, b),
-                          residual_fraction=self.residual_fraction,
-                          max_iterations=self.iterations,
-                          min_inliers=self.min_tracks,
-                          min_condition_ratio=self.min_condition_ratio)
-        if fit.ok and int(fit.inliers.sum()) >= self.gate:
-            self.n_accept += 1
-            return True
-        self.n_reject += 1
-        return False
+            return self._abstain("few_tracks")
+        fit = self._fit(a, b, Xa, Xb, joined)
+        return self._decide(a, b, fit, Xa, Xb, joined, cloud_a, cloud_b)

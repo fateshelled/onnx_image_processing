@@ -67,6 +67,9 @@ DEFAULT_PARAMS = {
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
     "held_cap": 4, "global_opt_on_loop": True, "global_opt_period": 10,
+    # Master switch for loop closure. False skips loop detection/verification
+    # entirely so the odometry-only trajectory can be evaluated or tuned.
+    "loop_enable": True,
 }
 
 
@@ -503,6 +506,8 @@ class OnlinePoseGraph:
             self._commit_loop_history(harvested_loops)
 
     def _add_loops(self, b):
+        if not bool(self.p.get("loop_enable", True)):
+            return
         # Loop closure with the temporal-consistency gate: match the new
         # keyframe against older keyframes in the window, then keep only hits
         # confirmed by the previous ``loop_temporal_k - 1`` keyframes.

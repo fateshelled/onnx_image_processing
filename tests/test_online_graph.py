@@ -78,6 +78,41 @@ def test_online_graph_node_set_is_bounded():
     assert max_nodes < 40, f"node set not bounded: {max_nodes}"
 
 
+def test_loop_enable_false_disables_loop_closure():
+    """loop_enable=False must add no loop edges and skip the verifier."""
+    rng = np.random.default_rng(2)
+    N = 60
+    gt = [np.eye(4)]
+    for _ in range(N - 1):
+        gt.append(gt[-1] @ se3_exp(rng.normal(size=6) * 0.08))
+
+    def match_fn(a, b):
+        R, t = _relative(gt[a], gt[b])
+        return {"ok": True, "R": R, "t": t, "inlier_ratio": 1.0,
+                "n_matches": 300}
+
+    base = {"kf_max_gap": 5, "kf_min_gap": 4, "max_keyframes": 3,
+            "kf_trans_thresh": 0.0, "kf_rot_thresh": 0.0,
+            "loop_iterations": 10, "step_scale_t": 0.1,
+            "scale_prior_sigma": 2.0, "loop_window": 80,
+            "loop_min_gap": 8, "loop_min_inlier": 0.4, "nl_reg": True,
+            "nl_reg_c": 10.0, "nl_reg_tau": 10.0, "nl_reg_length": 1.0}
+
+    enabled = OnlinePoseGraph(dict(base), cam=None, match_fn=match_fn)
+    for k in range(N):
+        enabled.add_frame(k)
+    assert enabled.n_loop > 0  # control: this setup does close loops
+
+    called = []
+    disabled = OnlinePoseGraph({**base, "loop_enable": False}, cam=None,
+                               match_fn=match_fn)
+    disabled.loop_verifier = lambda a, b: called.append((a, b)) or True
+    for k in range(N):
+        disabled.add_frame(k)
+    assert disabled.n_loop == 0
+    assert called == []
+
+
 def test_scale_kf_path_runs_and_zero_sigma_is_safe():
     """The Kalman-filter scale path must run and not divide by zero."""
     from vo.online_graph import DEFAULT_PARAMS
