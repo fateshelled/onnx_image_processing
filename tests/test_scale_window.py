@@ -30,7 +30,7 @@ def test_jacobian_matches_finite_difference():
     for _ in range(3):
         T.append(T[-1] @ se3_exp(rng.normal(size=6) * 0.3))
 
-    opt = SlidingWindowOptimizer(window_size=None, max_iterations=1,
+    opt = SlidingWindowOptimizer(max_iterations=1,
                                  optimize_scale=True, scale_prior_sigma=0.3)
     for i in range(4):
         opt.add_node(i, T[i])
@@ -100,7 +100,7 @@ def test_recovers_per_edge_scales_on_triangle():
     T1 = T0 @ np.linalg.inv(M1_meas)
     T2 = T1 @ np.linalg.inv(M2_meas)
 
-    opt = SlidingWindowOptimizer(window_size=None, max_iterations=200,
+    opt = SlidingWindowOptimizer(max_iterations=200,
                                  optimize_scale=True, scale_prior_sigma=0.0)
     for i, Ti in enumerate([T0, T1, T2]):
         opt.add_node(i, Ti)
@@ -122,7 +122,7 @@ def test_fixed_scale_cannot_close_triangle():
     T1 = np.linalg.inv(M1_meas)
     T2 = T1 @ np.linalg.inv(M2_meas)
 
-    opt = SlidingWindowOptimizer(window_size=None, max_iterations=200,
+    opt = SlidingWindowOptimizer(max_iterations=200,
                                  optimize_scale=False)
     for i, Ti in enumerate([np.eye(4), T1, T2]):
         opt.add_node(i, Ti)

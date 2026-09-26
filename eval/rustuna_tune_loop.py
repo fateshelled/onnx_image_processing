@@ -209,7 +209,7 @@ def _sequential_kf_priors(opt, kf, keys, params):
 
     def new_window():
         return SlidingWindowOptimizer(
-            window_size=None, max_iterations=params["loop_iterations"],
+            max_iterations=params["loop_iterations"],
             huber=1.0, step_scale_t=step_t, step_scale_r=step_t,
             optimize_scale=True, scale_prior_sigma=params["scale_prior_sigma"],
             tsvd_ratio=(0.0 if params.get("nl_reg", False)
@@ -630,7 +630,7 @@ def eval_seq(c, params, cam, desc_matcher, match_cache=None, diag=None,
 
     # --- pose graph + loop closure + per-edge scale ---
     opt = SlidingWindowOptimizer(
-        window_size=None, max_iterations=params["loop_iterations"], huber=1.0,
+        max_iterations=params["loop_iterations"], huber=1.0,
         step_scale_t=params["step_scale_t"], step_scale_r=params["step_scale_t"],
         optimize_scale=True, scale_prior_sigma=params["scale_prior_sigma"],
         tsvd_ratio=(0.0 if (params.get("scale_kf_adaptive", False)

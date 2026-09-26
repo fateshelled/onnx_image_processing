@@ -591,7 +591,6 @@ class OnlinePoseGraph:
 
     def _new_window(self):
         return SlidingWindowOptimizer(
-            window_size=None,
             max_iterations=self.p.get("loop_iterations", 10),
             huber=1.0,
             step_scale_t=self.p.get("step_scale_t", 0.1),

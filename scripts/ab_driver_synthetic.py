@@ -54,7 +54,7 @@ def build_opt(params):
     keys = list(range(N))
     kf = keys[::KF_GAP]
     opt = SlidingWindowOptimizer(
-        window_size=None, max_iterations=params["loop_iterations"], huber=1.0,
+        max_iterations=params["loop_iterations"], huber=1.0,
         step_scale_t=params["step_scale_t"], step_scale_r=params["step_scale_t"],
         optimize_scale=True, scale_prior_sigma=params["scale_prior_sigma"],
         tsvd_ratio=0.0)

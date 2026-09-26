@@ -1,19 +1,19 @@
-"""Sliding-window pose-graph optimizer for visual odometry.
+"""Pose-graph optimizer for visual odometry.
 
-v1 scope:
-- Nodes: camera-to-world SE(3) poses (4x4). The oldest live node is the
-  anchor (fixed); the window slides by dropping nodes beyond window_size.
+The optimizer keeps every node that is added. Node removal and bounded-lag
+marginalization are the caller's responsibility: ``online_graph`` bounds the
+active set and marginalizes exited keyframes into multi-node priors.
+
+- Nodes: camera-to-world SE(3) poses (4x4). Nodes listed in ``fixed_ids`` are
+  held fixed and pin the gauge.
 - Edges: relative SE(3) measurements M_ij with p_j = R_ij p_i + t_ij,
   satisfying M_ij = T_j^{-1} T_i when consistent. This matches the
   recoverPose [R|t] point-transform convention used by the VO pipeline
   (see PR #33).
 - Residual per edge: e = Log(M_ij^{-1} T_j^{-1} T_i)  (rotation part first).
-- Solver: Gauss-Newton with LM damping; numerical Jacobian via central
-  differences on 6-dof right-increments T' = T Exp(delta). Windows are
-  small (<= ~12 nodes) so dense solving is adequate and numpy-only.
-- Robustness: per-edge Huber reweighting.
-- Marginalization: v1 drops removed edges without propagating information
-  (documented approximation; full Schur/multi-node prior is future work).
+- Solver: Gauss-Newton with LM damping; analytic SE(3) Jacobians with a
+  central-difference fallback where the analytic form is unavailable.
+- Robustness: per-edge Huber reweighting (plus optional loop kernels).
 
 Optional per-edge scale (monocular scale drift):
 - recoverPose translations are unit-norm, so the translation magnitude of a
@@ -26,7 +26,7 @@ Optional per-edge scale (monocular scale drift):
 
 Large graphs switch to a sparse (scipy) normal-equation solve so the memory
 scales with the number of nonzeros instead of the square of the variables;
-the dense LM path is kept for small windows. Runs on CPU. Not ONNX-related.
+the dense LM path is kept for small graphs. Runs on CPU. Not ONNX-related.
 """
 
 import numpy as np
@@ -52,14 +52,14 @@ def _edge_residual(T_i, T_j, M):
 
 
 class SlidingWindowOptimizer:
-    """Pose-only sliding window over SE(3) nodes.
+    """Pose-only SE(3) pose graph over camera-to-world nodes.
 
     Node ids must be strictly increasing (typically step/frame counters).
+    Node removal / bounded-lag marginalization is left to the caller.
     """
 
     def __init__(
         self,
-        window_size: int | None = 10,
         max_iterations: int = 30,
         lambda_init: float = 1e-3,
         step_scale_t: float = 0.05,
@@ -83,9 +83,6 @@ class SlidingWindowOptimizer:
         loop_scale_max_rot: float = 0.5,
         loop_scale_max_dir: float = 1.0,
     ) -> None:
-        if window_size is not None and window_size < 2:
-            raise ValueError(f"window_size must be >= 2 or None, got {window_size}")
-        self.window_size = window_size
         self.max_iterations = max_iterations
         self.lambda_init = lambda_init
         self.step_scale_t = step_scale_t
@@ -97,7 +94,7 @@ class SlidingWindowOptimizer:
         # eigenvalue is below tsvd_ratio * max_eigenvalue. 0 disables.
         self.tsvd_ratio = float(tsvd_ratio)
         # Normal equations are dense below this many variables and sparse
-        # (scipy) above it, keeping the exact legacy solver for small windows.
+        # (scipy) above it, keeping the exact legacy solver for small graphs.
         self.dense_max_cols = int(dense_max_cols)
         if loop_robust not in ("none", "dcs", "block", "gm", "gnc_gm"):
             raise ValueError(f"unsupported loop_robust mode: {loop_robust}")
@@ -139,7 +136,7 @@ class SlidingWindowOptimizer:
         self.tsvd_total = 0
         self.pose_ids: list[int] = []
         # Node ids held fixed (no variables); they still participate in
-        # residuals and pin the gauge for fixed-lag optimization.
+        # residuals and pin the gauge.
         self.fixed_ids: set[int] = set()
         self.T: dict[int, np.ndarray] = {}
         self.edges: list[tuple] = []  # (i, j, M, sigma_t, sigma_r)
@@ -180,7 +177,6 @@ class SlidingWindowOptimizer:
         self.pose_ids.append(node_id)
         if fixed:
             self.fixed_ids.add(node_id)
-        self._drop_oldest()
 
     def add_edge(
         self,
@@ -302,30 +298,6 @@ class SlidingWindowOptimizer:
         if node_id not in self.T:
             raise KeyError(node_id)
         return self.T[node_id].copy()
-
-    def _drop_oldest(self) -> None:
-        if self.window_size is None:
-            return
-        while len(self.pose_ids) > self.window_size:
-            drop = self.pose_ids.pop(0)
-            self.T.pop(drop, None)
-            keep = [k for k, e in enumerate(self.edges)
-                    if e[0] != drop and e[1] != drop]
-            self.edges = [self.edges[k] for k in keep]
-            self.edge_whiten = [self.edge_whiten[k] for k in keep]
-            self.edge_robust = [self.edge_robust[k] for k in keep]
-            self.edge_scale = [self.edge_scale[k] for k in keep]
-            self.edge_scale_sigma = [self.edge_scale_sigma[k] for k in keep]
-            self.scale_prior_mean = [self.scale_prior_mean[k] for k in keep]
-            cols = [self.scale_col[k] for k in keep]
-            self.scale_col = []
-            self.n_scale = 0
-            for c in cols:
-                if c is None:
-                    self.scale_col.append(None)
-                else:
-                    self.scale_col.append(self.n_scale)
-                    self.n_scale += 1
 
     # -- internals ------------------------------------------------------------
 

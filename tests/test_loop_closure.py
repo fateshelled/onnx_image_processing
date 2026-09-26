@@ -1,4 +1,4 @@
-"""Synthetic tests for full-graph (window_size=None) pose optimization + loop edges.
+"""Synthetic tests for full-graph pose optimization + loop edges.
 
 Also covers the numpy-only integrated keyframe-matching / loop-closure edge
 selection logic in ``vo.loop_closure``.
@@ -25,12 +25,12 @@ def _chain(n, seed=0, step=0.1):
     return T
 
 
-def test_full_graph_keeps_all_nodes():
-    opt = SlidingWindowOptimizer(window_size=None, max_iterations=5)
+def test_keeps_all_nodes():
+    opt = SlidingWindowOptimizer(max_iterations=5)
     T = _chain(20, seed=2)
     for i, Ti in enumerate(T):
         opt.add_node(i, Ti)
-    assert len(opt.pose_ids) == 20, "window_size=None must keep all nodes"
+    assert len(opt.pose_ids) == 20, "the optimizer must keep all added nodes"
     for i in range(19):
         opt.add_edge(i, i + 1, np.linalg.inv(T[i + 1]) @ T[i])
     cost = opt.optimize()
@@ -45,7 +45,7 @@ def test_loop_closure_corrects_drift():
     # Odometry edges carry a constant translation bias -> drift on integration.
     bias = np.zeros(6)
     bias[3] = 0.08  # +0.08 m per step in x
-    opt = SlidingWindowOptimizer(window_size=None, max_iterations=200,
+    opt = SlidingWindowOptimizer(max_iterations=200,
                                  huber=1.0, step_scale_t=0.02, step_scale_r=0.02)
 
     # Initial (drifted) node poses: integrate biased odometry only.
@@ -131,7 +131,7 @@ def test_integrated_loop_preferred_then_local_fallback():
 
 
 if __name__ == "__main__":
-    test_full_graph_keeps_all_nodes()
+    test_keeps_all_nodes()
     test_loop_closure_corrects_drift()
     test_edge_key_is_undirected()
     test_temporal_gate_requires_consecutive_history()

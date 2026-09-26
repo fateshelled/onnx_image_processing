@@ -642,7 +642,6 @@ def run_vo(args):
             # only loop edges free (much smaller problem).
             odom_scale_free = args.edge_scale and not args.scale_loop_only
             opt = SlidingWindowOptimizer(
-                window_size=None,
                 max_iterations=args.loop_iterations,
                 huber=args.loop_huber,
                 step_scale_t=args.step_scale_t,

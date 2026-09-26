@@ -1,4 +1,4 @@
-"""Minimal SE(3) utilities for the sliding-window pose-graph optimizer.
+"""Minimal SE(3) utilities for the pose-graph optimizer.
 
 Tangent basis ordering: (omega, tau) = (rotation 3-vec, translation 3-vec),
 right-perturbation convention: node poses are updated as T' = T @ Exp(delta).

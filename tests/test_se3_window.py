@@ -24,7 +24,7 @@ def rand_T(rng, max_t=1.0, max_rot=0.5):
 
 class TestLoopRobustWeights:
     def _optimizer_with_edge(self, **kwargs):
-        opt = SlidingWindowOptimizer(window_size=None, **kwargs)
+        opt = SlidingWindowOptimizer(**kwargs)
         opt.add_node(0, np.eye(4))
         opt.add_node(1, np.eye(4))
         opt.add_edge(0, 1, np.eye(4), robust=True)
@@ -45,7 +45,7 @@ class TestLoopRobustWeights:
         assert opt._loop_robust_weight(0, 1e6) == pytest.approx(0.1)
 
     def test_only_flagged_edge_is_downweighted(self):
-        opt = SlidingWindowOptimizer(window_size=None, loop_robust="dcs",
+        opt = SlidingWindowOptimizer(loop_robust="dcs",
                                      loop_robust_phi=1.0, huber=1e9)
         for i in range(3):
             opt.add_node(i, np.eye(4))
@@ -57,18 +57,8 @@ class TestLoopRobustWeights:
         assert np.all(weights[6:12] < 0.5)
         assert opt.n_robust_downweighted == 1
 
-    def test_drop_oldest_keeps_robust_flags_aligned(self):
-        opt = SlidingWindowOptimizer(window_size=3, loop_robust="dcs")
-        for i in range(3):
-            opt.add_node(i, np.eye(4))
-        opt.add_edge(0, 1, np.eye(4), robust=True)
-        opt.add_edge(1, 2, np.eye(4), robust=False)
-        opt.add_node(3, np.eye(4))
-        assert len(opt.edges) == len(opt.edge_robust) == 1
-        assert opt.edge_robust == [False]
-
     def test_gm_formula_and_block_separation(self):
-        opt = SlidingWindowOptimizer(window_size=None, loop_robust="gm",
+        opt = SlidingWindowOptimizer(loop_robust="gm",
                                      loop_gm_mu=4.0, loop_dir_sigma=0.4,
                                      huber=1e9)
         opt.add_node(0, np.eye(4))
@@ -95,7 +85,7 @@ class TestLoopRobustWeights:
         assert wt == pytest.approx(0.5)
 
     def test_direction_weight_is_scale_invariant(self):
-        opt = SlidingWindowOptimizer(window_size=None, loop_robust="gm")
+        opt = SlidingWindowOptimizer(loop_robust="gm")
         opt.add_node(0, np.eye(4))
         T1 = np.eye(4)
         T1[:3, 3] = [1.0, 1.0, 0.0]
@@ -111,7 +101,7 @@ class TestLoopRobustWeights:
         assert np.allclose(vals, vals[0], atol=1e-12)
 
     def test_gnc_schedule_reaches_final_mu(self):
-        opt = SlidingWindowOptimizer(window_size=None, loop_robust="gnc_gm",
+        opt = SlidingWindowOptimizer(loop_robust="gnc_gm",
                                      loop_gm_mu=11.34)
         opt.add_node(0, np.eye(4))
         opt.add_node(1, np.eye(4))
@@ -132,7 +122,7 @@ class TestLoopRobustWeights:
                         (3, 5): 3.0},
                 "dir": {}}
         opt = SlidingWindowOptimizer(
-            window_size=None, loop_robust="gm", loop_scale_mode="mad",
+            loop_robust="gm", loop_scale_mode="mad",
             loop_robust_hist=hist, loop_mad_min_samples=2,
             loop_scale_floor=0.01, loop_scale_max_rot=10.0)
         opt.add_node(0, np.eye(4))
@@ -143,7 +133,7 @@ class TestLoopRobustWeights:
 
     def test_mad_scale_fallback_and_zero_floor(self):
         opt = SlidingWindowOptimizer(
-            window_size=None, loop_scale_mode="mad", loop_rot_sigma=0.12,
+            loop_scale_mode="mad", loop_rot_sigma=0.12,
             loop_robust_hist={"rot": {(1, 2): 0.0, (2, 3): 0.0}, "dir": {}},
             loop_mad_min_samples=2, loop_scale_floor=0.01)
         opt.add_node(0, np.eye(4))
@@ -152,7 +142,7 @@ class TestLoopRobustWeights:
         assert opt._mad_scale("rot", 0) == pytest.approx(0.01)
 
         fallback = SlidingWindowOptimizer(
-            window_size=None, loop_scale_mode="mad", loop_rot_sigma=0.12,
+            loop_scale_mode="mad", loop_rot_sigma=0.12,
             loop_robust_hist={"rot": {(2, 3): 0.5}, "dir": {}},
             loop_mad_min_samples=2)
         fallback.add_node(0, np.eye(4))
@@ -165,7 +155,7 @@ class TestPerEdgeScalePriorSigma:
     def test_per_edge_sigma_and_zero_sigma_safe(self):
         rng = np.random.default_rng(7)
         T = [rand_T(rng) for _ in range(4)]
-        opt = SlidingWindowOptimizer(window_size=None, max_iterations=5,
+        opt = SlidingWindowOptimizer(max_iterations=5,
                                      optimize_scale=True, scale_prior_sigma=2.0)
         for i, Ti in enumerate(T):
             opt.add_node(i, Ti)
@@ -181,20 +171,6 @@ class TestPerEdgeScalePriorSigma:
         assert opt._n_prior() == 1
         opt.optimize()  # must not raise ZeroDivisionError
         assert all(np.isfinite(s) for s in opt.edge_scale)
-
-    def test_drop_oldest_keeps_lists_in_sync(self):
-        rng = np.random.default_rng(8)
-        T = [rand_T(rng) for _ in range(4)]
-        opt = SlidingWindowOptimizer(window_size=3, optimize_scale=True,
-                                     scale_prior_sigma=2.0)
-        for i in range(3):
-            opt.add_node(i, T[i])
-        opt.add_edge(0, 1, rand_T(rng), scale_free=True)
-        opt.add_edge(1, 2, rand_T(rng), scale_free=True)
-        opt.add_node(3, T[3])  # drops node 0 and the edge (0,1)
-        opt.add_edge(2, 3, rand_T(rng), scale_free=True)
-        assert len(opt.edge_scale) == len(opt.edge_scale_sigma) \
-            == len(opt.scale_prior_mean) == len(opt.edges)
 
 
 class TestSe3:
@@ -238,7 +214,7 @@ class TestWindowOptimizer:
             meas.append(M)
             # T_{k+1}^{-1} T_k = M  =>  T_{k+1} = T_k @ M^{-1}
             T_gen.append(T_gen[-1] @ np.linalg.inv(M))
-        opt = SlidingWindowOptimizer(window_size=7)
+        opt = SlidingWindowOptimizer()
         opt.add_node(0, T_gen[0])
         for k in range(6):
             opt.add_node(k + 1, T_gen[k + 1])
@@ -266,7 +242,7 @@ class TestWindowOptimizer:
         T_init = [np.eye(4)]
         for k in range(6):
             T_init.append(T_init[-1] @ np.linalg.inv(meas[k]))
-        opt = SlidingWindowOptimizer(window_size=7, step_scale_t=0.1, step_scale_r=0.1)
+        opt = SlidingWindowOptimizer(step_scale_t=0.1, step_scale_r=0.1)
         opt.add_node(0, T_init[0])
         for k in range(6):
             opt.add_node(k + 1, T_init[k + 1])
@@ -280,21 +256,8 @@ class TestWindowOptimizer:
         e_after = np.linalg.norm(opt.get_pose(6)[:3, 3] - T_true[6][:3, 3])
         assert e_after < e_init
 
-    def test_window_slides(self):
-        rng = np.random.default_rng(5)
-        opt = SlidingWindowOptimizer(window_size=4)
-        opt.add_node(0, np.eye(4))
-        T = np.eye(4)
-        for k in range(8):
-            M = rand_T(rng, 0.3, 0.2)
-            T = T @ np.linalg.inv(M)
-            opt.add_node(k + 1, T)
-            opt.add_edge(k, k + 1, M)
-        assert len(opt.pose_ids) == 4
-        assert opt.pose_ids[-1] == 8
-
     def test_bad_node_ids(self):
-        opt = SlidingWindowOptimizer(window_size=4)
+        opt = SlidingWindowOptimizer()
         opt.add_node(0, np.eye(4))
         with pytest.raises(ValueError):
             opt.add_node(0, np.eye(4))
@@ -319,7 +282,7 @@ def _run_graph(dense_max_cols, tsvd_ratio=0.0):
     rng, T, meas = _random_graph()
     n = len(T)
     opt = SlidingWindowOptimizer(
-        window_size=None, max_iterations=40, step_scale_t=0.1, step_scale_r=0.1,
+        max_iterations=40, step_scale_t=0.1, step_scale_r=0.1,
         optimize_scale=True, scale_prior_sigma=0.5, tsvd_ratio=tsvd_ratio,
         dense_max_cols=dense_max_cols)
     for i, Ti in enumerate(T):
@@ -338,7 +301,7 @@ def _run_graph(dense_max_cols, tsvd_ratio=0.0):
 class TestSparseSolver:
     def test_jacobian_coo_matches_dense(self):
         rng, T, meas = _random_graph(seed=1)
-        opt = SlidingWindowOptimizer(window_size=None, max_iterations=1,
+        opt = SlidingWindowOptimizer(max_iterations=1,
                                      optimize_scale=True, scale_prior_sigma=0.3)
         for i, Ti in enumerate(T):
             opt.add_node(i, Ti)
@@ -375,7 +338,7 @@ class TestMarginalization:
         for k in range(4):
             T.append(T[-1] @ np.linalg.inv(meas[k]))
 
-        full = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+        full = SlidingWindowOptimizer(max_iterations=60,
                                      step_scale_t=0.1, step_scale_r=0.1)
         for i, Ti in enumerate(T):
             full.add_node(i, Ti)
@@ -389,7 +352,7 @@ class TestMarginalization:
         assert Omega.shape == (6, 6)
         assert np.allclose(Omega, Omega.T, atol=1e-9)
 
-        red = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+        red = SlidingWindowOptimizer(max_iterations=60,
                                      step_scale_t=0.1, step_scale_r=0.1)
         red.add_node(0, T[0])
         red.add_node(4, T[4])
@@ -411,7 +374,7 @@ class TestMultiNodePrior:
         for k in range(4):
             T.append(T[-1] @ np.linalg.inv(meas[k]))
 
-        full = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+        full = SlidingWindowOptimizer(max_iterations=60,
                                      step_scale_t=0.1, step_scale_r=0.1)
         for i, Ti in enumerate(T):
             full.add_node(i, Ti)
@@ -428,7 +391,7 @@ class TestMultiNodePrior:
         assert keep == [1, 3]
         assert H_r.shape == (12, 12)
 
-        red = SlidingWindowOptimizer(window_size=None, max_iterations=60,
+        red = SlidingWindowOptimizer(max_iterations=60,
                                      step_scale_t=0.1, step_scale_r=0.1)
         for i in (1, 2, 3, 4):
             red.add_node(i, full.get_pose(i))
