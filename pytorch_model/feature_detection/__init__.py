@@ -4,6 +4,9 @@ from .shi_tomasi_sparse_bad_sinkhorn import ShiTomasiSparseBADSinkhornMatcher
 from .shi_tomasi_angle_sparse_bad_sinkhorn_essential_matrix import (
     ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix,
 )
+from .shi_tomasi_angle_sparse_bad_sinkhorn_pyramid import (
+    ShiTomasiAngleSparseBADSinkhornMatcherPyramid,
+)
 from .akaze_sparse_bad_sinkhorn_essential_matrix import (
     AKAZESparseBADSinkhornWithEssentialMatrix,
 )
@@ -13,5 +16,6 @@ __all__ = [
     "ShiTomasiBADSinkhornMatcher",
     "ShiTomasiSparseBADSinkhornMatcher",
     "ShiTomasiAngleSparseBADSinkhornWithEssentialMatrix",
+    "ShiTomasiAngleSparseBADSinkhornMatcherPyramid",
     "AKAZESparseBADSinkhornWithEssentialMatrix",
 ]

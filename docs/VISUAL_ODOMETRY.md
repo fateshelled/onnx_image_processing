@@ -13,7 +13,7 @@ Visual Odometry estimates camera motion (trajectory) from a sequence of images o
 ## Architecture
 
 ```
-pytorch_model/vo/
+vo/
 ├── __init__.py           # Module exports
 ├── pose_estimation.py    # Camera pose estimation utilities
 └── trajectory.py         # Trajectory management and visualization
@@ -370,7 +370,7 @@ python sample/visual_odometry.py \
 The implementation uses an abstract `BaseCamera` class with concrete implementations:
 
 ```python
-from pytorch_model.vo import create_camera
+from vo import create_camera
 
 # Create OpenCV camera
 camera = create_camera(backend="opencv", device_id=0, width=640, height=480)
@@ -475,7 +475,7 @@ You can also use the VO modules programmatically:
 
 ```python
 import numpy as np
-from pytorch_model.vo import (
+from vo import (
     CameraIntrinsics,
     estimate_pose_ransac,
     Trajectory,

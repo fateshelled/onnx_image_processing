@@ -15,7 +15,7 @@
 
 ONNXモデルの推論結果に対してCPU上でフィルタリングを適用します。
 
-**ファイル**: `pytorch_model/matching/outlier_filters.py`, `sample/image_matching.py`
+**ファイル**: `vo/outlier_filters.py`, `sample/image_matching.py`
 
 **使用例**:
 ```bash
@@ -140,7 +140,7 @@ valid = margin >= dustbin_margin
 
 ### NumPy版実装
 
-**ファイル**: `pytorch_model/matching/outlier_filters.py`
+**ファイル**: `vo/outlier_filters.py`
 
 ```python
 def probability_ratio_filter(P: np.ndarray, ratio_threshold: float = 2.0) -> np.ndarray:
