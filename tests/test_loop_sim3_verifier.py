@@ -10,6 +10,7 @@ from vo.loop_sim3_verifier import (
     candidate_seed,
     compose_odom,
     point_key,
+    translation_angle_deg,
 )
 
 K = np.array([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]])
@@ -57,6 +58,12 @@ def test_shared_helpers_compose_and_keys():
     assert candidate_seed(0, 10, 40) != candidate_seed(0, 10, 41)
 
 
+def test_translation_angle_handles_direction_and_degenerate_input():
+    assert translation_angle_deg([1, 0, 0], [0, 1, 0]) == pytest.approx(90.0)
+    assert translation_angle_deg([1, 0, 0], [-1, 0, 0]) == pytest.approx(180.0)
+    assert translation_angle_deg([0, 0, 0], [1, 0, 0]) is None
+
+
 def test_verifier_accepts_consistent_loop():
     verifier = Sim3LoopVerifier(_odom(5), _match_fn, K, STRIDE,
                                 gate=8, window_strides=2)
@@ -71,6 +78,81 @@ def test_verifier_rejects_inconsistent_correspondence():
                                 gate=8, window_strides=2)
     assert verifier(10, 40) is False
     assert verifier.n_reject == 1
+
+
+def test_verifier_rejects_inconsistent_translation_direction():
+    def wrong_pose(a, b):
+        return {"ok": True, "t": np.array([-3.0, 0.0, 0.0])}
+
+    verifier = Sim3LoopVerifier(
+        _odom(5), _match_fn, K, STRIDE, gate=8, window_strides=2,
+        pose_fn=wrong_pose, max_translation_angle_deg=30.0)
+    assert verifier(10, 40) is False
+    assert verifier.n_direction_rejected == 1
+    assert verifier.last_translation_angle_deg == pytest.approx(180.0)
+
+
+def test_verifier_accepts_consistent_translation_direction():
+    def matching_pose(a, b):
+        return {"ok": True, "t": np.array([3.0, 0.0, 0.0])}
+
+    verifier = Sim3LoopVerifier(
+        _odom(5), _match_fn, K, STRIDE, gate=8, window_strides=2,
+        pose_fn=matching_pose, max_translation_angle_deg=30.0)
+    assert verifier(10, 40) is True
+    assert verifier.last_translation_angle_deg == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("pose", [None, {"ok": False}, {"ok": True, "t": None}])
+def test_verifier_direction_gate_abstains_when_pose_is_unavailable(pose):
+    verifier = Sim3LoopVerifier(
+        _odom(5), _match_fn, K, STRIDE, gate=8, window_strides=2,
+        pose_fn=lambda a, b: pose, max_translation_angle_deg=30.0)
+    assert verifier(10, 40) is False
+    assert verifier.n_abstain_no_pose == 1
+    assert verifier.n_abstain_no_match == 0
+
+
+def test_verifier_direction_gate_accept_policy_keeps_unavailable_pose():
+    verifier = Sim3LoopVerifier(
+        _odom(5), _match_fn, K, STRIDE, gate=8, window_strides=2,
+        pose_fn=lambda a, b: None, max_translation_angle_deg=30.0,
+        abstain_policy="accept")
+    assert verifier(10, 40) is True
+    assert verifier.n_abstain_no_pose == 1
+
+
+def test_direction_accept_policy_cannot_bypass_inlier_gate():
+    verifier = Sim3LoopVerifier(
+        _odom(5), _truncated_match_fn, K, STRIDE, gate=6,
+        window_strides=2, min_tracks=5, pose_fn=lambda a, b: None,
+        max_translation_angle_deg=30.0, abstain_policy="accept")
+    assert verifier(10, 40) is False
+    assert verifier.n_abstain_no_pose == 0
+
+
+def test_verifier_diagnostic_state_is_per_candidate():
+    verifier = Sim3LoopVerifier(_odom(5), _match_fn, K, STRIDE,
+                                gate=8, window_strides=2)
+    assert verifier(10, 40) is True
+    assert verifier.last_scale is not None
+    assert verifier(0, 40) is False
+    assert verifier.last_scale is None
+    assert verifier.last_translation_angle_deg is None
+    assert sum(verifier.scale_ratio_hist) == 1
+
+
+@pytest.mark.parametrize("direction", [[0.0, 0.0, 0.0],
+                                         [float("nan"), 0.0, 0.0]])
+def test_degenerate_candidate_direction_abstains(direction):
+    verifier = Sim3LoopVerifier(
+        _odom(5), _match_fn, K, STRIDE, gate=8, window_strides=2,
+        pose_fn=lambda a, b: {"ok": True, "t": direction},
+        max_translation_angle_deg=30.0, abstain_policy="accept")
+    assert verifier(10, 40) is True
+    assert verifier.n_abstain_no_pose == 1
+    assert verifier.n_direction_rejected == 0
+    assert sum(verifier.scale_ratio_hist) == 1
 
 
 def _none_for_loop_pair(a, b):

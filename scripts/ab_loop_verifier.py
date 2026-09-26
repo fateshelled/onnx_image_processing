@@ -28,7 +28,9 @@ CACHE = REPO / "eval/results/tune_cache_loop"
 FIELDS = ("ATE_median", "n_loop", "n_kf", "n_verifier_rejected",
           "n_verifier_abstained", "verifier_accept", "verifier_reject",
           "verifier_abstain", "verifier_abstain_no_cloud",
-          "verifier_abstain_no_match", "verifier_abstain_few_tracks")
+          "verifier_abstain_no_match", "verifier_abstain_no_pose",
+          "verifier_abstain_few_tracks", "verifier_direction_reject",
+          "verifier_scale_ratio_hist", "verifier_scale_ratio_bin_edges")
 
 
 def _finite(value):
@@ -37,16 +39,21 @@ def _finite(value):
     return value
 
 
-def _configs(gates, policies, keyframes=False):
+def _configs(gates, policies, keyframes=False, direction_angles=(None,)):
     configs = [("baseline", {"loop_verifier": "none"})]
     prefix = "sim3k" if keyframes else "sim3"
-    for gate in gates:
-        for policy in policies:
-            overrides = {"loop_verifier": "sim3",
-                          "loop_verifier_gate": gate,
-                         "loop_verifier_abstain": policy,
-                         "loop_verifier_keyframes": bool(keyframes)}
-            configs.append((f"{prefix}_g{gate}_{policy}", overrides))
+    for angle in direction_angles:
+        angle_tag = "" if angle is None else f"_dir{angle:g}"
+        for gate in gates:
+            for policy in policies:
+                overrides = {"loop_verifier": "sim3",
+                             "loop_verifier_gate": gate,
+                             "loop_verifier_abstain": policy,
+                             "loop_verifier_keyframes": bool(keyframes)}
+                if angle is not None:
+                    overrides["loop_verifier_max_translation_angle_deg"] = angle
+                configs.append((f"{prefix}{angle_tag}_g{gate}_{policy}",
+                                overrides))
     return configs
 
 
@@ -62,6 +69,9 @@ def main():
                         help="include keyframe-baseline clouds (S1); combine "
                              "with --policies accept for the deployment "
                              "profile")
+    parser.add_argument("--direction-angles", default="none",
+                        help="comma-separated translation-direction gates in "
+                             "degrees; use none to disable")
     parser.add_argument("--output", type=Path)
     opts = parser.parse_args()
 
@@ -79,10 +89,23 @@ def main():
             match_path = CACHE / f"match_cache_{seq}_numpy.pkl"
         with match_path.open("rb") as handle:
             match_cache = pickle.load(handle)
+        angles = []
+        for value in opts.direction_angles.split(","):
+            value = value.strip()
+            if not value:
+                continue
+            if value.lower() == "none":
+                angles.append(None)
+                continue
+            angle = float(value)
+            if not math.isfinite(angle) or angle <= 0.0 or angle > 180.0:
+                raise ValueError("direction angles must be finite values in (0, 180]")
+            angles.append(angle)
+        angles = tuple(angles)
         for tag, overrides in _configs(
                 [int(g) for g in opts.gates.split(",") if g],
                 [p.strip() for p in opts.policies.split(",") if p],
-                keyframes=opts.keyframes):
+                keyframes=opts.keyframes, direction_angles=angles):
             params = {**SEQ_OPT1_DEFAULTS, **overrides}
             try:
                 result = eval_seq(c, params, cam, matcher, match_cache)

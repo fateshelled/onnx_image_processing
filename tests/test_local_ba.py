@@ -5,7 +5,9 @@ import pytest
 
 from vo.local_ba import (BAObservation, _linearize,
                          _gauge_basis, _has_exact_sim3_gauge,
-                         _observation_residual_jacobians, _schur_reduce,
+                         _observation_residual_jacobians,
+                         _relative_prior_jacobians, _relative_prior_residual,
+                         _schur_reduce,
                          linearize_reduced, optimize_local_ba)
 from vo.se3 import se3_exp, skew
 
@@ -221,6 +223,89 @@ def test_already_converged_scene_returns_valid_factor():
     assert result.ok, result.reason
     assert result.iterations == 0
     np.testing.assert_allclose(result.final_cost, 0.0, atol=1e-15)
+
+
+def test_relative_prior_ignores_translation_scale_but_penalizes_direction():
+    poses, _landmarks, _observations = _scene()
+    prior = np.linalg.inv(poses[0]) @ poses[1]
+    scaled = prior.copy()
+    scaled[:3, 3] *= 3.0
+    np.testing.assert_allclose(
+        _relative_prior_residual(poses[0], scaled, prior, .1, .1)[3:],
+        0.0, atol=1e-10)
+    turned = prior.copy()
+    turned[:3, 3] = [0.0, 1.0, 0.0]
+    assert np.linalg.norm(
+        _relative_prior_residual(poses[0], turned, prior, .1, .1)[3:]) > 1.0
+
+
+def test_relative_prior_keeps_sim3_gauge_in_reduced_system():
+    poses, landmarks, observations = _scene()
+    relative_priors = {
+        (0, 1): np.linalg.inv(poses[0]) @ poses[1],
+        (1, 2): np.linalg.inv(poses[1]) @ poses[2],
+    }
+    pose_ids, hessian, _gradient, _cost, _valid = linearize_reduced(
+        poses, landmarks, observations, K, huber_delta=1e6,
+        relative_priors=relative_priors,
+        prior_rotation_sigma=.2, prior_direction_sigma=.2)
+    assert _has_exact_sim3_gauge(hessian, poses, pose_ids)
+
+
+def test_relative_prior_jacobians_match_independent_finite_difference():
+    poses, _landmarks, _observations = _scene()
+    prior = np.linalg.inv(poses[0]) @ poses[1]
+    state_a = poses[0] @ se3_exp([.03, -.02, .01, .1, -.05, .02])
+    state_b = poses[1] @ se3_exp([-.02, .01, .04, .2, .1, -.03])
+    analytic = _relative_prior_jacobians(state_a, state_b, prior, .2, .3)
+    for endpoint, expected in enumerate(analytic):
+        numeric = np.zeros((6, 6))
+        for column in range(6):
+            step = np.zeros(6)
+            step[column] = 1e-6
+            plus_a, plus_b = state_a.copy(), state_b.copy()
+            minus_a, minus_b = state_a.copy(), state_b.copy()
+            if endpoint == 0:
+                plus_a = state_a @ se3_exp(step)
+                minus_a = state_a @ se3_exp(-step)
+            else:
+                plus_b = state_b @ se3_exp(step)
+                minus_b = state_b @ se3_exp(-step)
+            numeric[:, column] = (
+                _relative_prior_residual(plus_a, plus_b, prior, .2, .3)
+                - _relative_prior_residual(minus_a, minus_b, prior, .2, .3)
+            ) / 2e-6
+        np.testing.assert_allclose(expected, numeric, atol=1e-8, rtol=1e-6)
+
+
+def test_relative_prior_requires_both_positive_sigmas():
+    poses, landmarks, observations = _scene()
+    with pytest.raises(ValueError, match="sigmas"):
+        optimize_local_ba(
+            poses, landmarks, observations, K,
+            relative_priors={(0, 1): np.linalg.inv(poses[0]) @ poses[1]},
+            prior_rotation_sigma=.2, prior_direction_sigma=0.0)
+
+
+def test_relative_prior_cost_matches_independent_residual_cost():
+    poses, landmarks, observations = _scene()
+    prior = np.linalg.inv(poses[0]) @ poses[1]
+    shifted = poses[1] @ se3_exp([.04, -.03, .02, .15, .1, -.05])
+    state = {**poses, 1: shifted}
+    relative_priors = {(0, 1): prior}
+    pose_ids, _hessian, _gradient, with_prior_cost, _valid = linearize_reduced(
+        state, landmarks, observations, K, huber_delta=1e6,
+        relative_priors=relative_priors,
+        prior_rotation_sigma=.2, prior_direction_sigma=.3)
+    _ids, _hessian, _gradient, observation_cost, _valid = linearize_reduced(
+        state, landmarks, observations, K, huber_delta=1e6)
+    residual = _relative_prior_residual(
+        state[0], state[1], prior, .2, .3)
+    assert pose_ids == (0, 1, 2)
+    assert np.isfinite(residual).all()
+    np.testing.assert_allclose(
+        with_prior_cost - observation_cost,
+        0.5 * float(residual @ residual), atol=1e-10)
 
 
 def test_gauge_rank_check_is_invariant_to_world_scale():

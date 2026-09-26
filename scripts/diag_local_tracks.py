@@ -15,7 +15,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "eval"))
 
-from eval.eval_tum_vo import estimate_pose_from_matches, intrinsics_for  # noqa: E402
+from eval.eval_tum_vo import estimate_pose_from_matches, intrinsics_for, umeyama  # noqa: E402
 from eval.rustuna_tune_loop import DEFAULT_ARGS, load_cache  # noqa: E402
 from eval.torch_sinkhorn import TorchSinkhornMatcher  # noqa: E402
 from vo.local_tracks import (  # noqa: E402
@@ -148,7 +148,7 @@ def _camera_to_world_poses(anchor_to_camera):
     return poses
 
 
-def _largest_ba_component(poses, landmarks, observations):
+def _largest_ba_component(poses, landmarks, observations, required_frames=()):
     adjacency = {}
     for item in observations:
         pose_node = ("p", item.frame_id)
@@ -171,8 +171,9 @@ def _largest_ba_component(poses, landmarks, observations):
             item for item in observations
             if (("p", item.frame_id) in reached
                 and ("l", item.track_id) in reached))
-        components.append((len(component_observations), reached,
-                           component_observations))
+        if all(("p", frame) in reached for frame in required_frames):
+            components.append((len(component_observations), reached,
+                               component_observations))
     if not components:
         return {}, {}, ()
     _count, nodes, selected = max(
@@ -236,6 +237,122 @@ def _run_ba_diagnostic(anchor_poses, keypoints, tracks, triangulated, cam,
     }
 
 
+def _trajectory_ate(poses, frames, gt_pos, stride):
+    indices = [frame // stride for frame in frames]
+    if (len(frames) < 3 or max(indices) >= len(gt_pos)
+            or not np.isfinite(gt_pos[indices]).all()):
+        raise ValueError("at least three aligned finite ground-truth positions required")
+    est = np.array([poses[frame][:3, 3] for frame in frames])
+    gt = np.asarray(gt_pos[indices], dtype=float)
+    if np.mean(np.sum((est - est.mean(axis=0)) ** 2, axis=1)) <= 1e-12:
+        raise ValueError("degenerate estimated trajectory")
+    scale, rotation, translation = umeyama(est, gt, with_scale=True)
+    errors = np.linalg.norm(scale * (est @ rotation.T) + translation - gt, axis=1)
+    return {"median": float(np.median(errors)),
+            "rmse": float(np.sqrt(np.mean(errors ** 2)))}
+
+
+def _run_bounded_ba_ab(cache, frames, anchor, keypoints, tracks, cam, opts):
+    """Offline window smoothing with full-sequence track/initial-pose prep.
+
+    Only BA observations/triangulation are window-local. Input tracks and
+    initial poses can depend on future frames: this is not an online A/B.
+    ATE measures the retrospectively smoothed trajectory.
+    """
+    initial = _camera_to_world_poses(anchor)
+    poses = {frame: pose.copy() for frame, pose in initial.items()}
+    track_by_id = {track.track_id: track for track in tracks}
+    baseline = _trajectory_ate(initial, frames, cache["gt_pos"], cache["stride"])
+    rows = []
+    started = time.perf_counter()
+    for end in range(2, len(frames)):
+        window = frames[max(0, end + 1 - opts.ba_window_size):end + 1]
+        window_set = set(window)
+        # Triangulate from the current window; do not reuse full-sequence points.
+        local_anchor = {frame: (pose[:3, :3].T,
+                                -pose[:3, :3].T @ pose[:3, 3])
+                        for frame, pose in poses.items() if frame in window_set}
+        local_tracks = [type(track)(track.track_id, tuple(
+            (frame, feature) for frame, feature in track.observations
+            if frame in window_set)) for track in tracks]
+        local_tracks = [track for track in local_tracks
+                        if len(track.observations) >= 3]
+        landmarks = {}
+        for track in local_tracks:
+            triangulated = triangulate_feature_track(
+                track, keypoints, local_anchor, cam.K,
+                (opts.width, opts.height))
+            if triangulated is not None and triangulated.hard_valid:
+                landmarks[track.track_id] = triangulated.point
+        observations = tuple(
+            BAObservation(frame, track_id, tuple(keypoints[frame][feature]), feature)
+            for track_id in sorted(landmarks)
+            for frame, feature in track_by_id[track_id].observations
+            if frame in window_set)
+        selected_poses, selected_points, observations = _largest_ba_component(
+            {frame: poses[frame] for frame in window}, landmarks, observations,
+            required_frames=(window[0], window[1], window[-1]))
+        row = {"end_frame": int(frames[end]), "frames": sorted(selected_poses),
+               "landmarks": len(selected_points), "observations": len(observations),
+               "accepted": False, "reason": "", "cost_ratio": None,
+               "rotation_step_deg_max": None, "translation_step_ratio_max": None,
+               "pre_ate_rmse": None, "candidate_ate_rmse": None}
+        if (len(selected_poses) < 3 or frames[end] not in selected_poses
+                or window[0] not in selected_poses
+                or window[1] not in selected_poses):
+            row["reason"] = "insufficient connected covisibility"
+            rows.append(row)
+            continue
+        start_frame = min(selected_poses)
+        # The window's initial baseline is the local scale reference.
+        baseline_length = float(np.linalg.norm(
+            poses[window[1]][:3, 3] - poses[window[0]][:3, 3]))
+        if baseline_length <= 1e-12:
+            row["reason"] = "degenerate baseline"
+            rows.append(row)
+            continue
+        result = optimize_local_ba(
+            selected_poses, selected_points, observations, cam,
+            max_iterations=opts.ba_max_iterations, huber_delta=opts.ba_huber)
+        row["cost_ratio"] = (float(result.final_cost / result.initial_cost)
+                             if result.ok and result.initial_cost > 0 else None)
+        if not result.ok:
+            row["reason"] = result.reason
+            rows.append(row)
+            continue
+        # Counterfactual only: GT never influences acceptance. Refit Sim(3)
+        # independently for the pre/candidate trajectories over the same frames.
+        row["pre_ate_rmse"] = _trajectory_ate(
+            poses, frames, cache["gt_pos"], cache["stride"])["rmse"]
+        row["candidate_ate_rmse"] = _trajectory_ate(
+            {**poses, **result.poses}, frames, cache["gt_pos"],
+            cache["stride"])["rmse"]
+        steps = [se3_log(np.linalg.inv(poses[frame]) @ result.poses[frame])
+                 for frame in sorted(selected_poses) if frame != start_frame]
+        rotation_max = max(float(np.degrees(np.linalg.norm(step[:3])))
+                           for step in steps)
+        translation_max = max(float(np.linalg.norm(step[3:]) / baseline_length)
+                              for step in steps)
+        row["rotation_step_deg_max"] = rotation_max
+        row["translation_step_ratio_max"] = translation_max
+        if (not np.isfinite(rotation_max + translation_max)
+                or rotation_max > opts.ba_max_rotation_deg
+                or translation_max > opts.ba_max_translation_ratio):
+            row["reason"] = "pose jump gate"
+        else:
+            row["accepted"] = True
+            poses.update(result.poses)
+        rows.append(row)
+    return {"evaluation_scope": "offline_full_sequence_prep_retrospective_smoothing",
+            "baseline_ate": baseline,
+            "retrospective_bounded_ate": _trajectory_ate(
+                poses, frames, cache["gt_pos"], cache["stride"]),
+            "accepted": sum(row["accepted"] for row in rows),
+            "rejected": sum(not row["accepted"] for row in rows),
+            "elapsed_ms": 1000.0 * (time.perf_counter() - started),
+            "windows": rows}
+
+
 def evaluate_sequence(seq, opts, matcher):
     cache = load_cache(opts.cache_dir, seq)
     frames = sorted(cache["feat"])[:opts.max_frames]
@@ -292,6 +409,10 @@ def evaluate_sequence(seq, opts, matcher):
     if getattr(opts, "run_ba", False):
         ba_report = _run_ba_diagnostic(
             poses, keypoints, selected_tracks, triangulated, cam, opts)
+    bounded_report = None
+    if getattr(opts, "ba_window_ate", False):
+        bounded_report = _run_bounded_ba_ab(
+            cache, frames, poses, keypoints, built.tracks, cam, opts)
     observations_per_frame = {
         int(frame): sum(frame in {item[0] for item in track.observations}
                         for track in selected_tracks)
@@ -339,6 +460,7 @@ def evaluate_sequence(seq, opts, matcher):
         "reprojection_p90_px": percentile_summary(reprojection_p90),
         "max_depth_baselines": percentile_summary(depth_baselines),
         "local_ba": ba_report,
+        "bounded_ba_ab": bounded_report,
         "track_length_histogram": histogram(lengths),
         "covisibility_pairs": len(counts),
         "shared_tracks_median": (float(np.median(shared_values))
@@ -370,14 +492,25 @@ def main():
     parser.add_argument("--run-ba", action="store_true")
     parser.add_argument("--ba-max-iterations", type=int, default=15)
     parser.add_argument("--ba-huber", type=float, default=3.0)
+    parser.add_argument("--ba-window-ate", action="store_true",
+                        help="offline bounded-window BA vs initial trajectory ATE")
+    parser.add_argument("--ba-window-size", type=int, default=6)
+    parser.add_argument("--ba-max-rotation-deg", type=float, default=2.0)
+    parser.add_argument("--ba-max-translation-ratio", type=float, default=0.25)
     opts = parser.parse_args()
     sequences = [value.strip() for value in opts.seq.split(",") if value.strip()]
     if not sequences:
         parser.error("--seq must contain at least one sequence")
-    if (opts.max_frames < 2 or opts.min_track_length < 2
+    if (opts.max_frames < (3 if opts.ba_window_ate else 2)
+            or opts.min_track_length < 2
             or opts.pair_radius < 1 or opts.min_shared_tracks < 1
             or opts.max_neighbors < 0 or opts.ba_max_iterations < 1
-            or not np.isfinite(opts.ba_huber) or opts.ba_huber <= 0.0):
+            or not np.isfinite(opts.ba_huber) or opts.ba_huber <= 0.0
+            or opts.ba_window_size < 3
+            or not np.isfinite(opts.ba_max_rotation_deg)
+            or opts.ba_max_rotation_deg <= 0.0
+            or not np.isfinite(opts.ba_max_translation_ratio)
+            or opts.ba_max_translation_ratio <= 0.0):
         parser.error("invalid frame, track, pair, or neighbor limit")
     if (not np.isfinite([opts.fx, opts.fy, opts.cx, opts.cy]).all()
             or opts.fx <= 0 or opts.fy <= 0

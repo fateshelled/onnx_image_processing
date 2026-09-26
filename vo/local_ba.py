@@ -7,7 +7,7 @@ import time
 
 import numpy as np
 
-from .se3 import se3_exp, skew
+from .se3 import se3_exp, se3_log, skew
 
 
 @dataclass(frozen=True)
@@ -153,8 +153,68 @@ def _filter_initial_outliers(poses, landmarks, observations, K, huber_delta):
         return observations
 
 
+def _relative_prior_residual(pose_a, pose_b, prior, rotation_sigma,
+                             direction_sigma):
+    relative = np.linalg.inv(pose_a) @ pose_b
+    rotation = se3_log(np.linalg.inv(prior) @ relative)[:3]
+    current_direction = relative[:3, 3]
+    prior_direction = prior[:3, 3]
+    current_norm = np.linalg.norm(current_direction)
+    prior_norm = np.linalg.norm(prior_direction)
+    if min(current_norm, prior_norm) <= 1e-12:
+        return None
+    direction = (current_direction / current_norm
+                 - prior_direction / prior_norm) / direction_sigma
+    return np.r_[rotation / rotation_sigma, direction]
+
+
+def _validate_relative_priors(poses, relative_priors):
+    if not relative_priors:
+        return
+    for (frame_a, frame_b), prior in relative_priors.items():
+        if frame_a not in poses or frame_b not in poses or frame_a == frame_b:
+            raise ValueError("relative prior uses an invalid pose pair")
+        prior = np.asarray(prior, dtype=float)
+        if (prior.shape != (4, 4) or not np.all(np.isfinite(prior))
+                or not np.allclose(prior[3], [0., 0., 0., 1.])
+                or not np.allclose(prior[:3, :3].T @ prior[:3, :3], np.eye(3),
+                                   atol=1e-7)
+                or not np.isclose(np.linalg.det(prior[:3, :3]), 1.0,
+                                  atol=1e-7)
+                or np.linalg.norm(prior[:3, 3]) <= 1e-12):
+            raise ValueError("relative prior must be a finite nonzero SE(3) transform")
+
+
+def _relative_prior_jacobians(pose_a, pose_b, prior, rotation_sigma,
+                              direction_sigma, epsilon=1e-6):
+    jacobians = []
+    for frame, fixed in (("a", pose_b), ("b", pose_a)):
+        jacobian = np.zeros((6, 6))
+        for column in range(6):
+            step = np.zeros(6)
+            step[column] = epsilon
+            if frame == "a":
+                plus = _relative_prior_residual(
+                    pose_a @ se3_exp(step), fixed, prior,
+                    rotation_sigma, direction_sigma)
+                minus = _relative_prior_residual(
+                    pose_a @ se3_exp(-step), fixed, prior,
+                    rotation_sigma, direction_sigma)
+            else:
+                plus = _relative_prior_residual(
+                    fixed, pose_b @ se3_exp(step), prior,
+                    rotation_sigma, direction_sigma)
+                minus = _relative_prior_residual(
+                    fixed, pose_b @ se3_exp(-step), prior,
+                    rotation_sigma, direction_sigma)
+            jacobian[:, column] = (plus - minus) / (2 * epsilon)
+        jacobians.append(jacobian)
+    return tuple(jacobians)
+
+
 def _linearize(poses, landmarks, observations, K, huber_delta, pose_ids,
-               landmark_ids, cancelled=None):
+               landmark_ids, relative_priors=None, prior_rotation_sigma=0.0,
+               prior_direction_sigma=0.0, cancelled=None):
     pose_index = {frame_id: index for index, frame_id in enumerate(pose_ids)}
     landmark_index = {track_id: index
                       for index, track_id in enumerate(landmark_ids)}
@@ -194,6 +254,33 @@ def _linearize(poses, landmarks, observations, K, huber_delta, pose_ids,
         bl[li] += J_landmark.T @ weighted_residual
         cost += robust_cost
         valid += 1
+    if relative_priors:
+        if prior_rotation_sigma <= 0.0 or prior_direction_sigma <= 0.0:
+            raise ValueError("relative prior sigmas must be positive when enabled")
+        for _prior_index, ((frame_a, frame_b), prior) in enumerate(
+                sorted(relative_priors.items())):
+            if cancelled is not None and cancelled():
+                return None
+            residual = _relative_prior_residual(
+                poses[frame_a], poses[frame_b], prior,
+                prior_rotation_sigma, prior_direction_sigma)
+            if residual is None:
+                continue
+            jac_a, jac_b = _relative_prior_jacobians(
+                poses[frame_a], poses[frame_b], prior,
+                prior_rotation_sigma, prior_direction_sigma)
+            for frame_id, jacobian in ((frame_a, jac_a), (frame_b, jac_b)):
+                section = slice(6 * pose_index[frame_id],
+                                6 * pose_index[frame_id] + 6)
+                Hpp[section, section] += jacobian.T @ jacobian
+                bp[section] += jacobian.T @ residual
+            section_a = slice(6 * pose_index[frame_a],
+                              6 * pose_index[frame_a] + 6)
+            section_b = slice(6 * pose_index[frame_b],
+                              6 * pose_index[frame_b] + 6)
+            Hpp[section_a, section_b] += jac_a.T @ jac_b
+            Hpp[section_b, section_a] += jac_b.T @ jac_a
+            cost += 0.5 * float(residual @ residual)
     return Hpp, Hpl, Hll, bp, bl, float(cost), valid
 
 
@@ -280,29 +367,40 @@ def _normalized_full_gradient(Hpp, Hll, bp, bl):
 
 
 def linearize_reduced(poses, landmarks, observations, camera, *,
-                      huber_delta=3.0):
+                      huber_delta=3.0, relative_priors=None,
+                      prior_rotation_sigma=0.0,
+                      prior_direction_sigma=0.0):
     """Return the ungauged landmark-Schur pose normal equation."""
     if huber_delta <= 0.0:
         raise ValueError("huber_delta must be positive")
     K = _camera_matrix(camera)
     pose_state, landmark_state = _copy_state(poses, landmarks)
+    _validate_relative_priors(pose_state, relative_priors)
     normalized = _validate_state(pose_state, landmark_state, observations)
     normalized = _filter_initial_outliers(
         pose_state, landmark_state, normalized, K, huber_delta)
     pose_ids = tuple(sorted(pose_state))
     landmark_ids = tuple(sorted(landmark_state))
     blocks = _linearize(pose_state, landmark_state, normalized, K,
-                        huber_delta, pose_ids, landmark_ids)
+                        huber_delta, pose_ids, landmark_ids,
+                        relative_priors=relative_priors,
+                        prior_rotation_sigma=prior_rotation_sigma,
+                        prior_direction_sigma=prior_direction_sigma)
     H, b, _ = _schur_reduce(*blocks[:5])
     return pose_ids, H, b, blocks[5], blocks[6]
 
 
 def _state_cost(poses, landmarks, observations, K, huber_delta,
                 anchor_id, scale_id, scale_target, scale_sigma,
-                cancelled=None):
+                relative_priors=None, prior_rotation_sigma=0.0,
+                prior_direction_sigma=0.0, cancelled=None):
     blocks = _linearize(
         poses, landmarks, observations, K, huber_delta,
-        tuple(sorted(poses)), tuple(sorted(landmarks)), cancelled=cancelled)
+        tuple(sorted(poses)), tuple(sorted(landmarks)),
+        relative_priors=relative_priors,
+        prior_rotation_sigma=prior_rotation_sigma,
+        prior_direction_sigma=prior_direction_sigma,
+        cancelled=cancelled)
     if blocks is None:
         return np.inf, -1
     _, _, _, _, _, cost, valid = blocks
@@ -316,6 +414,8 @@ def optimize_local_ba(poses, landmarks, observations, camera, *,
                       pose_anchor_id=None, max_iterations=15,
                       huber_delta=3.0, lambda_init=1e-3,
                       scale_sigma=1e-4, min_observations=6,
+                      relative_priors=None, prior_rotation_sigma=0.0,
+                      prior_direction_sigma=0.0,
                       deadline=None, clock=time.monotonic):
     """Optimize a local map and export its ungauged reduced pose factor.
 
@@ -327,8 +427,12 @@ def optimize_local_ba(poses, landmarks, observations, camera, *,
     if (max_iterations < 1 or huber_delta <= 0.0 or lambda_init <= 0.0
             or scale_sigma <= 0.0 or min_observations < 1):
         raise ValueError("invalid local BA solver settings")
+    if relative_priors and (prior_rotation_sigma <= 0.0
+                            or prior_direction_sigma <= 0.0):
+        raise ValueError("relative prior sigmas must be positive when enabled")
     K = _camera_matrix(camera)
     pose_state, landmark_state = _copy_state(poses, landmarks)
+    _validate_relative_priors(pose_state, relative_priors)
     normalized = _validate_state(pose_state, landmark_state, observations)
     normalized = _filter_initial_outliers(
         pose_state, landmark_state, normalized, K, huber_delta)
@@ -354,6 +458,7 @@ def optimize_local_ba(poses, landmarks, observations, camera, *,
     initial_cost, required_valid = _state_cost(
         pose_state, landmark_state, normalized, K, huber_delta,
         anchor_id, scale_id, scale_target, scale_sigma,
+        relative_priors, prior_rotation_sigma, prior_direction_sigma,
         cancelled=cancelled)
     if cancelled():
         return _failure(initial_poses, initial_landmarks,
@@ -363,7 +468,9 @@ def optimize_local_ba(poses, landmarks, observations, camera, *,
                         "insufficient valid observations")
     initial_blocks = _linearize(
         pose_state, landmark_state, normalized, K, huber_delta,
-        pose_ids, landmark_ids, cancelled=cancelled)
+        pose_ids, landmark_ids, relative_priors=relative_priors,
+        prior_rotation_sigma=prior_rotation_sigma,
+        prior_direction_sigma=prior_direction_sigma, cancelled=cancelled)
     if initial_blocks is None or cancelled():
         return _failure(initial_poses, initial_landmarks,
                         "deadline exceeded", initial_cost=initial_cost)
@@ -391,6 +498,9 @@ def optimize_local_ba(poses, landmarks, observations, camera, *,
                             "deadline exceeded", initial_cost=initial_cost)
         blocks = _linearize(pose_state, landmark_state, normalized, K,
                             huber_delta, pose_ids, landmark_ids,
+                            relative_priors=relative_priors,
+                            prior_rotation_sigma=prior_rotation_sigma,
+                            prior_direction_sigma=prior_direction_sigma,
                             cancelled=cancelled)
         if blocks is None or cancelled():
             return _failure(initial_poses, initial_landmarks,
@@ -445,9 +555,10 @@ def optimize_local_ba(poses, landmarks, observations, camera, *,
             return _failure(initial_poses, initial_landmarks,
                             "deadline exceeded", initial_cost=initial_cost)
         candidate_cost, candidate_valid = _state_cost(
-            candidate_poses, candidate_landmarks, normalized, K, huber_delta,
-            anchor_id, scale_id, scale_target, scale_sigma,
-            cancelled=cancelled)
+                candidate_poses, candidate_landmarks, normalized, K, huber_delta,
+                anchor_id, scale_id, scale_target, scale_sigma,
+                relative_priors, prior_rotation_sigma, prior_direction_sigma,
+                cancelled=cancelled)
         if cancelled():
             return _failure(initial_poses, initial_landmarks,
                             "deadline exceeded", initial_cost=initial_cost)
@@ -468,6 +579,9 @@ def optimize_local_ba(poses, landmarks, observations, camera, *,
                         "no cost-decreasing step", initial_cost=initial_cost)
     final_blocks = _linearize(pose_state, landmark_state, normalized, K,
                               huber_delta, pose_ids, landmark_ids,
+                              relative_priors=relative_priors,
+                              prior_rotation_sigma=prior_rotation_sigma,
+                              prior_direction_sigma=prior_direction_sigma,
                               cancelled=cancelled)
     if final_blocks is None or cancelled():
         return _failure(initial_poses, initial_landmarks,

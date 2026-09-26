@@ -91,6 +91,8 @@ def _opts(**overrides):
         max_neighbors=2, fx=525.0, fy=525.0, cx=320.0, cy=240.0,
         width=640, height=480, run_ba=False, ba_max_iterations=5,
         ba_huber=3.0,
+        ba_window_size=3, ba_max_rotation_deg=2.0,
+        ba_max_translation_ratio=0.25,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -210,7 +212,10 @@ def test_main_returns_nonzero_after_writing_failure_json(
     "args", [["--seq", ""], ["--pair-radius", "0"],
              ["--min-shared-tracks", "0"], ["--max-neighbors", "-1"],
               ["--fx", "nan"], ["--width", "0"],
-              ["--ba-max-iterations", "0"], ["--ba-huber", "nan"]])
+               ["--ba-max-iterations", "0"], ["--ba-huber", "nan"],
+               ["--ba-window-size", "2"],
+               ["--ba-max-rotation-deg", "nan"],
+               ["--ba-max-translation-ratio", "0"]])
 def test_main_rejects_invalid_cli_values(monkeypatch, args):
     monkeypatch.setattr(sys, "argv", ["diag_local_tracks.py", *args])
     with pytest.raises(SystemExit) as exc:
@@ -236,6 +241,23 @@ def test_largest_ba_component_is_deterministic():
     assert tuple(sorted(selected_poses)) == (0, 1)
     assert tuple(sorted(selected_landmarks)) == (0, 1)
     assert len(selected) == 4
+
+
+def test_ba_component_prefers_required_window_frames_over_larger_component():
+    poses = {frame: np.eye(4) for frame in range(5)}
+    points = {track: np.ones(3) for track in range(4)}
+    observations = tuple(diag.BAObservation(frame, track, (1., 2.))
+                         for track, frames in enumerate(
+                             ((0, 1, 4), (2, 3), (2, 3), (2, 3)))
+                         for frame in frames)
+    selected, landmarks, rows = diag._largest_ba_component(
+        poses, points, observations, required_frames=(0, 1, 4))
+    assert sorted(selected) == [0, 1, 4]
+    assert sorted(landmarks) == [0]
+    assert len(rows) == 3
+    empty = diag._largest_ba_component(
+        poses, points, observations, required_frames=(0, 2, 4))
+    assert empty == ({}, {}, ())
 
 
 def test_run_ba_diagnostic_converts_and_aligns_problem(monkeypatch):
@@ -305,3 +327,143 @@ def test_run_ba_diagnostic_empty_problem_has_stable_json_schema():
     assert report["rotation_step_deg_max"] is None
     assert report["elapsed_ms"] >= 0.0
     json.dumps(report, allow_nan=False)
+
+
+def test_bounded_ba_rejects_whole_window_then_accepts_safe_update(monkeypatch):
+    frames = [0, 2, 4, 6]
+    anchor = {frame: (np.eye(3), np.array([-frame / 2, 0., 0.]))
+              for frame in frames}
+    keypoints = {frame: np.array([[100., 200.]]) for frame in frames}
+    tracks = (FeatureTrack(0, tuple((frame, 0) for frame in frames)),)
+    points = (TriangulatedTrack(0, np.array([0., 0., 5.]), (0, 6), True,
+                                2., 0.2, 1., 1., 2., 4.),)
+    monkeypatch.setattr(diag, "triangulate_feature_track",
+                        lambda *_args: points[0])
+    calls = []
+
+    def fake_optimize(poses, landmarks, observations, _cam, **_kwargs):
+        calls.append((min(poses), max(poses), len(observations),
+                      poses[min(poses)][:3, 3].copy()))
+        output = {frame: pose.copy() for frame, pose in poses.items()}
+        output[max(poses)][:3, 3] += [0.8 if len(calls) == 1 else 0.1, 0., 0.]
+        return SimpleNamespace(ok=True, reason="", poses=output,
+                               landmarks=landmarks, initial_cost=10.,
+                               final_cost=5.)
+
+    monkeypatch.setattr(diag, "optimize_local_ba", fake_optimize)
+    cache = {"stride": 2, "gt_pos": np.array([[i, 0., 0.]
+                                               for i in range(4)])}
+    report = diag._run_bounded_ba_ab(cache, frames, anchor, keypoints,
+                                     tracks, SimpleNamespace(K=np.eye(3)), _opts())
+    assert calls[0][:3] == (0, 4, 3)
+    assert calls[1][:3] == (2, 6, 3)
+    np.testing.assert_allclose(calls[1][3], [1., 0., 0.])
+    assert report["accepted"] == report["rejected"] == 1
+    assert [row["reason"] for row in report["windows"]] == [
+        "pose jump gate", ""]
+    assert report["windows"][0]["translation_step_ratio_max"] == pytest.approx(.8)
+    assert report["windows"][1]["translation_step_ratio_max"] == pytest.approx(.1)
+    assert report["windows"][0]["candidate_ate_rmse"] > report["windows"][0]["pre_ate_rmse"]
+    assert report["windows"][1]["pre_ate_rmse"] == pytest.approx(report["baseline_ate"]["rmse"])
+    assert report["retrospective_bounded_ate"]["rmse"] > report["baseline_ate"]["rmse"]
+    json.dumps(report, allow_nan=False)
+
+
+def test_bounded_ba_triangulates_only_observations_available_in_window(monkeypatch):
+    frames = [0, 2, 4, 6]
+    anchor = {frame: (np.eye(3), np.array([-frame / 2, 0., 0.]))
+              for frame in frames}
+    keypoints = {frame: np.array([[100., 200.]]) for frame in frames}
+    tracks = (FeatureTrack(0, ((0, 0), (2, 0), (4, 0), (6, 0))),
+              FeatureTrack(1, ((0, 0), (4, 0), (6, 0))))
+    seen = []
+
+    def triangulate(track, _pixels, poses, _K, _dimensions):
+        seen.append((track.track_id, track.observations, tuple(sorted(poses))))
+        return None
+
+    monkeypatch.setattr(diag, "triangulate_feature_track", triangulate)
+    monkeypatch.setattr(diag, "optimize_local_ba",
+                        lambda *_args, **_kwargs: pytest.fail("no valid local points"))
+    cache = {"stride": 2, "gt_pos": np.array([[i, 0., 0.]
+                                               for i in range(4)])}
+    report = diag._run_bounded_ba_ab(
+        cache, frames, anchor, keypoints, tracks,
+        SimpleNamespace(K=np.eye(3)), _opts())
+    assert seen == [(0, ((0, 0), (2, 0), (4, 0)), (0, 2, 4)),
+                    (0, ((2, 0), (4, 0), (6, 0)), (2, 4, 6))]
+    assert report["accepted"] == 0
+    assert report["rejected"] == 2
+
+
+def test_bounded_ba_real_geometry_reduces_synthetic_trajectory_error():
+    from vo.se3 import se3_exp
+
+    K = np.array([[400., 0., 320.], [0., 400., 240.], [0., 0., 1.]])
+    true_poses = {frame: np.eye(4) for frame in (0, 2, 4)}
+    for frame in true_poses:
+        true_poses[frame][0, 3] = frame / 2
+    initial = {frame: pose.copy() for frame, pose in true_poses.items()}
+    initial[4] = initial[4] @ se3_exp([.015, -.02, .01, .12, -.08, .04])
+    anchor = {frame: (pose[:3, :3].T,
+                      -pose[:3, :3].T @ pose[:3, 3])
+              for frame, pose in initial.items()}
+    points = [np.array([x, y, z]) for x, y, z in (
+        (-.8, -.4, 4.), (-.2, .3, 5.), (.5, -.2, 4.5),
+        (1., .5, 6.), (1.7, -.3, 5.5), (2.2, .2, 4.2))]
+    keypoints = {}
+    for frame, pose in true_poses.items():
+        pixels = []
+        for point in points:
+            camera_point = pose[:3, :3].T @ (point - pose[:3, 3])
+            uv = K @ camera_point
+            pixels.append((uv[[1, 0]] / uv[2]).tolist())
+        keypoints[frame] = np.asarray(pixels)
+    tracks = tuple(FeatureTrack(i, ((0, i), (2, i), (4, i)))
+                   for i in range(len(points)))
+
+    cache = {"stride": 2, "gt_pos": np.array([[i, 0., 0.]
+                                               for i in range(3)])}
+    report = diag._run_bounded_ba_ab(
+        cache, [0, 2, 4], anchor, keypoints, tracks,
+        SimpleNamespace(K=K), _opts(ba_max_rotation_deg=10.,
+                                    ba_max_translation_ratio=.5,
+                                    ba_max_iterations=30))
+    assert report["accepted"] == 1, report["windows"]
+    assert report["retrospective_bounded_ate"]["rmse"] < report["baseline_ate"]["rmse"]
+    json.dumps(report, allow_nan=False)
+
+
+def test_evaluate_sequence_wires_bounded_ba(monkeypatch):
+    keypoints = np.zeros((1, 1, 2), dtype=float)
+    descriptors = np.zeros((1, 1, 4), dtype=float)
+    cache = {"feat": {frame: (keypoints, descriptors)
+                      for frame in (0, 2, 4)}, "stride": 2,
+             "odom": [{"ok": True, "R": np.eye(3), "t": [-1., 0., 0.]}] * 2}
+    monkeypatch.setattr(diag, "load_cache", lambda *_args: cache)
+    monkeypatch.setattr(diag, "intrinsics_for",
+                        lambda *_args: (525., 525., 320., 240.))
+    monkeypatch.setattr(diag, "extract_match_indices",
+                        lambda *_args: (np.array([0]), np.array([0]),
+                                        np.array([.9])))
+    monkeypatch.setattr(diag, "estimate_pose_from_matches",
+                        lambda *_args: {"ok": True, "mask": np.array([True])})
+    monkeypatch.setattr(diag, "triangulate_feature_track",
+                        lambda *_args: None)
+    captured = []
+
+    def bounded(*args):
+        captured.append(args)
+        return {"evaluation_scope": "offline"}
+
+    monkeypatch.setattr(diag, "_run_bounded_ba_ab", bounded)
+
+    class Matcher:
+        def match_probs(self, *_args):
+            return np.ones((2, 2))
+
+    report = diag.evaluate_sequence(
+        "syn", _opts(ba_window_ate=True), Matcher())
+    assert report["bounded_ba_ab"] == {"evaluation_scope": "offline"}
+    assert len(captured) == 1
+    assert len(captured[0][4]) == 1  # raw built tracks, not filtered points
