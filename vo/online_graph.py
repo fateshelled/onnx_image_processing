@@ -43,7 +43,7 @@ from .se3_window import SlidingWindowOptimizer
 DEFAULT_PARAMS = {
     "odom_ref": "kf", "kf_mode": "motion", "keyframe_decim": 15,
     "kf_trans_thresh": 4.0, "kf_rot_thresh": 30.0, "kf_max_gap": 8,
-    "kf_local_map_k": 2, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
+    "kf_local_map_k": 1, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
     "loop_window": 60, "loop_min_gap": 20, "loop_min_inlier": 0.5,
     "loop_temporal_k": 2, "loop_sigma_scale": 1.0,
     "loop_robust": "none", "loop_robust_phi": 1.0,
@@ -128,7 +128,7 @@ class OnlinePoseGraph:
         self._step = 1          # index step between consecutive frames
         self._seg = []          # transient ids since the last keyframe
         self._odom = {}         # frame id -> (R, t) relative to the previous frame
-        self._spoke = {}        # frame id -> (ref_kf, R, t, inlier, n_matches)
+        self._spoke = {}        # frame id -> [(ref_kf, R, t, inlier, n_matches)]
         self._priors = []       # pairwise transient priors (a, b, G, Omega)
         self._node_priors = []  # multi-node priors (ids, H, b, x0)
         self._hits = []         # per-keyframe loop hits (temporal confirmation)
@@ -230,9 +230,8 @@ class OnlinePoseGraph:
         # (K=1 keeps the previous single-hub behaviour).
         gate_deg = float(self.p.get("trans_gate_deg", 0.0))
         min_inl = float(self.p.get("kf_edge_min_inlier", 0.0))
-        for ref in self._kf[-max(1, int(self.p.get("kf_local_map_k", 1))):]:
-            if ref == prev:
-                continue
+        spoke_refs = [ref for ref in self._kf if ref != prev]
+        for ref in spoke_refs[-max(1, int(self.p.get("kf_local_map_k", 1))):]:
             sres = self.match(ref, idx)
             if not (sres and sres.get("ok")):
                 continue
@@ -241,10 +240,11 @@ class OnlinePoseGraph:
             dT = np.linalg.inv(self._T[idx]) @ self._T[ref]
             if not _trans_consistent(dT, sres.get("t"), gate_deg):
                 continue
-            self._spoke[idx] = (int(ref), np.asarray(sres["R"], float),
-                                np.asarray(sres["t"], float).reshape(3),
-                                float(sres.get("inlier_ratio", 0.0)),
-                                int(sres.get("n_matches", -1)))
+            self._spoke.setdefault(idx, []).append(
+                (int(ref), np.asarray(sres["R"], float),
+                 np.asarray(sres["t"], float).reshape(3),
+                 float(sres.get("inlier_ratio", 0.0)),
+                 int(sres.get("n_matches", -1))))
 
         self._last = idx
         self._seg.append(idx)
@@ -339,8 +339,7 @@ class OnlinePoseGraph:
                 self._added.add(edge_key(p, v))
         kf_spoke = None  # (act edge index, odometry baseline) for the new KF
         for v in trans + [b]:
-            if v in self._spoke:
-                ref, R, t, _inl, _n = self._spoke[v]
+            for ref, R, t, _inl, _n in self._spoke.get(v, []):
                 if ref in node_set and ref != self._prev.get(v):
                     kwargs, m = {}, None
                     if v == b and self._scale_kf is not None:
@@ -367,8 +366,8 @@ class OnlinePoseGraph:
         for v in trans + [b]:
             if v in self._odom:
                 present.add(edge_key(self._prev[v], v))
-            if v in self._spoke:
-                present.add(edge_key(self._spoke[v][0], v))
+            for ref, *_rest in self._spoke.get(v, []):
+                present.add(edge_key(ref, v))
         loop_act_ei = {}  # edge_key -> index in act.edges (for the local naive)
         for (la, lb, lR, lt, lsig) in self._loops:
             k = edge_key(la, lb)

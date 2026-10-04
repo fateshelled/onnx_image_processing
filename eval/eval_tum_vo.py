@@ -1034,8 +1034,8 @@ def main():
                          "the odometry chain scale).")
     ap.add_argument("--edge-scale", action="store_true", default=False,
                     help="Optimize a per-edge translation scale (similarity "
-                         "pose graph) instead of fixing all translations to "
-                         "unit norm. First free edge is the scale gauge.")
+                          "pose graph) instead of fixing all translations to "
+                          "unit norm. Unreferenced components get a scale gauge.")
     ap.add_argument("--scale-prior-sigma", type=float, default=0.5,
                     help="Std of the log-scale prior pulling edge scales "
                          "toward 1 (only with --edge-scale).")

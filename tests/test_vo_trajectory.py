@@ -124,6 +124,32 @@ class TestTrajectoryAccumulation:
         assert scale == pytest.approx(1.0, abs=0.05)
         assert err < 0.05
 
+    def test_replace_poses_rebuilds_absolute_trajectory(self):
+        trajectory = Trajectory()
+        poses = [np.eye(4), np.eye(4)]
+        poses[0][0, 3] = 2.0
+        poses[1][0, 3] = 3.0
+
+        trajectory.replace_poses(poses)
+        poses[0][0, 3] = 99.0
+
+        assert len(trajectory) == 2
+        assert np.allclose(trajectory.get_positions_array(),
+                           [[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]])
+
+    def test_empty_trajectory_can_be_saved_and_plotted(self, tmp_path):
+        trajectory = Trajectory(initialize_identity=False)
+        output = tmp_path / "empty.npz"
+
+        trajectory.save_to_file(output)
+        loaded = np.load(output)
+
+        assert len(trajectory) == 0
+        assert loaded["poses"].size == 0
+        assert loaded["positions"].size == 0
+        assert trajectory.plot_2d() is not None
+        assert trajectory.plot_3d() is not None
+
     def test_yaw_rotation_accumulation(self):
         """Yaw rotation per step: the known failure mode of the old code."""
         rng = np.random.default_rng(1)

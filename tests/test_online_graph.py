@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from vo.online_graph import OnlinePoseGraph
+from vo.se3_window import SlidingWindowOptimizer
 from vo.se3 import se3_exp
 
 
@@ -138,6 +139,34 @@ def test_scale_kf_path_runs_and_zero_sigma_is_safe():
         assert graph._scale_kf is not None
         assert graph._scale_kf.k is not None and np.isfinite(graph._scale_kf.k)
         assert graph._scale_kf.k > 0.0
+
+
+def test_local_map_adds_all_successful_spokes_to_optimizer(monkeypatch):
+    calls = []
+    added_edges = []
+    original_add_edge = SlidingWindowOptimizer.add_edge
+
+    def recording_add_edge(self, i, j, *args, **kwargs):
+        added_edges.append((i, j))
+        return original_add_edge(self, i, j, *args, **kwargs)
+
+    monkeypatch.setattr(SlidingWindowOptimizer, "add_edge", recording_add_edge)
+
+    def match_fn(a, b):
+        calls.append((a, b))
+        return {"ok": True, "R": np.eye(3), "t": np.array([1.0, 0.0, 0.0]),
+                "inlier_ratio": 1.0, "n_matches": 100}
+
+    params = {"kf_max_gap": 4, "kf_local_map_k": 2, "max_keyframes": 12,
+              "loop_enable": False, "global_opt_on_loop": False,
+              "nl_reg": False}
+    graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
+    for frame in range(13):
+        graph.add_frame(frame)
+
+    assert graph.keyframes == [0, 4, 8, 12]
+    assert (4, 10) in calls and (8, 10) in calls
+    assert (4, 10) in added_edges and (8, 10) in added_edges
 
 
 def test_rotation_cycle_gate_rejects_inconsistent_loop():

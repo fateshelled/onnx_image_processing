@@ -436,6 +436,7 @@ def _eval_online_kf_prior(c, params, cam, match_frames, raw_match_frames=None,
     # always 0 for it; the real abstain breakdown is in ``verifier_abstain*``.
     result = {"ATE_median": ate, "ATE_rmse": ate_rmse, "ATE_p90": ate_p90,
               "ATE_max": ate_max, "n_loop": graph.n_loop, "n_kf": graph.n_kf,
+              "n_dropped_held": getattr(graph, "n_dropped_held", 0),
               "n_cycle_reject": graph.n_cycle_rejected,
               "n_verifier_rejected": graph.n_verifier_rejected,
               "n_verifier_abstained": graph.n_verifier_abstained,
