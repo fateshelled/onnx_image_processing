@@ -316,14 +316,12 @@ class SlidingWindowOptimizer:
 
     def _residuals(self) -> np.ndarray:
         """Scaled residual vector; edge rows then scale-prior rows."""
-        if not self.edges:
-            return np.zeros(0)
         out = [
             self._apply_weight(
                 k, _edge_residual(self.T[i], self.T[j], self._scaled_M(k)))
             for k, (i, j, M, st, sr) in enumerate(self.edges)
         ]
-        r = np.concatenate(out)
+        r = np.concatenate(out) if out else np.zeros(0)
         if self._n_prior():
             pri = [
                 np.array([(np.log(max(self.edge_scale[e], 1e-12))
@@ -367,8 +365,6 @@ class SlidingWindowOptimizer:
         return block / self._edge_scale(st, sr)[:, None]
 
     def _huber_weights(self) -> np.ndarray:
-        if not self.edges:
-            return np.zeros(0)
         w = np.ones(6 * len(self.edges))
         robust_weights = []
         robust_rot_weights = []
@@ -522,7 +518,6 @@ class SlidingWindowOptimizer:
         """
         i, j, M, st, sr = self.edges[k]
         Ms = self._scaled_M(k)
-        sc = self._edge_scale(st, sr)
         e = _edge_residual(self.T[i], self.T[j], Ms)
         P = np.linalg.inv(self.T[j]) @ self.T[i]
         A = np.linalg.inv(Ms) @ P
@@ -532,7 +527,7 @@ class SlidingWindowOptimizer:
         w = 0.5 * np.array([G[2, 1] - G[1, 2], G[0, 2] - G[2, 0], G[1, 0] - G[0, 1]])
         v = G[:3, 3]
         twist = np.concatenate([w, v])
-        return (se3_right_jacobian_inv(e) @ twist) / sc
+        return self._apply_weight(k, se3_right_jacobian_inv(e) @ twist)
 
     def _jacobian_coo(self, eps=1e-6):
         """Sparse Jacobian as COO triplets ``(rows, cols, vals, shape)``.
@@ -904,6 +899,19 @@ class SlidingWindowOptimizer:
 
     # -- solver ---------------------------------------------------------------
 
+    def _capture_scales(self):
+        return list(self.edge_scale)
+
+    def _restore_scales(self, state):
+        self.edge_scale = state
+
+    def _apply_scale_step(self, dx):
+        for e, c in enumerate(self.scale_col):
+            if c is not None:
+                self.edge_scale[e] = max(
+                    self.edge_scale[e] * float(np.exp(np.clip(dx[c], -50, 50))),
+                    1e-9)
+
     def optimize(self, verbose: bool = False) -> float:
         if self.loop_robust == "gnc_gm" and any(self.edge_robust):
             cost = self.last_cost
@@ -917,7 +925,7 @@ class SlidingWindowOptimizer:
     def _optimize_once(self, verbose: bool = False) -> float:
         live = list(self.pose_ids)
         free = [nd for nd in live if nd not in self.fixed_ids]
-        if len(live) < 3 or not self.edges or not free:
+        if self._residuals().size == 0 or (not free and not self.n_scale):
             self.last_cost = self._cost()
             self.last_steps = 0
             return self.last_cost
@@ -995,14 +1003,10 @@ class SlidingWindowOptimizer:
                 if float(np.max(np.abs(dx))) < 1e-10:
                     break
                 backup = {n_: self.T[n_].copy() for n_ in live}
-                backup_scale = list(self.edge_scale)
+                backup_scale = self._capture_scales()
                 for k, node in enumerate(free):
                     self.T[node] = backup[node] @ se3_exp(dx[6 * k: 6 * k + 6])
-                for e, c in enumerate(self.scale_col):
-                    if c is not None:
-                        self.edge_scale[e] = max(
-                            backup_scale[e]
-                            * float(np.exp(dx[6 * n_node + c])), 1e-9)
+                self._apply_scale_step(dx[6 * n_node:])
                 cost = self._weighted_cost(w)
                 if cost <= base_cost - 1e-12:
                     lam = max(lam / 3.0, 1e-9)
@@ -1010,7 +1014,7 @@ class SlidingWindowOptimizer:
                     accepted = True
                     break
                 self.T.update(backup)
-                self.edge_scale = backup_scale
+                self._restore_scales(backup_scale)
                 lam *= 10.0
                 if lam > 1e7:
                     break

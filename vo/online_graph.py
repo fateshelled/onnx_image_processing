@@ -117,6 +117,16 @@ class OnlinePoseGraph:
         self.p = params
         self.cam = cam
         self.match = match_fn
+        self._canonical = None
+        self._canonical_failed = False
+        backend = params.get("marginalization_backend", "legacy")
+        if backend != "legacy":
+            from .canonical_graph import CanonicalGraph, MODES
+            if backend not in MODES:
+                raise ValueError(f"unknown marginalization_backend: {backend}")
+            if params.get("scale_kf", False):
+                raise ValueError("canonical backend does not reuse ScaleKF feedback")
+            self._canonical = CanonicalGraph(self, backend)
         self.kf_min_gap = 4
         self.kf_max_gap = int(params.get("kf_max_gap", 16))
         self.max_kf = params.get("max_keyframes")
@@ -193,6 +203,8 @@ class OnlinePoseGraph:
         previous frame; when omitted it is obtained from ``match_fn``. The
         evaluator injects its precomputed odometry this way.
         """
+        if self._canonical_failed:
+            raise RuntimeError("canonical solve failed; recreate graph before continuing")
         idx = int(idx)
         if self._last is None:
             self._T[idx] = np.eye(4)
@@ -253,6 +265,8 @@ class OnlinePoseGraph:
         return self._pose_of(idx)
 
     def pose(self, frame_id=None):
+        if self._canonical_failed:
+            raise RuntimeError("canonical solve failed; no valid output snapshot")
         return self._pose_of(self._last if frame_id is None else frame_id)
 
     # -- internals ----------------------------------------------------------
@@ -276,6 +290,15 @@ class OnlinePoseGraph:
         by a prior are kept (as free nodes) until their Markov blanket is fully
         active, then Schur-marginalized into a multi-node prior and dropped.
         """
+        if self._canonical is not None:
+            try:
+                return self._canonical.close_segment(new_kf)
+            except Exception:
+                # Loop gating also changes counters/history before solving.
+                # This reference backend is fail-stop rather than pretending
+                # that a partially completed segment can safely be retried.
+                self._canonical_failed = True
+                raise
         a = self._kf[-1]
         b = new_kf
         trans = [i for i in self._seg if i != b and i != a]
@@ -589,7 +612,11 @@ class OnlinePoseGraph:
         return verified
 
     def _new_window(self):
-        return SlidingWindowOptimizer(
+        cls = SlidingWindowOptimizer
+        if self._canonical is not None:
+            from .joint_prior import JointWindowOptimizer
+            cls = JointWindowOptimizer
+        return cls(
             max_iterations=self.p.get("loop_iterations", 10),
             huber=1.0,
             step_scale_t=self.p.get("step_scale_t", 0.1),

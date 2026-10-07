@@ -11,6 +11,8 @@ The edge residual is  e = Log(M_ij^{-1} T_j^{-1} T_i).
 """
 
 import numpy as np
+from scipy.spatial.transform import Rotation
+from scipy.special import bernoulli, factorial
 
 
 def skew(v):
@@ -34,21 +36,9 @@ def so3_exp(phi):
 
 def so3_log(R):
     """Returns axis-angle (3,) with angle in [0, pi]."""
-    cos_theta = (np.trace(R) - 1.0) / 2.0
-    cos_theta = min(1.0, max(-1.0, cos_theta))
-    theta = float(np.arccos(cos_theta))
-    if theta < 1e-9:
-        return 0.5 * np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-    if np.pi - theta < 1e-6:
-        # Near pi: use the symmetric part
-        A = (R + np.eye(3)) / 2.0
-        axis = np.sqrt(np.maximum(np.diag(A), 0.0))
-        idx = int(np.argmax(axis))
-        axis = axis[idx] * A[:, idx]
-        n = np.linalg.norm(axis)
-        return (axis / n) * theta if n > 1e-9 else np.zeros(3)
-    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]) / (2.0 * np.sin(theta))
-    return axis * theta
+    # Quaternion-based extraction avoids division by sin(theta) near pi and
+    # preserves the principal-branch axis sign on either side of pi.
+    return Rotation.from_matrix(np.asarray(R, dtype=np.float64)).as_rotvec()
 
 
 def so3_left_jacobian_inv(phi):
@@ -88,17 +78,7 @@ def se3_log(T):
     R = T[:3, :3]
     t = T[:3, 3]
     phi = so3_log(R)
-    theta = float(np.linalg.norm(phi))
-    Kfull = skew(phi)
-    if theta < 1e-9:
-        tau = t.copy()
-    else:
-        V = (
-            np.eye(3)
-            + (1.0 - np.cos(theta)) / (theta ** 2) * Kfull
-            + (theta - np.sin(theta)) / (theta ** 3) * (Kfull @ Kfull)
-        )
-        tau = np.linalg.solve(V, t)
+    tau = so3_left_jacobian_inv(phi) @ t
     out = np.zeros(6)
     out[:3] = phi
     out[3:] = tau
@@ -121,9 +101,7 @@ def se3_ad(T):
     return out
 
 
-_BERNOULLI = [1.0, -0.5, 1.0 / 6.0, 0.0, -1.0 / 30.0, 0.0, 1.0 / 42.0, 0.0,
-              -1.0 / 30.0, 0.0, 5.0 / 66.0, 0.0, -691.0 / 2730.0, 0.0,
-              7.0 / 6.0, 0.0, -3617.0 / 510.0]
+_BERNOULLI_COEFFICIENTS = bernoulli(40) / factorial(np.arange(41))
 
 
 def se3_ad_e(e):
@@ -144,18 +122,16 @@ def se3_left_jacobian_inv(e):
 
     Analytic via the Bernoulli series Sigma B_k/k! ad(e)^k, valid for
     ||omega|| < 2*pi (convergence verified against finite differences;
-    residuals are far below 2 in practice).
+    using 40 terms beyond the constant to retain accuracy near pi).
     """
     e = np.asarray(e, dtype=np.float64).reshape(6)
     A = se3_ad_e(e)
     S = np.zeros((6, 6))
     Ak = np.eye(6)
-    fact = 1.0
-    for k in range(17):
+    for k, coefficient in enumerate(_BERNOULLI_COEFFICIENTS):
         if k > 0:
             Ak = Ak @ A
-            fact *= k
-        S += (_BERNOULLI[k] / fact) * Ak
+        S += coefficient * Ak
     return S
 
 
