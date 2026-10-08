@@ -19,6 +19,10 @@ class JointPrior:
     A: np.ndarray
     r0: np.ndarray
     sources: frozenset
+    # Provenance, not a numerical rank inference at the current estimate.
+    # False is conservative for externally supplied absolute/partial priors.
+    relative_pose: bool = False
+    pose_components: tuple = ()
 
     def __post_init__(self):
         width = sum(6 if kind == "pose" else 1 for kind, _ in self.keys)
@@ -29,6 +33,12 @@ class JointPrior:
             raise ValueError("invalid joint prior dimensions/keys")
         if not np.isfinite(self.A).all() or not np.isfinite(self.r0).all():
             raise ValueError("non-finite joint prior")
+        if self.pose_components:
+            flat = [p for group in self.pose_components for p in group]
+            poses = {k for kind, k in self.keys if kind == "pose"}
+            if (any(not group for group in self.pose_components)
+                    or len(flat) != len(set(flat)) or set(flat) != poses):
+                raise ValueError("invalid pose component provenance")
 
 
 def project_rows(J, r, eliminate_columns, keep_columns, rtol=1e-10):
@@ -57,12 +67,29 @@ def project_rows(J, r, eliminate_columns, keep_columns, rtol=1e-10):
 class JointWindowOptimizer(SlidingWindowOptimizer):
     """Legacy edge model plus priors referencing stable scalar identities."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, pose_gauge_policy="rank", **kwargs):
+        if pose_gauge_policy not in ("rank", "physical"):
+            raise ValueError("pose_gauge_policy must be rank or physical")
+        self.pose_gauge_policy = pose_gauge_policy
         super().__init__(**kwargs)
         self.joint_priors = []
         self.scalar_col = {}
         self.scalar_value = {}
         self.scalar_edge = {}
+        self._regularization_priors = []
+
+    def add_nl_regularization(self, *args, **kwargs):
+        before = len(self.prior_factors)
+        super().add_nl_regularization(*args, **kwargs)
+        self._regularization_priors.extend(self.prior_factors[before:])
+
+    def pop_last_prior_factor(self):
+        if not self.prior_factors:
+            return False
+        removed = self.prior_factors[-1]
+        self._regularization_priors = [p for p in self._regularization_priors
+                                       if p is not removed]
+        return super().pop_last_prior_factor()
 
     def add_scalar(self, key, value=0.0):
         if key in self.scalar_col:
@@ -149,19 +176,63 @@ class JointWindowOptimizer(SlidingWindowOptimizer):
         return (np.asarray(rows, dtype=np.int64),
                 np.asarray(cols, dtype=np.int64), np.asarray(vals), shape)
 
+    def _pose_components(self):
+        """Structural scopes survive row compression of disconnected priors."""
+        adjacency = {p: set() for p in self.pose_ids}
+        absolute = set(self.fixed_ids)
+        groups = [(i, j) for i, j, *_ in self.edges]
+        for f in self.joint_priors:
+            poses = [k for kind, k in f.keys if kind == "pose"]
+            groups.extend(f.pose_components or (poses,))
+            if not f.relative_pose:
+                absolute.update(poses)
+        for factor in self.prior_factors:
+            if any(factor is p for p in self._regularization_priors):
+                continue  # temporary damping is not an absolute observation
+            groups.append(factor[0])
+            absolute.update(factor[0])
+        for group in groups:
+            for p in group:
+                adjacency[p].update(group)
+        remaining = set(adjacency)
+        components = []
+        while remaining:
+            component, stack = set(), [min(remaining)]
+            while stack:
+                p = stack.pop()
+                if p not in component:
+                    component.add(p)
+                    stack.extend(adjacency[p] - component)
+            remaining -= component
+            components.append(component)
+        return components, absolute
+
     def _gauge_anchor_columns(self, free, n_node):
-        # Reference backend: reveal *all* null directions from the weighted
-        # Jacobian. Solve in independent columns (a gauge choice), never inject
-        # that choice into a marginal. This handles mixed and prior-only graphs.
+        # Fix physical pose gauges before resolving other numerical nulls.
+        components, absolute = (self._pose_components() if self.pose_gauge_policy == "physical"
+                                else ([], set()))
+        anchors = set()
+        offsets = {p: 6*i for i, p in enumerate(free)}
+        for component in components:
+            if not component & absolute:
+                start = offsets[min(component)]
+                anchors.update(range(start, start + 6))
+        # Absolute/partially constrained components are handled conservatively
+        # by rank detection; never freeze their whole first pose by assumption.
         J = self._jacobian() * np.sqrt(self._huber_weights())[:, None]
-        norms = np.linalg.norm(J, axis=0)
+        columns = np.array([i for i in range(J.shape[1]) if i not in anchors], dtype=int)
         if not J.size:
             return set(range(J.shape[1]))
-        _, R, piv = sla.qr(J / np.maximum(norms, 1e-15), pivoting=True,
+        if not columns.size:
+            return anchors
+        reduced = J[:, columns]
+        norms = np.linalg.norm(reduced, axis=0)
+        _, R, piv = sla.qr(reduced / np.maximum(norms, 1e-15), pivoting=True,
                            mode="economic")
         d = np.abs(np.diag(R))
         rank = int(np.count_nonzero(d > 1e-10 * d.max())) if d.size else 0
-        return set(int(c) for c in piv[rank:])
+        anchors.update(int(columns[c]) for c in piv[rank:])
+        return anchors
 
     def _capture_scales(self):
         return super()._capture_scales(), dict(self.scalar_value)
@@ -197,4 +268,10 @@ class JointWindowOptimizer(SlidingWindowOptimizer):
                              self._residuals() * weights, ecols, kcols)
         x0 = tuple(self.T[k].copy() if kind == "pose" else self.log_scale(k)
                    for kind, k in keep)
-        return JointPrior(tuple(keep), x0, A, r0, frozenset(sources))
+        relative_pose = (not self.fixed_ids and not self.prior_factors
+                         and all(f.relative_pose or not any(kind == "pose" for kind, _ in f.keys)
+                                 for f in self.joint_priors))
+        kept_poses = {k for kind, k in keep if kind == "pose"}
+        components, _ = self._pose_components()
+        scopes = tuple(tuple(sorted(c & kept_poses)) for c in components if c & kept_poses)
+        return JointPrior(tuple(keep), x0, A, r0, frozenset(sources), relative_pose, scopes)

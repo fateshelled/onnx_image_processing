@@ -1,4 +1,4 @@
-"""Online keyframe pose graph with a fixed-lag window and NL-Reg.
+"""Online keyframe pose graph with canonical marginalization and joint ridge.
 
 This module owns **all** the pose-graph logic so the offline evaluator
 (``eval/rustuna_tune_loop.py``) and the streaming sample
@@ -10,7 +10,7 @@ This module owns **all** the pose-graph logic so the offline evaluator
 * deferred (option 1) marginalization of exited keyframes into multi-node
   priors;
 * loop closure with the temporal-consistency gate and cycle handling;
-* direction-dependent Tikhonov regularization (NL-Reg).
+* joint relative-pose/log-scale ridge regularization (legacy NL-Reg is optional).
 
 The graph is matcher-agnostic and **index-based**: the caller passes
 ``match_fn(i, j) -> dict`` where the dict has keys ``ok`` (bool), ``R``
@@ -35,11 +35,14 @@ from .loop_closure import confirmed_loop_hits, edge_key
 from .scale_kf import ScaleKF
 from .se3_window import SlidingWindowOptimizer
 
-# Default parameters for the online sequential graph. Adopted from the
+# Observation/keyframe parameters for the online sequential graph come from the
 # 200-trial optuna study "online_bounded_kf" (best trial 174, mean+worst
 # ATE 0.5245 on desk/desk2/room; a near-tie with trials 119/121/122 at
 # 0.5247). Some values sit on the search-grid boundary (kf_max_gap=8,
-# max_keyframes=12) and may improve further with a wider grid.
+# max_keyframes=12) and may improve further with a wider grid. The solver now
+# uses canonical marginalization and relative joint ridge (alpha=10, sigma=1),
+# selected by three-sequence short/long comparisons; 40 iterations match those
+# comparisons. Regularization is solver-only, never marginalized as observations.
 DEFAULT_PARAMS = {
     "odom_ref": "kf", "kf_mode": "motion", "keyframe_decim": 15,
     "kf_trans_thresh": 4.0, "kf_rot_thresh": 30.0, "kf_max_gap": 8,
@@ -58,11 +61,15 @@ DEFAULT_PARAMS = {
     # values reject loop measurements whose rotation disagrees with the
     # independently accumulated odometry chain by more than this many degrees.
     "cycle_threshold_deg": 0.0,
-    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 10,
+    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 40,
     "tsvd_ratio": 0.0, "scale_kf": False,
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
     "graph_mode": "kf_prior", "max_keyframes": 12, "seq_tsvd_ratio": 0.0,
-    "nl_reg": True, "nl_reg_c": 10.0, "nl_reg_tau": 30.0, "nl_reg_length": 0.5,
+    "nl_reg": False, "nl_reg_c": 10.0, "nl_reg_tau": 30.0, "nl_reg_length": 0.5,
+    "marginalization_backend": "canonical_marginal",
+    "canonical_regularization": "relative_joint_ridge",
+    "relative_reg_alpha": 10.0, "relative_reg_tau": 1.0,
+    "relative_sigma_r": 1.0, "relative_sigma_t": 1.0, "relative_sigma_l": 1.0,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
@@ -106,11 +113,11 @@ class OnlinePoseGraph:
     """Online sequential pose graph.
 
     Parameters are read from a plain dict (defaults come from
-    ``DEFAULT_PARAMS``). The graph keeps at most ``max_keyframes`` active
-    keyframes; transient frames are marginalized into relative priors when a
-    new keyframe is promoted, and exited keyframes are deferred (option 1)
-    until their Markov blanket is active, then marginalized into multi-node
-    priors.
+    ``DEFAULT_PARAMS``). The canonical default keeps all historical keyframes
+    in its dense solves; ``max_keyframes``/``held_cap`` only bound the legacy
+    backend. Transient frames are marginalized into relative priors when a
+    new keyframe is promoted. The legacy backend defers exited keyframes
+    (option 1) until their Markov blanket is active.
     """
 
     def __init__(self, params, cam, match_fn):
@@ -613,10 +620,30 @@ class OnlinePoseGraph:
 
     def _new_window(self):
         cls = SlidingWindowOptimizer
+        options = {}
+        regularization = self.p.get("canonical_regularization", "legacy")
+        if regularization not in ("legacy", "relative_joint_soft", "relative_joint_ridge", "relative_joint_none"):
+            raise ValueError("unknown canonical_regularization")
+        if regularization != "legacy":
+            if self._canonical is None or self.p.get("nl_reg", True):
+                raise ValueError("relative regularization requires canonical backend and nl_reg=false")
+            if self.p.get("seq_tsvd_ratio", 0.) or self.p.get("tsvd_ratio", 0.):
+                raise ValueError("relative regularization requires TSVD off")
         if self._canonical is not None:
             from .joint_prior import JointWindowOptimizer
             cls = JointWindowOptimizer
+            options["pose_gauge_policy"] = self.p.get("canonical_pose_gauge", "rank")
+            if regularization != "legacy":
+                from .relative_joint import RelativeJointWindowOptimizer
+                cls = RelativeJointWindowOptimizer
+                options.update(regularization=regularization.removeprefix("relative_joint_"),
+                               alpha=self.p.get("relative_reg_alpha", 1.),
+                               tau=self.p.get("relative_reg_tau", 1.),
+                               sigma_r=self.p.get("relative_sigma_r", 1.),
+                               sigma_t=self.p.get("relative_sigma_t", 1.),
+                               sigma_l=self.p.get("relative_sigma_l", 1.))
         return cls(
+            **options,
             max_iterations=self.p.get("loop_iterations", 10),
             huber=1.0,
             step_scale_t=self.p.get("step_scale_t", 0.1),

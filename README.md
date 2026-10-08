@@ -136,6 +136,11 @@ python sample/image_matching.py --model shi_tomasi_sparse_bad_sinkhorn.onnx --in
 
 Estimate camera trajectory from video or image sequence using the ONNX feature matching model.
 
+The online sample defaults to canonical marginalization with joint relative
+pose/log-scale ridge regularization (`alpha=10`, sigma parameters=1, 40 solver
+iterations). See [relative joint regularization](docs/relative_joint_regularization.md)
+for configuration, evaluation trade-offs, and the legacy/NL-Reg override.
+
 ### 1. Export ONNX model
 
 ```bash

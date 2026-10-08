@@ -153,7 +153,7 @@ def load_cache(cache_dir, seq):
             "stride": int(z["stride"]), "n_frames": int(z["n_frames"])}
 
 
-# Default parameters for the sequential fixed-lag graph (seq_opt1 + NL-Reg),
+# Default parameters for the sequential graph (canonical marginal + joint ridge),
 # shared with the online graph module. Callers that need the batch graph must
 # pass graph_mode="stride" explicitly.
 from vo.online_graph import DEFAULT_PARAMS as _SEQ_DEFAULTS  # noqa: E402
@@ -478,9 +478,24 @@ def _eval_online_kf_prior(c, params, cam, match_frames, raw_match_frames=None,
 # --------------------------------------------------------------------------
 # Evaluator (mirrors run_vo's loop-closure block)
 # --------------------------------------------------------------------------
+def effective_eval_params(params):
+    """Freeze every inherited setting before evaluating or saving a trial."""
+    return {**SEQ_OPT1_DEFAULTS, **params}
+
+
+def evaluation_settings_key(arguments, defaults=None):
+    """Separate persisted studies when CLI conditions or inherited defaults differ."""
+    fixed_settings = {key: value for key, value in arguments.items()
+                      if key not in {"n_trials", "out", "storage", "study_name",
+                                     "report_only", "build_cache"}}
+    fixed_settings["evaluation_defaults"] = (SEQ_OPT1_DEFAULTS if defaults is None else defaults)
+    return hashlib.sha256(json.dumps(
+        fixed_settings, sort_keys=True, allow_nan=False).encode()).hexdigest()[:12]
+
+
 def eval_seq(c, params, cam, desc_matcher, match_cache=None, diag=None,
              on_frame=None):
-    params = {**SEQ_OPT1_DEFAULTS, **params}
+    params = effective_eval_params(params)
     stride = c["stride"]
     pa = SimpleNamespace(**vars(DEFAULT_ARGS))
     pa.kf_mode = params["kf_mode"]
@@ -877,11 +892,7 @@ def run_study(args):
         sampler = rustuna.samplers.TPESampler(seed=args.seed)
     # Objective values from different fixed evaluation conditions are
     # incomparable.  Keep them in separate studies even when storage is reused.
-    fixed_settings = {key: value for key, value in vars(args).items()
-                      if key not in {"n_trials", "out", "storage", "study_name",
-                                     "report_only", "build_cache"}}
-    settings_key = hashlib.sha256(json.dumps(
-        fixed_settings, sort_keys=True, allow_nan=False).encode()).hexdigest()[:12]
+    settings_key = evaluation_settings_key(vars(args))
     direction_tag = ("off" if args.fix_loop_verifier_angle is None
                      else str(args.fix_loop_verifier_angle))
     study_name = (f"{args.study_name}_{'_'.join(seqs)}_{args.objective}"
@@ -960,6 +971,7 @@ def run_study(args):
             "cycle_threshold_deg": 0.0,
             "loop_verifier_max_translation_angle_deg": args.fix_loop_verifier_angle,
         }
+        params = effective_eval_params(params)
         per = {s: eval_seq(caches[s], params, cams[s], desc_matcher,
                            match_caches[s]) for s in seqs}
         vals = [per[s]["ATE_median"] for s in seqs]
