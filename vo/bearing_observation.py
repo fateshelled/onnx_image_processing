@@ -11,6 +11,7 @@ class BearingObservation:
     sigma_r: float = .1
     sigma_d: float = .4
     q_direction: float = 1.
+    sigma_radial: float | None = None
 
     def __post_init__(self):
         R=np.array(self.rotation,dtype=float,copy=True)
@@ -21,15 +22,20 @@ class BearingObservation:
             raise ValueError('signed direction must be finite and nonzero')
         if not np.isfinite([self.sigma_r,self.sigma_d,self.q_direction]).all() or self.sigma_r<=0 or self.sigma_d<=0 or not 0<=self.q_direction<=1:
             raise ValueError('invalid observation scale/confidence')
+        if self.sigma_radial is not None and (not np.isfinite(self.sigma_radial) or self.sigma_radial<=0):
+            raise ValueError('invalid radial scale')
         u/=np.linalg.norm(u);R.flags.writeable=False;u.flags.writeable=False
         object.__setattr__(self,'rotation',R);object.__setattr__(self,'direction',u)
 
-    def linearize(self,Ti,Tj):
+    def _geometry(self,Ti,Tj):
         Q=Tj[:3,:3].T@Ti[:3,:3]
         v=Tj[:3,:3].T@(Ti[:3,3]-Tj[:3,3]);length=float(np.linalg.norm(v))
         if length==0 or not np.isfinite(length):
             raise ValueError('bearing undefined at zero/nonfinite baseline')
-        n=v/length;e=so3_log(self.rotation.T@Q)
+        return Q,v,length,v/length
+
+    def linearize(self,Ti,Tj):
+        Q,v,length,n=self._geometry(Ti,Tj);e=so3_log(self.rotation.T@Q)
         # Jr^-1(e)=Jl^-1(-e), matching right SE3 increments.
         Jr=so3_left_jacobian_inv(-e)/self.sigma_r
         G=(np.eye(3)-np.outer(n,n))/length/self.sigma_d
@@ -40,6 +46,24 @@ class BearingObservation:
         if not np.isfinite(r).all() or not np.isfinite(a).all() or not np.isfinite(b).all():
             raise ValueError('nonfinite bearing factor')
         return r,a,b
+
+    def linearize_radial(self,Ti,Tj,log_scale):
+        """Baseline-length residual coupling |v| to exp(log_scale).
+
+        The scale state is a log-scale (additive increments), so the residual
+        derivative w.r.t. the variable is -exp(log_scale)/sigma_radial.
+        """
+        if self.sigma_radial is None:
+            raise ValueError('radial residual requires sigma_radial')
+        Q,v,length,n=self._geometry(Ti,Tj)
+        s=float(np.exp(float(log_scale)))
+        G=n/self.sigma_radial
+        a=np.zeros((1,6));b=np.zeros((1,6))
+        a[0,3:]=G@Q;b[0,:3]=G@skew(v);b[0,3:]=-G
+        r=np.array([(length-s)/self.sigma_radial]);d_scale=np.array([-s/self.sigma_radial])
+        if not np.isfinite(r).all() or not np.isfinite(a).all() or not np.isfinite(b).all() or not np.isfinite(d_scale).all():
+            raise ValueError('nonfinite bearing radial factor')
+        return r,a,b,d_scale
 
     def cost_weights(self,r):
         norms2=np.sum(np.asarray(r).reshape(2,3)**2,axis=1)

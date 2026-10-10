@@ -38,3 +38,32 @@ def test_confidence_block_separation_sign_and_domain():
     np.testing.assert_array_equal(w0[:3],w1[:3]);assert np.all(w0[3:]==0) and c0<c1
     for q in (0,1):
         with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0],q_direction=q).linearize(a,a)
+
+
+def _step(c,sign):
+    dx=np.zeros(6);dx[c]=sign*1e-6;return se3_exp(dx)
+
+
+def test_radial_residual_sign_sigma_and_jacobian():
+    a=se3_exp(np.array([.1,.2,-.1,.2,-.3,.1]))
+    b=se3_exp(np.array([-.2,.05,.1,1.,.3,-.2]))
+    v=b[:3,:3].T@(a[:3,3]-b[:3,3]);length=float(np.linalg.norm(v))
+    obs=BearingObservation(np.eye(3),[.1,.2,1.],sigma_radial=.3)
+    r,ja,jb,ds=obs.linearize_radial(a,b,np.log(length))
+    np.testing.assert_allclose(r,0.,atol=1e-12)
+    j=np.hstack((ja,jb,ds.reshape(-1,1)))
+    num=np.empty_like(j)
+    for c in range(13):
+        values=[]
+        for sign in (1,-1):
+            x,y=a.copy(),b.copy();dlog=0.
+            if c<6:x=x@_step(c,sign)
+            elif c<12:y=y@_step(c-6,sign)
+            else:dlog=sign*1e-6
+            values.append(obs.linearize_radial(x,y,np.log(length)+dlog)[0])
+        num[:,c]=(values[0]-values[1])/2e-6
+    np.testing.assert_allclose(j,num,rtol=1e-6,atol=1e-7)
+    short=obs.linearize_radial(a,b,np.log(length*.5))[0]
+    assert short[0]>0  # estimated baseline below prediction -> positive residual
+    with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0]).linearize_radial(a,b,0.)
+    with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0],sigma_radial=-1.)

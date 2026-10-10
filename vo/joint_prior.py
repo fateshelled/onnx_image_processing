@@ -77,6 +77,9 @@ class JointWindowOptimizer(SlidingWindowOptimizer):
         self.scalar_value = {}
         self.scalar_edge = {}
         self._regularization_priors = []
+        # Scale keys whose regularization term is suppressed (their information
+        # comes from an explicit prior instead, e.g. bearing loop scales).
+        self.scale_regularizer_exclude = set()
 
     def add_nl_regularization(self, *args, **kwargs):
         before = len(self.prior_factors)

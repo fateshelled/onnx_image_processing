@@ -181,6 +181,15 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
             B = np.sqrt(self.alpha)*np.eye(len(D))
         else:
             B = np.zeros((0, len(D)))
+        if self.scale_regularizer_exclude and B.shape[0] == len(D):
+            mask = np.concatenate([
+                np.ones(6) if k[0] == "pose"
+                else np.array([0. if k[1] in self.scale_regularizer_exclude else 1.])
+                for k in keys])
+            # Zero only the excluded columns: eta of an excluded scale no longer
+            # enters any regularizer row, and its regularizer Jacobian column
+            # vanishes, while included keys keep their exact regularization.
+            B = B @ np.diag(mask)
 
         def regularizer(jacobian=False):
             eta, blocks = [], []

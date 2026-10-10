@@ -75,6 +75,14 @@ DEFAULT_PARAMS = {
     # factor (no distance variable) via BearingJointWindowOptimizer. Bearing
     # loops require the relative canonical solver (nl_reg=false, TSVD off).
     "loop_observation_model": "se3",
+    # Bearing loop variant. When bearing_radial is on, each bearing loop gains a
+    # per-loop log-scale variable weakly constrained by a zero-mean log prior, so
+    # the otherwise unobserved baseline length is softly pinned (see
+    # notes/20261010-bearing-radial-constraint-design.md). None uses the
+    # optimizer defaults (loop_dir_sigma, step_scale_t, scale_prior_sigma).
+    "bearing_radial": False,
+    "bearing_sigma_d": None, "bearing_sigma_radial": None,
+    "bearing_scale_prior_sigma": None, "bearing_scale_prior_mean": 0.0,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
@@ -655,6 +663,12 @@ class OnlinePoseGraph:
                 if loop_model == "bearing":
                     from .bearing_joint import BearingJointWindowOptimizer
                     cls = BearingJointWindowOptimizer
+                    options.update(
+                        bearing_radial=self.p.get("bearing_radial", False),
+                        bearing_sigma_d=self.p.get("bearing_sigma_d"),
+                        bearing_sigma_radial=self.p.get("bearing_sigma_radial"),
+                        bearing_scale_prior_sigma=self.p.get("bearing_scale_prior_sigma"),
+                        bearing_scale_prior_mean=self.p.get("bearing_scale_prior_mean", 0.0))
         return cls(
             **options,
             max_iterations=self.p.get("loop_iterations", 10),

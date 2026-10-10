@@ -257,6 +257,14 @@ def test_loop_observation_model_selects_window_class():
         {**base, "loop_observation_model": "bearing"},
         cam=None, match_fn=None)._new_window()
     assert type(bearing) is BearingJointWindowOptimizer
+    assert bearing.bearing_radial is False
+    radial = OnlinePoseGraph(
+        {**base, "loop_observation_model": "bearing", "bearing_radial": True,
+         "bearing_sigma_radial": 0.3, "bearing_scale_prior_sigma": 0.6},
+        cam=None, match_fn=None)._new_window()
+    assert radial.bearing_radial is True
+    assert radial.bearing_sigma_radial == 0.3
+    assert radial.bearing_scale_prior_sigma == 0.6
     with pytest.raises(ValueError):
         OnlinePoseGraph({**base, "loop_observation_model": "nope"},
                         cam=None, match_fn=None)._new_window()
