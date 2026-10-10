@@ -49,3 +49,25 @@ def test_rpe_returns_nan_for_unreachable_length():
     metrics = relative_pose_errors(gt.copy(), gt, lengths_m=(1.0, 5.0))
     assert np.isfinite(metrics["RPE_trans_1m_median"])
     assert np.isnan(metrics["RPE_trans_5m_median"])
+    assert np.isnan(metrics["RPE_trans_5m_max"])
+    assert np.isnan(metrics["RPE_rot_5m_max_deg"])
+    assert metrics["RPE_5m_count"] == 0
+
+
+def test_rpe_tail_detects_an_isolated_orientation_error_with_exact_positions():
+    gt = _straight_trajectory(6, step=1.)
+    est = gt.copy()
+    est[2, :3, :3] = cv2.Rodrigues(np.array([0., 0., np.pi/2]))[0]
+    metrics = relative_pose_errors(est, gt, lengths_m=(1.,))
+    # Five pairs. Translation is wrong only for the outgoing pair at pose 2;
+    # rotation is wrong for both its incoming and outgoing pair. ATE positions
+    # remain exact, and both RPE medians hide the isolated orientation error.
+    assert metrics["RPE_1m_count"] == 5
+    assert metrics["RPE_trans_1m_median"] == pytest.approx(0., abs=1e-9)
+    assert metrics["RPE_trans_1m_max"] == pytest.approx(np.sqrt(2.))
+    assert metrics["RPE_trans_1m_rmse"] == pytest.approx(np.sqrt(2./5))
+    assert metrics["RPE_trans_1m_p90"] == pytest.approx(.6*np.sqrt(2.))
+    assert metrics["RPE_rot_1m_median_deg"] == pytest.approx(0.)
+    assert metrics["RPE_rot_1m_max_deg"] == pytest.approx(90.)
+    assert metrics["RPE_rot_1m_p90_deg"] == pytest.approx(90.)
+    assert metrics["RPE_rot_1m_rmse_deg"] == pytest.approx(90.*np.sqrt(2./5))

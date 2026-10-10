@@ -251,11 +251,23 @@ def relative_pose_errors(est_poses, gt_poses,
             metrics[f"RPE_trans_{tag}_drift_pct"] = float(
                 100.0 * np.median(trans) / length)
             metrics[f"RPE_rot_{tag}_median_deg"] = float(np.median(rot))
+            metrics[f"RPE_trans_{tag}_p90"] = float(np.percentile(trans, 90.))
+            metrics[f"RPE_trans_{tag}_max"] = float(np.max(trans))
+            metrics[f"RPE_rot_{tag}_p90_deg"] = float(np.percentile(rot, 90.))
+            metrics[f"RPE_rot_{tag}_max_deg"] = float(np.max(rot))
+            metrics[f"RPE_rot_{tag}_rmse_deg"] = float(np.sqrt(np.mean(np.square(rot))))
+            metrics[f"RPE_{tag}_count"] = len(trans)
         else:
             metrics[f"RPE_trans_{tag}_median"] = float("nan")
             metrics[f"RPE_trans_{tag}_rmse"] = float("nan")
             metrics[f"RPE_trans_{tag}_drift_pct"] = float("nan")
             metrics[f"RPE_rot_{tag}_median_deg"] = float("nan")
+            metrics[f"RPE_trans_{tag}_p90"] = float("nan")
+            metrics[f"RPE_trans_{tag}_max"] = float("nan")
+            metrics[f"RPE_rot_{tag}_p90_deg"] = float("nan")
+            metrics[f"RPE_rot_{tag}_max_deg"] = float("nan")
+            metrics[f"RPE_rot_{tag}_rmse_deg"] = float("nan")
+            metrics[f"RPE_{tag}_count"] = 0
     return metrics
 
 

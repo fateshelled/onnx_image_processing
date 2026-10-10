@@ -245,6 +245,28 @@ def test_loop_mad_history_is_bounded_and_unique():
     assert len(graph._hist_rot) == len(graph._hist_dir) == 3
 
 
+def test_loop_observation_model_selects_window_class():
+    from vo.bearing_joint import BearingJointWindowOptimizer
+    from vo.relative_joint import RelativeJointWindowOptimizer
+    base = {"marginalization_backend": "canonical_marginal",
+            "canonical_regularization": "relative_joint_ridge",
+            "nl_reg": False, "seq_tsvd_ratio": 0.0, "loop_robust": "none"}
+    default = OnlinePoseGraph(dict(base), cam=None, match_fn=None)._new_window()
+    assert type(default) is RelativeJointWindowOptimizer
+    bearing = OnlinePoseGraph(
+        {**base, "loop_observation_model": "bearing"},
+        cam=None, match_fn=None)._new_window()
+    assert type(bearing) is BearingJointWindowOptimizer
+    with pytest.raises(ValueError):
+        OnlinePoseGraph({**base, "loop_observation_model": "nope"},
+                        cam=None, match_fn=None)._new_window()
+    with pytest.raises(ValueError):
+        OnlinePoseGraph({"marginalization_backend": "legacy",
+                         "canonical_regularization": "legacy",
+                         "loop_observation_model": "bearing"},
+                        cam=None, match_fn=None)._new_window()
+
+
 def test_loop_verifier_hook_counts_rejects_and_abstains():
     graph = OnlinePoseGraph({}, cam=None, match_fn=lambda _a, _b: None)
     verdicts = {0: False, 10: None, 20: True}

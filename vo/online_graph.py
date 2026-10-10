@@ -70,6 +70,11 @@ DEFAULT_PARAMS = {
     "canonical_regularization": "relative_joint_ridge",
     "relative_reg_alpha": 10.0, "relative_reg_tau": 1.0,
     "relative_sigma_r": 1.0, "relative_sigma_t": 1.0, "relative_sigma_l": 1.0,
+    # Loop observation model. "se3" is the canonical SE(3) relative-pose
+    # residual; "bearing" replaces loop edges with the SO3/direction separated
+    # factor (no distance variable) via BearingJointWindowOptimizer. Bearing
+    # loops require the relative canonical solver (nl_reg=false, TSVD off).
+    "loop_observation_model": "se3",
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
@@ -624,11 +629,16 @@ class OnlinePoseGraph:
         regularization = self.p.get("canonical_regularization", "legacy")
         if regularization not in ("legacy", "relative_joint_soft", "relative_joint_ridge", "relative_joint_none"):
             raise ValueError("unknown canonical_regularization")
+        loop_model = self.p.get("loop_observation_model", "se3")
+        if loop_model not in ("se3", "bearing"):
+            raise ValueError("unknown loop_observation_model")
         if regularization != "legacy":
             if self._canonical is None or self.p.get("nl_reg", True):
                 raise ValueError("relative regularization requires canonical backend and nl_reg=false")
             if self.p.get("seq_tsvd_ratio", 0.) or self.p.get("tsvd_ratio", 0.):
                 raise ValueError("relative regularization requires TSVD off")
+        elif loop_model == "bearing":
+            raise ValueError("bearing loop observations require relative canonical regularization")
         if self._canonical is not None:
             from .joint_prior import JointWindowOptimizer
             cls = JointWindowOptimizer
@@ -642,6 +652,9 @@ class OnlinePoseGraph:
                                sigma_r=self.p.get("relative_sigma_r", 1.),
                                sigma_t=self.p.get("relative_sigma_t", 1.),
                                sigma_l=self.p.get("relative_sigma_l", 1.))
+                if loop_model == "bearing":
+                    from .bearing_joint import BearingJointWindowOptimizer
+                    cls = BearingJointWindowOptimizer
         return cls(
             **options,
             max_iterations=self.p.get("loop_iterations", 10),
