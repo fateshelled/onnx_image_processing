@@ -83,6 +83,9 @@ DEFAULT_PARAMS = {
     "bearing_radial": False,
     "bearing_sigma_d": None, "bearing_sigma_radial": None,
     "bearing_scale_prior_sigma": None, "bearing_scale_prior_mean": 0.0,
+    # Per-block robust kernel: rotation stays GM; the direction block can use a
+    # non-saturating kernel ("gm" default, or "huber"/"quadratic").
+    "bearing_dir_kernel": "gm", "bearing_dir_delta": 1.0,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
@@ -668,7 +671,9 @@ class OnlinePoseGraph:
                         bearing_sigma_d=self.p.get("bearing_sigma_d"),
                         bearing_sigma_radial=self.p.get("bearing_sigma_radial"),
                         bearing_scale_prior_sigma=self.p.get("bearing_scale_prior_sigma"),
-                        bearing_scale_prior_mean=self.p.get("bearing_scale_prior_mean", 0.0))
+                        bearing_scale_prior_mean=self.p.get("bearing_scale_prior_mean", 0.0),
+                        bearing_dir_kernel=self.p.get("bearing_dir_kernel", "gm"),
+                        bearing_dir_delta=self.p.get("bearing_dir_delta", 1.0))
         return cls(
             **options,
             max_iterations=self.p.get("loop_iterations", 10),

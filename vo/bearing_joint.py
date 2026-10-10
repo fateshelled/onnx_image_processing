@@ -7,7 +7,8 @@ from .relative_joint import RelativeJointWindowOptimizer
 class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
     def __init__(self, bearing_radial=False, bearing_sigma_d=None,
                  bearing_sigma_radial=None, bearing_scale_prior_sigma=None,
-                 bearing_scale_prior_mean=0.0, **kwargs):
+                 bearing_scale_prior_mean=0.0, bearing_dir_kernel="gm",
+                 bearing_dir_delta=1.0, **kwargs):
         super().__init__(**kwargs)
         self.bearing_loops = {}
         self.bearing_radial = bool(bearing_radial)
@@ -19,8 +20,12 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
                                           if bearing_scale_prior_sigma is None
                                           else float(bearing_scale_prior_sigma))
         self.bearing_scale_prior_mean = float(bearing_scale_prior_mean)
+        self.bearing_dir_kernel = str(bearing_dir_kernel)
+        self.bearing_dir_delta = float(bearing_dir_delta)
         if self.bearing_sigma_d <= 0:
             raise ValueError('bearing direction sigma must be positive')
+        if self.bearing_dir_kernel not in ("gm","huber","quadratic"):
+            raise ValueError('unknown bearing direction kernel')
         if self.bearing_radial and (self.bearing_sigma_radial <= 0
                                     or self.bearing_scale_prior_sigma <= 0):
             raise ValueError('bearing radial/scale-prior sigma must be positive')
@@ -37,6 +42,8 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
         result.bearing_sigma_radial=optimizer.step_scale_t
         result.bearing_scale_prior_sigma=optimizer.scale_prior_sigma
         result.bearing_scale_prior_mean=0.0
+        result.bearing_dir_kernel="gm"
+        result.bearing_dir_delta=1.0
         result.scale_regularizer_exclude=set()
         return result
 
@@ -56,7 +63,9 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
         radial_sigma=self.bearing_sigma_radial if self.bearing_radial else None
         self.bearing_loops[key]=(i,j,BearingObservation(M[:3,:3],M[:3,3],
             sigma_r=self.step_scale_r if sigma is None else sigma,
-            sigma_d=self.bearing_sigma_d,q_direction=1.,sigma_radial=radial_sigma),key)
+            sigma_d=self.bearing_sigma_d,q_direction=1.,sigma_radial=radial_sigma,
+            direction_kernel=self.bearing_dir_kernel,
+            direction_delta=self.bearing_dir_delta),key)
         if self.bearing_radial:
             self.add_scalar(key,np.log(scale))
             self.scale_regularizer_exclude.add(key)

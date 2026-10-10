@@ -265,6 +265,12 @@ def test_loop_observation_model_selects_window_class():
     assert radial.bearing_radial is True
     assert radial.bearing_sigma_radial == 0.3
     assert radial.bearing_scale_prior_sigma == 0.6
+    assert bearing.bearing_dir_kernel == "gm"
+    huber = OnlinePoseGraph(
+        {**base, "loop_observation_model": "bearing",
+         "bearing_dir_kernel": "huber", "bearing_dir_delta": 0.5},
+        cam=None, match_fn=None)._new_window()
+    assert huber.bearing_dir_kernel == "huber" and huber.bearing_dir_delta == 0.5
     with pytest.raises(ValueError):
         OnlinePoseGraph({**base, "loop_observation_model": "nope"},
                         cam=None, match_fn=None)._new_window()

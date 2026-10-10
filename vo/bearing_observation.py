@@ -12,6 +12,8 @@ class BearingObservation:
     sigma_d: float = .4
     q_direction: float = 1.
     sigma_radial: float | None = None
+    direction_kernel: str = "gm"
+    direction_delta: float = 1.
 
     def __post_init__(self):
         R=np.array(self.rotation,dtype=float,copy=True)
@@ -24,6 +26,10 @@ class BearingObservation:
             raise ValueError('invalid observation scale/confidence')
         if self.sigma_radial is not None and (not np.isfinite(self.sigma_radial) or self.sigma_radial<=0):
             raise ValueError('invalid radial scale')
+        if self.direction_kernel not in ("gm","huber","quadratic"):
+            raise ValueError('unknown direction kernel')
+        if self.direction_kernel=="huber" and (not np.isfinite(self.direction_delta) or self.direction_delta<=0):
+            raise ValueError('invalid direction huber delta')
         u/=np.linalg.norm(u);R.flags.writeable=False;u.flags.writeable=False
         object.__setattr__(self,'rotation',R);object.__setattr__(self,'direction',u)
 
@@ -65,8 +71,24 @@ class BearingObservation:
             raise ValueError('nonfinite bearing radial factor')
         return r,a,b,d_scale
 
+    def _block_cost_weight(self,norm2,kernel,q):
+        if kernel=="gm":
+            return q*norm2/(np.sqrt(1.+norm2)+1.), q/np.sqrt(1.+norm2)
+        if kernel=="quadratic":
+            return .5*q*norm2, q
+        if kernel=="huber":
+            norm=np.sqrt(norm2)
+            if norm<=self.direction_delta:
+                return .5*q*norm2, q
+            return q*(self.direction_delta*norm-.5*self.direction_delta**2), q*self.direction_delta/norm
+        raise ValueError('unknown kernel')
+
     def cost_weights(self,r):
         norms2=np.sum(np.asarray(r).reshape(2,3)**2,axis=1)
-        q=np.array([1.,self.q_direction])
-        cost=float(np.sum(q*norms2/(np.sqrt(1+norms2)+1)))
-        return cost,np.repeat(q/np.sqrt(1+norms2),3)
+        q=(1.,self.q_direction)
+        kernels=("gm",self.direction_kernel)
+        cost=0.;weights=np.empty(6)
+        for b,(n2,kernel) in enumerate(zip(norms2,kernels)):
+            c,w=self._block_cost_weight(float(n2),kernel,q[b])
+            cost+=c;weights[3*b:3*b+3]=w
+        return float(cost),weights

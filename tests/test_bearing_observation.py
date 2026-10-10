@@ -67,3 +67,32 @@ def test_radial_residual_sign_sigma_and_jacobian():
     assert short[0]>0  # estimated baseline below prediction -> positive residual
     with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0]).linearize_radial(a,b,0.)
     with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0],sigma_radial=-1.)
+
+
+def test_direction_kernel_cost_gradient_and_blocks():
+    a=se3_exp(np.array([.1,.2,-.1,.2,-.3,.1]))
+    b=se3_exp(np.array([-.2,.05,.1,1.,.3,-.2]))
+    for kernel,delta in (("gm",1.),("huber",.3),("quadratic",1.)):
+        obs=BearingObservation(np.eye(3),[.1,.2,1.],sigma_d=.2,
+                               direction_kernel=kernel,direction_delta=delta)
+        r,ja,jb=obs.linearize(a,b);j=np.hstack((ja,jb))
+        gradient=j.T@(obs.cost_weights(r)[1]*r)
+        ng=[]
+        for c in range(12):
+            values=[]
+            for sign in (1,-1):
+                x,y=a.copy(),b.copy();dx=np.zeros(6);dx[c%6]=sign*1e-6
+                if c<6:x=x@se3_exp(dx)
+                else:y=y@se3_exp(dx)
+                rr,_,_=obs.linearize(x,y);values.append(obs.cost_weights(rr)[0])
+            ng.append((values[0]-values[1])/2e-6)
+        np.testing.assert_allclose(gradient,ng,rtol=1e-6,atol=1e-7)
+    r=np.array([0.,0.,0.,3.,4.,0.])
+    cost,w=BearingObservation(np.eye(3),[1,0,0],direction_kernel="quadratic").cost_weights(r)
+    np.testing.assert_allclose(w,1.);np.testing.assert_allclose(cost,.5*25.)
+    cost,w=BearingObservation(np.eye(3),[1,0,0],direction_kernel="huber",
+                              direction_delta=.3).cost_weights(r)
+    assert w[3]==pytest.approx(.3/5.);np.testing.assert_allclose(w[:3],1.);assert w[4]==w[5]==w[3]
+    cost,w=BearingObservation(np.eye(3),[1,0,0]).cost_weights(r)  # default gm
+    assert w[3]==pytest.approx(1./np.sqrt(26.))
+    with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0],direction_kernel="nope")
