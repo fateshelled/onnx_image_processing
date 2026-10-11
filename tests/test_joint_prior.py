@@ -207,6 +207,137 @@ def test_fully_eliminated_disconnected_component_is_a_constant(mode):
     assert np.isfinite(g.pose(8)).all()
 
 
+def test_canonical_cap_bounds_active_keyframes_and_absorbs():
+    n = 40
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_marginal", kf_max_gap=1,
+        loop_enable=False, nl_reg=False, canonical_cap=True,
+        canonical_max_keyframes=2, loop_window=2, scale_prior_sigma=.6),
+        None, lambda a, b: {"ok": False})
+    g.add_frame(0)
+    for i in range(1, n):
+        g.add_frame(i, odom=(np.eye(3), np.array([-1., 0, 0])))
+    state = g._canonical
+    state.assert_ownership()
+    assert state.n_absorbed > 0
+    assert len(state.active) <= 2
+    assert state.n_over_cap == 0
+    assert g.last_n_nodes <= 3
+    assert all(np.isfinite(g.pose(i)).all() for i in range(n))
+
+
+def test_canonical_cap_off_matches_unbounded_history():
+    def build(cap):
+        g = OnlinePoseGraph(dict(
+            marginalization_backend="canonical_marginal", kf_max_gap=1,
+            loop_enable=False, nl_reg=False, canonical_cap=cap,
+            canonical_max_keyframes=2, loop_window=2, scale_prior_sigma=.6),
+            None, lambda a, b: {"ok": False})
+        g.add_frame(0)
+        for i in range(1, 25):
+            g.add_frame(i, odom=(np.eye(3), np.array([-1., 0, 0])))
+        return np.array([g.pose(i)[:3, 3] for i in range(25)])
+
+    off = build(False)
+    on = build(True)
+    # Absorbing a chain of isotropic priors is exact for this consistent
+    # (loop-free) case, so bounded and unbounded positions must agree.
+    np.testing.assert_allclose(on, off, atol=1e-6)
+
+
+def test_canonical_cap_does_not_bake_transients_into_est():
+    n = 30
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_marginal", kf_max_gap=4,
+        loop_enable=False, nl_reg=False, canonical_cap=True,
+        canonical_max_keyframes=1, loop_window=1, scale_prior_sigma=.6),
+        None, lambda a, b: {"ok": False})
+    g.add_frame(0)
+    for i in range(1, n):
+        g.add_frame(i, odom=(np.eye(3), np.array([-1., 0, 0])))
+    trans = [i for i in range(n) if i not in g._kf]
+    assert trans  # transients exist under kf_max_gap=4
+    assert all(t not in g._est for t in trans)
+    assert all(np.isfinite(g.pose(i)).all() for i in range(n))
+
+
+def test_canonical_cap_absorbs_se3_loop_endpoint():
+    def match(a, b):
+        if a == 0 and b == 12:
+            return dict(ok=True, R=np.eye(3), t=np.array([-2., 0, 0]),
+                        inlier_ratio=1., n_matches=100)
+        return {"ok": False}
+
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_marginal", kf_max_gap=4,
+        loop_min_gap=8, loop_temporal_k=1, scale_prior_sigma=.2, nl_reg=False,
+        canonical_cap=True, canonical_max_keyframes=1, loop_window=4),
+        None, match)
+    g.add_frame(0)
+    for i in range(1, 40):
+        g.add_frame(i, odom=(np.eye(3), np.array([-1., 0, 0])))
+    state = g._canonical
+    state.assert_ownership()
+    assert 0 in state.absorbed
+    assert ("loop", 0, 12) not in state.raw
+    assert len(state.active) <= 4
+    assert all(np.isfinite(g.pose(i)).all() for i in range(40))
+
+
+def test_canonical_cap_absorb_bridge_multineighbor():
+    # KF 0 gets three active neighbours (segment prior -> 4, loops -> 8, 12);
+    # absorbing it exercises the multi-neighbour nullspace gate on every later
+    # solve that consumes the resulting bridge prior.
+    def match(a, b):
+        if a == 0 and b in (8, 12):
+            return dict(ok=True, R=np.eye(3), t=np.array([-2., 0, 0]),
+                        inlier_ratio=1., n_matches=100)
+        return {"ok": False}
+
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_marginal", kf_max_gap=4,
+        loop_min_gap=8, loop_temporal_k=1, scale_prior_sigma=.2, nl_reg=False,
+        canonical_cap=True, canonical_max_keyframes=1, loop_window=4),
+        None, match)
+    g.add_frame(0)
+    for i in range(1, 40):
+        g.add_frame(i, odom=(np.eye(3), np.array([-1., 0, 0])))
+    state = g._canonical
+    state.assert_ownership()
+    assert 0 in state.absorbed
+    assert len(state.active) <= 4
+    assert all(np.isfinite(g.pose(i)).all() for i in range(40))
+
+
+def test_canonical_cap_measurement_free_keyframes_do_not_fail_stop():
+    # A run of failed odometry leaves keyframes without incident factors; they
+    # must not be absorbed (or crash the graph) -- they are counted as over-cap.
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_marginal", kf_max_gap=1,
+        loop_enable=False, nl_reg=False, canonical_cap=True,
+        canonical_max_keyframes=1, loop_window=1, scale_prior_sigma=.6),
+        None, lambda a, b: {"ok": False})
+    g.add_frame(0)
+    for i in range(1, 20):
+        odom = ((None, None) if 5 <= i <= 8
+                else (np.eye(3), np.array([-1., 0, 0])))
+        g.add_frame(i, odom=odom)
+    state = g._canonical
+    state.assert_ownership()
+    assert state.n_over_cap > 0
+    assert all(np.isfinite(g.pose(i)).all() for i in range(20))
+
+
+def test_canonical_cap_rejects_shared_scale_mode():
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_shared", kf_max_gap=1,
+        loop_enable=False, nl_reg=False, canonical_cap=True,
+        canonical_max_keyframes=1, loop_window=1), None, lambda a, b: {"ok": False})
+    g.add_frame(0)
+    with pytest.raises(ValueError, match="canonical_shared"):
+        g.add_frame(1, odom=(np.eye(3), np.array([-1., 0, 0])))
+
+
 def test_shared_scale_splits_at_tracking_failure_inside_and_between_segments():
     g = OnlinePoseGraph(dict(marginalization_backend="canonical_shared",
                              kf_max_gap=4, loop_enable=False, nl_reg=False),

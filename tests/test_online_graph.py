@@ -239,10 +239,12 @@ def test_loop_mad_history_is_bounded_and_unique():
     graph._commit_loop_history([
         (0, 2, 0.1, 0.2), (1, 3, 0.2, 0.3), (2, 4, 0.3, 0.4),
         (3, 5, 0.4, 0.5), (3, 5, 9.0, 9.0),
+        (4, 6, 0.5, float("nan")),  # dropped bearing direction: skipped
     ])
     assert list(graph._hist_rot) == [(1, 3), (2, 4), (3, 5)]
     assert graph._hist_rot[(3, 5)] == pytest.approx(0.4)
     assert len(graph._hist_rot) == len(graph._hist_dir) == 3
+    assert (4, 6) not in graph._hist_rot and (4, 6) not in graph._hist_dir
 
 
 def test_loop_observation_model_selects_window_class():
@@ -266,6 +268,12 @@ def test_loop_observation_model_selects_window_class():
     assert radial.bearing_sigma_radial == 0.3
     assert radial.bearing_scale_prior_sigma == 0.6
     assert bearing.bearing_dir_kernel == "gm"
+    assert bearing.bearing_baseline_floor == 1e-4
+    floor = OnlinePoseGraph(
+        {**base, "loop_observation_model": "bearing",
+         "bearing_baseline_floor": 0.05},
+        cam=None, match_fn=None)._new_window()
+    assert floor.bearing_baseline_floor == 0.05
     huber = OnlinePoseGraph(
         {**base, "loop_observation_model": "bearing",
          "bearing_dir_kernel": "huber", "bearing_dir_delta": 0.5},

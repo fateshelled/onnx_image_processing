@@ -37,6 +37,13 @@ class CanonicalGraph:
         self.sources = set()
         self.previous_lambda = None
         self.revision = 0
+        # Bounding (opt-in via graph param "canonical_cap"): active keyframes are
+        # the free nodes of the reduced graph. Exited keyframes are Schur
+        # absorbed into their neighbours and dropped from the solve.
+        self.active = None  # set of active keyframe ids; None until first close
+        self.absorbed = set()
+        self.n_over_cap = 0
+        self.n_absorbed = 0
 
     def _window(self, measurements, priors, poses):
         g = self.graph
@@ -91,6 +98,139 @@ class CanonicalGraph:
             owners.update(fac.sources)
         if owners != self.sources:
             raise AssertionError("lost canonical observation")
+
+    # -- bounding (opt-in) ---------------------------------------------------
+
+    def _loop_window(self):
+        # Must match the loop *detection* window in OnlinePoseGraph._add_loops
+        # (default 80) so condition B keeps every detectable endpoint active.
+        # The caller rejects non-positive values (see close_segment).
+        return int(self.graph.p.get("loop_window", 80))
+
+    def _cap_window(self):
+        g = self.graph
+        w = max(int(g.p.get("canonical_max_keyframes")
+                    or g.p.get("max_keyframes", 12) or 12),
+                self._loop_window())
+        return w
+
+    def _has_incident_loop(self, E):
+        return any(key[0] == "loop" and E in (m.a, m.b)
+                   for key, m in self.raw.items())
+
+    def _blanket_active(self, E):
+        """True when E has incident factors and all their pose endpoints are
+        active. A keyframe with no incident factor (measurement-free segment)
+        is not absorbable and returns False so the caller can fall back.
+        """
+        found = False
+        for pr in self.priors:
+            if ("pose", E) in pr.keys:
+                found = True
+                for kind, k in pr.keys:
+                    if kind == "pose" and k not in self.active:
+                        return False
+        for key, m in self.raw.items():
+            if key[0] == "loop" and E in (m.a, m.b):
+                found = True
+                if (m.a if m.b == E else m.b) not in self.active:
+                    return False
+        return found
+
+    def absorb(self, E):
+        """Schur-absorb active keyframe E into its active neighbours.
+
+        Combines E's incident priors (and SE3 loop edges) into a single joint
+        prior over the neighbours, removes the consumed factors, freezes E's
+        pose for output and drops it from the active set. Bearing loop edges
+        cannot be marginalized, so the caller must exclude such E.
+        """
+        g = self.graph
+        if E not in self.poses:
+            raise KeyError(f"absorb target {E} is not an active pose")
+        inc_pri = [pr for pr in self.priors if ("pose", E) in pr.keys]
+        inc_loop = [(key, m) for key, m in self.raw.items()
+                    if key[0] == "loop" and E in (m.a, m.b)]
+        if inc_loop and g.p.get("loop_observation_model", "se3") == "bearing":
+            raise ValueError("cannot absorb a keyframe with bearing loops")
+        nbr = set()
+        for pr in inc_pri:
+            nbr |= {k for kind, k in pr.keys if kind == "pose" and k != E}
+        for _key, m in inc_loop:
+            nbr.add(m.a if m.b == E else m.b)
+        if not nbr <= self.active:
+            raise RuntimeError(f"absorb {E}: blanket is not active")
+        # nbr may be empty when E only carries unary (single-node) priors; the
+        # summary is then a constant over no variable and E is safely frozen
+        # and dropped. (Constant summaries are retained for ownership and
+        # pruned only when loop/observation retirement lands.)
+        sub = g._new_window()
+        for nd in sorted(nbr | {E}):
+            pose = self.poses.get(nd)
+            sub.add_node(nd, pose if pose is not None else g._est[nd])
+        scale_keys = {k for pr in inc_pri for kind, k in pr.keys
+                      if kind == "scale"}
+        for key in sorted(scale_keys):
+            sub.add_scalar(key, self.scales.get(key, 0.0))
+        for pr in inc_pri:
+            sub.add_joint_prior(pr)
+        for key, m in inc_loop:
+            sub.add_named_edge(
+                m.key, m.a, m.b, m.M,
+                scale=float(np.exp(self.scales.get(m.key, 0.0))), **m.kwargs)
+        eliminate = {("pose", E)}
+        eliminate |= {("scale", k) for k in scale_keys}
+        eliminate |= {("scale", m.key) for _key, m in inc_loop}
+        sources = set()
+        for pr in inc_pri:
+            sources |= pr.sources
+        for key, _m in inc_loop:
+            sources.add(key)
+        summary = sub.marginalize_joint(eliminate, sources)
+        # Publish: freeze E's pose, drop it, replace consumed factors.
+        g._est[E] = self.poses[E].copy()
+        self.poses.pop(E, None)
+        inc_pri_ids = {id(pr) for pr in inc_pri}
+        self.priors = [pr for pr in self.priors if id(pr) not in inc_pri_ids]
+        for key, _m in inc_loop:
+            self.raw.pop(key, None)
+            self.scales.pop(key, None)
+            g._loops = [lp for lp in g._loops
+                        if edge_key(lp[0], lp[1]) != key[1:]]
+        self.priors.append(summary)
+        self.active.discard(E)
+        self.absorbed.add(E)
+        self.n_absorbed += 1
+
+    def _absorb_overflow(self):
+        # Runs after the segment solve (order solve -> absorb). last_n_nodes is
+        # therefore the solve size (<= W + 1); the persistent bound on
+        # ``self.active`` is what M1 checks.
+        g = self.graph
+        w = self._cap_window()
+        idx = {k: i for i, k in enumerate(g._kf)}
+        loop_window = self._loop_window()
+        bearing = g.p.get("loop_observation_model", "se3") == "bearing"
+        # NOTE: bearing loop endpoints are never absorbed here, so with bearing
+        # loops the active set can exceed W until loop retirement lands (next
+        # stage); n_over_cap counts this and M1 must not assert it to be 0 for
+        # bearing.
+        while len(self.active) > w:
+            chosen = None
+            for E in sorted(self.active):
+                age = len(g._kf) - 1 - idx.get(E, len(g._kf) - 1)
+                if age < loop_window:
+                    continue
+                if bearing and self._has_incident_loop(E):
+                    continue
+                if not self._blanket_active(E):
+                    continue
+                chosen = E
+                break
+            if chosen is None:
+                self.n_over_cap += 1
+                break
+            self.absorb(chosen)
 
     def close_segment(self, b):
         g = self.graph
@@ -153,9 +293,33 @@ class CanonicalGraph:
             raise ValueError("canonical observation already registered")
         all_raw = list(self.raw.values()) + measurements + new_loops
         all_priors = self.priors + scale_factors
-        nodes = set(g._kf) | {b} | set(trans)
-        if self.mode == "canonical_raw":
-            nodes |= set(self.poses)
+        # canonical_cap is opt-in; canonical_raw keeps every keyframe free and
+        # therefore silently ignores it. canonical_shared is rejected below.
+        cap = bool(g.p.get("canonical_cap", False)) and self.mode != "canonical_raw"
+        if cap and self.mode == "canonical_shared":
+            # Shared lambda scale keys span adjacent segments; absorbing one
+            # endpoint would eliminate a key still referenced elsewhere.
+            raise ValueError("canonical_cap is unsupported with canonical_shared")
+        if cap and self._loop_window() <= 0:
+            # Condition B (never absorb inside the loop detection window)
+            # requires a positive window; loop_window<=0 means "scan all KFs".
+            raise ValueError("canonical_cap requires loop_window > 0")
+        if cap:
+            if self.active is None:
+                self.active = set(g._kf)
+            live = set(self.active) | {b} | set(trans)
+            outside = [e.key for e in all_raw if e.a not in live or e.b not in live]
+            outside += [f for f in all_priors
+                        if any(kind == "pose" and k not in live
+                               for kind, k in f.keys)]
+            if outside:
+                raise RuntimeError(
+                    "canonical cap: retained factor outside the active set")
+            nodes = live
+        else:
+            nodes = set(g._kf) | {b} | set(trans)
+            if self.mode == "canonical_raw":
+                nodes |= set(self.poses)
         act = self._window(all_raw, all_priors, nodes)
         g.last_n_nodes = len(act.pose_ids)
         if g.p.get("nl_reg", True):
@@ -202,14 +366,24 @@ class CanonicalGraph:
             if self.mode != "canonical_retained":
                 for e in measurements:
                     self.scales.pop(e.key, None)
-        for k in list(g._kf) + [b]:
-            g._est[k] = act.get_pose(k)
+        if cap:
+            # Only keyframes (never transients) are stored as absolute poses;
+            # transients keep their anchor-relative reconstruction.
+            for k in sorted(set(self.active) | {b}):
+                if k in act.pose_ids:
+                    g._est[k] = act.get_pose(k)
+        else:
+            for k in list(g._kf) + [b]:
+                g._est[k] = act.get_pose(k)
         # Keep the existing output reconstruction fixed across the A/B variants.
         for k in trans:
             g._rel[k] = (a, np.linalg.inv(g._T[a]) @ g._T[k])
             g._spoke.pop(k, None)
         g._kf.append(b)
         g._seg = []
+        if cap:
+            self.active.add(b)
+            self._absorb_overflow()
         g._pending_global = False  # every solve already includes all loop factors
         g._last_global_kf = len(g._kf)
         if g.p.get("loop_scale_mode", "fixed") == "mad":

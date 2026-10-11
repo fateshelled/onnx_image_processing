@@ -46,6 +46,23 @@ def test_loop_has_no_scale_and_full_jacobian_matches():
     with pytest.raises(ValueError):obj.marginalize_joint(set())
 
 
+def test_bearing_baseline_floor_propagates_to_observation():
+    obj=BearingJointWindowOptimizer(regularization='ridge',alpha=10,
+                                    optimize_scale=True,bearing_baseline_floor=.05)
+    obj.add_node(0,np.eye(4));b=np.eye(4);b[0,3]=1.2;obj.add_node(2,b)
+    m=np.eye(4);m[0,3]=-1;obj.add_named_edge(('loop',0,2),0,2,m)
+    assert obj.bearing_loops[('loop',0,2)][2].baseline_floor==.05
+
+
+def test_harvest_reports_nan_direction_below_baseline_floor():
+    obj=BearingJointWindowOptimizer(regularization='ridge',alpha=10,optimize_scale=True)
+    obj.add_node(0,np.eye(4));b=np.eye(4);b[0,3]=1e-6;obj.add_node(2,b)
+    m=np.eye(4);m[0,3]=-1;obj.add_named_edge(('loop',0,2),0,2,m)
+    samples=[s for s in obj.harvest_robust_residuals() if s[0]==0 and s[1]==2]
+    assert len(samples)==1
+    assert np.isfinite(samples[0][2]) and np.isnan(samples[0][3])
+
+
 def test_loop_connects_components_for_gauge():
     obj=BearingJointWindowOptimizer(regularization='ridge')
     obj.add_node(0,np.eye(4));b=np.eye(4);b[0,3]=1;obj.add_node(4,b)
