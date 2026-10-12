@@ -44,6 +44,7 @@ class CanonicalGraph:
         self.absorbed = set()
         self.n_over_cap = 0
         self.n_absorbed = 0
+        self.n_retired_loops = 0
 
     def _window(self, measurements, priors, poses):
         g = self.graph
@@ -202,6 +203,29 @@ class CanonicalGraph:
         self.absorbed.add(E)
         self.n_absorbed += 1
 
+    def _retire_oldest_bearing_loop(self):
+        """Drop the oldest retained bearing loop to free its held endpoints.
+
+        Bearing loops cannot be Schur-absorbed, so their endpoints stay active;
+        retiring a loop (dropping the constraint) is the only way to bound the
+        active set. SE3 loops are absorbable and never retired. The dropped
+        constraint is an approximation, counted in ``n_retired_loops``.
+        """
+        g = self.graph
+        if g.p.get("loop_observation_model", "se3") != "bearing":
+            return False  # SE3 loops are absorbable and must not be retired
+        loops = [(key, m) for key, m in self.raw.items() if key[0] == "loop"]
+        if not loops:
+            return False
+        key, m = min(loops, key=lambda kv: (min(kv[1].a, kv[1].b),
+                                            max(kv[1].a, kv[1].b)))
+        self.raw.pop(key, None)
+        self.sources.discard(key)
+        self.scales.pop(key, None)
+        g._loops = [lp for lp in g._loops if edge_key(lp[0], lp[1]) != key[1:]]
+        self.n_retired_loops += 1
+        return True
+
     def _absorb_overflow(self):
         # Runs after the segment solve (order solve -> absorb). last_n_nodes is
         # therefore the solve size (<= W + 1); the persistent bound on
@@ -211,10 +235,6 @@ class CanonicalGraph:
         idx = {k: i for i, k in enumerate(g._kf)}
         loop_window = self._loop_window()
         bearing = g.p.get("loop_observation_model", "se3") == "bearing"
-        # NOTE: bearing loop endpoints are never absorbed here, so with bearing
-        # loops the active set can exceed W until loop retirement lands (next
-        # stage); n_over_cap counts this and M1 must not assert it to be 0 for
-        # bearing.
         while len(self.active) > w:
             chosen = None
             for E in sorted(self.active):
@@ -227,10 +247,18 @@ class CanonicalGraph:
                     continue
                 chosen = E
                 break
-            if chosen is None:
-                self.n_over_cap += 1
-                break
-            self.absorb(chosen)
+            if chosen is not None:
+                self.absorb(chosen)
+                continue
+            # No absorbable keyframe: a bearing loop endpoint is blocking.
+            # Retire the oldest retained loop (drop its constraint) so its
+            # endpoint can be absorbed next iteration.
+            if bearing and self._retire_oldest_bearing_loop():
+                continue
+            # Nothing left to free (e.g. measurement-free keyframes): the
+            # bound cannot be met for this step; count it and stop.
+            self.n_over_cap += 1
+            break
 
     def close_segment(self, b):
         g = self.graph

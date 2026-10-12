@@ -281,6 +281,7 @@ def test_canonical_cap_absorbs_se3_loop_endpoint():
     assert 0 in state.absorbed
     assert ("loop", 0, 12) not in state.raw
     assert len(state.active) <= 4
+    assert state.n_retired_loops == 0  # SE3 loops are absorbed, not retired
     assert all(np.isfinite(g.pose(i)).all() for i in range(40))
 
 
@@ -326,6 +327,31 @@ def test_canonical_cap_measurement_free_keyframes_do_not_fail_stop():
     state.assert_ownership()
     assert state.n_over_cap > 0
     assert all(np.isfinite(g.pose(i)).all() for i in range(20))
+
+
+def test_canonical_cap_retires_bearing_loops_to_bound():
+    def match(a, b):
+        if a == 0 and b >= 8 and b % 4 == 0:
+            return dict(ok=True, R=np.eye(3), t=np.array([-2., 0, 0]),
+                        inlier_ratio=1., n_matches=100)
+        return {"ok": False}
+
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_marginal",
+        canonical_regularization="relative_joint_ridge", seq_tsvd_ratio=0.0,
+        loop_robust="none", loop_observation_model="bearing",
+        kf_max_gap=4, loop_min_gap=8, loop_temporal_k=1, scale_prior_sigma=.2,
+        nl_reg=False, canonical_cap=True, canonical_max_keyframes=1,
+        loop_window=4), None, match)
+    g.add_frame(0)
+    for i in range(1, 40):
+        g.add_frame(i, odom=(np.eye(3), np.array([-1., 0, 0])))
+    state = g._canonical
+    state.assert_ownership()
+    assert state.n_retired_loops > 0
+    assert state.n_over_cap == 0
+    assert len(state.active) <= 4
+    assert all(np.isfinite(g.pose(i)).all() for i in range(40))
 
 
 def test_canonical_cap_rejects_shared_scale_mode():
