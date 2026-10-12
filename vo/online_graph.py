@@ -98,10 +98,6 @@ DEFAULT_PARAMS = {
     # Per-block robust kernel: rotation stays GM; the direction block can use a
     # non-saturating kernel ("gm" default, or "huber"/"quadratic").
     "bearing_dir_kernel": "gm", "bearing_dir_delta": 1.0,
-    # Lower bound on the estimated loop baseline used to damp the 1/L bearing
-    # direction Jacobian (None uses the BearingObservation default). Prevents
-    # the solver blow-up when coincident loop endpoints make L -> 0.
-    "bearing_baseline_floor": None,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
@@ -689,8 +685,7 @@ class OnlinePoseGraph:
                         bearing_scale_prior_sigma=self.p.get("bearing_scale_prior_sigma"),
                         bearing_scale_prior_mean=self.p.get("bearing_scale_prior_mean", 0.0),
                         bearing_dir_kernel=self.p.get("bearing_dir_kernel", "gm"),
-                        bearing_dir_delta=self.p.get("bearing_dir_delta", 1.0),
-                        bearing_baseline_floor=self.p.get("bearing_baseline_floor"))
+                        bearing_dir_delta=self.p.get("bearing_dir_delta", 1.0))
         return cls(
             **options,
             max_iterations=self.p.get("loop_iterations", 10),
@@ -719,8 +714,6 @@ class OnlinePoseGraph:
         """Commit post-solve loop residuals once per unique edge, bounded."""
         cap = max(1, int(self.p.get("loop_mad_window", 64)))
         for i, j, r_rot, r_dir in samples:
-            if not (np.isfinite(r_rot) and np.isfinite(r_dir)):
-                continue  # e.g. bearing direction dropped below baseline floor
             key = edge_key(i, j)
             if key in self._hist_rot:
                 continue

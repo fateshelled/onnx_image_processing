@@ -3,12 +3,6 @@ from dataclasses import dataclass
 import numpy as np
 from .se3 import so3_log, so3_left_jacobian_inv, skew
 
-# Default lower bound on the estimated loop baseline below which the bearing
-# direction observation is treated as unobservable (see the baseline_floor
-# field). Kept deliberately small so normal loops are untouched; it is a safety
-# net against the 1/L blow-up when loop endpoints become coincident.
-DEFAULT_BASELINE_FLOOR = 1e-4
-
 
 @dataclass(frozen=True)
 class BearingObservation:
@@ -20,18 +14,6 @@ class BearingObservation:
     sigma_radial: float | None = None
     direction_kernel: str = "gm"
     direction_delta: float = 1.
-    # The direction Jacobian scales as (I - n n^T)/L. As the estimated
-    # baseline L -> 0 (near-coincident loop endpoints, L > 0) that factor
-    # diverges (1/L),
-    # blowing up the Hessian and stalling the solver. Below baseline_floor the
-    # translation direction is treated as unobservable (no parallax): the
-    # direction block contributes zero residual/Jacobian and only the rotation
-    # block (independent of L) and any radial block constrain the loop.
-    # Scope: this is a safety net for the L -> 0 blow-up only. It does NOT
-    # remove the intrinsic 1/L stiffness for baselines just above the floor
-    # (that needs a larger floor or a different formulation). See
-    # notes/20261011-solver-fail-rootcause.md.
-    baseline_floor: float = DEFAULT_BASELINE_FLOOR
 
     def __post_init__(self):
         R=np.array(self.rotation,dtype=float,copy=True)
@@ -48,8 +30,6 @@ class BearingObservation:
             raise ValueError('unknown direction kernel')
         if self.direction_kernel=="huber" and (not np.isfinite(self.direction_delta) or self.direction_delta<=0):
             raise ValueError('invalid direction huber delta')
-        if not np.isfinite(self.baseline_floor) or self.baseline_floor<=0:
-            raise ValueError('baseline_floor must be positive')
         u/=np.linalg.norm(u);R.flags.writeable=False;u.flags.writeable=False
         object.__setattr__(self,'rotation',R);object.__setattr__(self,'direction',u)
 
@@ -64,13 +44,9 @@ class BearingObservation:
         Q,v,length,n=self._geometry(Ti,Tj);e=so3_log(self.rotation.T@Q)
         # Jr^-1(e)=Jl^-1(-e), matching right SE3 increments.
         Jr=so3_left_jacobian_inv(-e)/self.sigma_r
+        G=(np.eye(3)-np.outer(n,n))/length/self.sigma_d
         a=np.zeros((6,6));b=np.zeros((6,6))
         a[:3,:3]=Jr;b[:3,:3]=-Jr@Q.T
-        if length<self.baseline_floor:
-            # No parallax: the translation direction is unobservable. Keep the
-            # rotation constraint, drop the (1/L-divergent) direction block.
-            return np.r_[e/self.sigma_r,np.zeros(3)],a,b
-        G=(np.eye(3)-np.outer(n,n))/length/self.sigma_d
         a[3:,3:]=G@Q;b[3:,:3]=G@skew(v);b[3:,3:]=-G
         r=np.r_[e/self.sigma_r,(n-self.direction)/self.sigma_d]
         if not np.isfinite(r).all() or not np.isfinite(a).all() or not np.isfinite(b).all():

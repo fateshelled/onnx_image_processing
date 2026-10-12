@@ -40,23 +40,6 @@ def test_confidence_block_separation_sign_and_domain():
         with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0],q_direction=q).linearize(a,a)
 
 
-def test_direction_block_dropped_below_baseline_floor():
-    a=np.eye(4);b=np.eye(4);b[0,3]=1e-10  # tiny but nonzero baseline
-    obs=BearingObservation(np.eye(3),[1.,0.,0.],sigma_d=.2)
-    r,ja,jb=obs.linearize(a,b)
-    assert np.isfinite(r).all() and np.isfinite(ja).all() and np.isfinite(jb).all()
-    # Direction block is unobservable at zero parallax -> exactly zero.
-    assert np.all(r[3:]==0) and np.all(ja[3:,:]==0) and np.all(jb[3:,:]==0)
-    # Rotation block survives (finite, independent of baseline).
-    assert np.max(np.abs(ja[:3,:3]))>0
-    # Just above the floor the direction block is active and 1/L-bounded.
-    up=np.eye(4);up[0,3]=1e0
-    r2,ja2,jb2=obs.linearize(a,up)
-    assert np.any(ja2[3:,:]!=0)
-    with pytest.raises(ValueError):
-        BearingObservation(np.eye(3),[1.,0.,0.],baseline_floor=0.0)
-
-
 def _step(c,sign):
     dx=np.zeros(6);dx[c]=sign*1e-6;return se3_exp(dx)
 

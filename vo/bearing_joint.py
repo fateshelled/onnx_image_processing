@@ -1,6 +1,6 @@
 """Opt-in canonical solver replacing raw loop edges with bearing observations."""
 import numpy as np
-from .bearing_observation import DEFAULT_BASELINE_FLOOR, BearingObservation
+from .bearing_observation import BearingObservation
 from .relative_joint import RelativeJointWindowOptimizer
 
 
@@ -8,7 +8,7 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
     def __init__(self, bearing_radial=False, bearing_sigma_d=None,
                  bearing_sigma_radial=None, bearing_scale_prior_sigma=None,
                  bearing_scale_prior_mean=0.0, bearing_dir_kernel="gm",
-                 bearing_dir_delta=1.0, bearing_baseline_floor=None, **kwargs):
+                 bearing_dir_delta=1.0, **kwargs):
         super().__init__(**kwargs)
         self.bearing_loops = {}
         self.bearing_radial = bool(bearing_radial)
@@ -22,9 +22,6 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
         self.bearing_scale_prior_mean = float(bearing_scale_prior_mean)
         self.bearing_dir_kernel = str(bearing_dir_kernel)
         self.bearing_dir_delta = float(bearing_dir_delta)
-        self.bearing_baseline_floor = (DEFAULT_BASELINE_FLOOR
-                                       if bearing_baseline_floor is None
-                                       else float(bearing_baseline_floor))
         if self.bearing_sigma_d <= 0:
             raise ValueError('bearing direction sigma must be positive')
         if self.bearing_dir_kernel not in ("gm","huber","quadratic"):
@@ -47,7 +44,6 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
         result.bearing_scale_prior_mean=0.0
         result.bearing_dir_kernel="gm"
         result.bearing_dir_delta=1.0
-        result.bearing_baseline_floor=DEFAULT_BASELINE_FLOOR
         result.scale_regularizer_exclude=set()
         return result
 
@@ -69,8 +65,7 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
             sigma_r=self.step_scale_r if sigma is None else sigma,
             sigma_d=self.bearing_sigma_d,q_direction=1.,sigma_radial=radial_sigma,
             direction_kernel=self.bearing_dir_kernel,
-            direction_delta=self.bearing_dir_delta,
-            baseline_floor=self.bearing_baseline_floor),key)
+            direction_delta=self.bearing_dir_delta),key)
         if self.bearing_radial:
             self.add_scalar(key,np.log(scale))
             self.scale_regularizer_exclude.add(key)
@@ -166,14 +161,6 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
         result=super().harvest_robust_residuals()
         for i,j,f,_s in self.bearing_loops.values():
             r,_,_=f.linearize(self.T[i],self.T[j])
-            rot=float(np.linalg.norm(r[:3])*f.sigma_r)
-            Tij=np.linalg.inv(self.T[j])@self.T[i]
-            baseline=float(np.linalg.norm(Tij[:3,3]))
-            if baseline>=f.baseline_floor:
-                dirn=float(2*np.arcsin(np.clip(np.linalg.norm(r[3:6])*f.sigma_d/2,0,1)))
-            else:
-                # Direction is dropped below the baseline floor; its residual is
-                # not a real observation (0 would bias the MAD loop scale).
-                dirn=float('nan')
-            result.append((i,j,rot,dirn))
+            result.append((i,j,float(np.linalg.norm(r[:3])*f.sigma_r),
+                           float(2*np.arcsin(np.clip(np.linalg.norm(r[3:6])*f.sigma_d/2,0,1)))))
         return result
