@@ -41,8 +41,11 @@ from .se3_window import SlidingWindowOptimizer
 # 0.5247). Some values sit on the search-grid boundary (kf_max_gap=8,
 # max_keyframes=12) and may improve further with a wider grid. The solver now
 # uses canonical marginalization and relative joint ridge (alpha=10, sigma=1),
-# selected by three-sequence short/long comparisons; 40 iterations match those
-# comparisons. Regularization is solver-only, never marginalized as observations.
+# selected by three-sequence short/long comparisons. Loop iterations are 20:
+# raising them to 40 made the LM solver enter a degenerate linearization region
+# (numerically indefinite Hessian, rejected-step churn) and crashed the room
+# bearing sequence, while 20 completes it with equal desk/desk2 accuracy and
+# lower cost. Regularization is solver-only, never marginalized as observations.
 DEFAULT_PARAMS = {
     "odom_ref": "kf", "kf_mode": "motion", "keyframe_decim": 15,
     "kf_trans_thresh": 4.0, "kf_rot_thresh": 30.0, "kf_max_gap": 8,
@@ -61,7 +64,7 @@ DEFAULT_PARAMS = {
     # values reject loop measurements whose rotation disagrees with the
     # independently accumulated odometry chain by more than this many degrees.
     "cycle_threshold_deg": 0.0,
-    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 40,
+    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 20,
     "tsvd_ratio": 0.0, "scale_kf": False,
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
     "graph_mode": "kf_prior", "max_keyframes": 12, "seq_tsvd_ratio": 0.0,

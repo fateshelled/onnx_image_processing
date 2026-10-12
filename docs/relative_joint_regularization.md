@@ -4,7 +4,7 @@
 
 The online VO sample and callers using `vo.online_graph.DEFAULT_PARAMS` use
 `canonical_marginal` with `relative_joint_ridge`: alpha=10, all three sigma
-parameters=1, NL-Reg disabled, TSVD disabled, `loop_robust=none`, and 40 iterations.
+parameters=1, NL-Reg disabled, TSVD disabled, `loop_robust=none`, and 20 iterations.
 Ridge adds constant information alpha in the dimensionless relative pose/scale
 coordinates. Its prediction center stays fixed during each solve.
 
@@ -85,6 +85,29 @@ Regularization never adds factor rows to marginalization. Its influence on the
 estimated linearization state does remain. Variable edge scales must use stable
 names (`add_named_edge`); unnamed variable scales are rejected at solve/export.
 
+## Numerical robustness
+
+The `soft` (Wiener) regularizer needs `chol(H0 + tau*I)`. At a huge Hessian
+dynamic range `H0` can be numerically indefinite (roundoff-only negative
+eigenvalues), where the Cholesky is undefined. In that case the factor is
+built from a PSD projection: `eigh(0.5*(H0+H0.T))`, negatives clipped to zero,
+and the symmetric inverse square root (`B^T B = alpha*tau*(P(H0)+tau*I)^-1` for
+the projected `P(H0)`, the same information as the triangular factor). The
+positive spectrum is untouched; the negative eigenvalues here are roundoff
+artifacts at the huge dynamic range. The normal PD path still uses Cholesky
+unchanged.
+
+When the LM schedule is exhausted without finding a decreasing step, the solver
+returns the last accepted iterate with `relative_diagnostics["status"] ==
+"no_progress"` instead of raising (matching the legacy sliding-window solver's
+no-progress semantics). The state is finite (the initial estimate if no step was
+accepted) and is a valid best-effort estimate, so a single stalled window never
+aborts the whole run. The stall is surfaced through the status (plus the usual
+rejection/lambda diagnostics); the returned estimate is never clipped or
+non-finite. The loop iteration cap is 20: 40 iterations let the solver wander
+into the degenerate bearing region and crashed the room/fr2 sequences, while 20
+completes them with equal desk/desk2 accuracy.
+
 ## Current limits
 
 - Dense experimental solver, intended for small canonical windows.
@@ -98,4 +121,5 @@ names (`add_named_edge`); unnamed variable scales are rejected at solve/export.
 
 `relative_diagnostics` records status, rejected trials, failure reasons, final
 LM damping, accepted costs, initial spectrum and regularization/data costs.
-Persistent failure raises an exception instead of returning a clipped estimate.
+An exhausted LM schedule returns the last accepted iterate with status
+`no_progress`; the returned estimate is never clipped or non-finite.

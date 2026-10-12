@@ -175,8 +175,21 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
         J = self._jacobian()[:, cols] * D
         H0 = J.T @ (self._huber_weights()[:, None] * J)
         if self.regularization == "soft":
-            L = sla.cholesky(H0 + self.tau*np.eye(len(D)), lower=True)
-            B = np.sqrt(self.alpha*self.tau) * sla.solve_triangular(L, np.eye(len(D)), lower=True)
+            try:
+                L = sla.cholesky(H0 + self.tau*np.eye(len(D)), lower=True)
+            except np.linalg.LinAlgError:
+                # H0 is numerically indefinite at a huge dynamic range, so the
+                # Wiener Cholesky is undefined. Project H0 onto the PSD cone
+                # (symmetrize, clip roundoff-only negatives to 0) and use the
+                # symmetric inverse square root; it satisfies
+                # B^T B = alpha*tau*(P(H0)+tau I)^-1 for the projected P(H0),
+                # the same information as the triangular factor, with no
+                # threshold on the positive spectrum.
+                w, V = np.linalg.eigh(0.5*(H0 + H0.T))
+                w = np.maximum(w, 0.)
+                B = np.sqrt(self.alpha*self.tau) * (V * (1./np.sqrt(w + self.tau))) @ V.T
+            else:
+                B = np.sqrt(self.alpha*self.tau) * sla.solve_triangular(L, np.eye(len(D)), lower=True)
         elif self.regularization == "ridge":
             B = np.sqrt(self.alpha)*np.eye(len(D))
         else:
@@ -278,9 +291,13 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
                 self.relative_diagnostics["last_failure"] = failure
                 lam *= 10.
             if not accepted:
-                if status != "roundoff":
-                    self.relative_diagnostics.update(status="failed", final_lambda=float(lam))
-                    raise RuntimeError("relative joint solve failed to find a finite decreasing trial")
+                if status == "roundoff":
+                    break
+                # No lambda yields a decreasing step: stop and return the last
+                # accepted iterate (the initial estimate if none was accepted)
+                # as a best-effort result, matching the legacy sliding-window
+                # solver. The state is finite; status "no_progress" surfaces it.
+                status = "no_progress"
                 break
         rr = regularizer()
         reg_cost = float(.5*(rr @ rr))

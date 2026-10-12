@@ -178,7 +178,7 @@ def test_shipped_ridge_defaults_run_canonical_marginalization():
     assert window.regularization == "ridge"
     assert window.alpha == 10.
     assert window.sigmas == (1., 1., 1.)
-    assert window.max_iterations == 40
+    assert window.max_iterations == 20
     assert g._canonical.mode == "canonical_marginal"
     # Pass the real default graph through several promotions, transient
     # marginalizations and replacement priors, rather than only checking keys.
@@ -327,9 +327,8 @@ def test_roundoff_convergence_and_large_gradient_failure(monkeypatch, curvature_
     bad.add_joint_prior(JointPrior((("scale", "s"),), (0.,), np.ones((1, 1)),
                                   np.array([-1.]), frozenset()))
     monkeypatch.setattr(bad, "_true_cost", lambda: 1.)
-    with pytest.raises(RuntimeError):
-        bad.optimize()
-    assert bad.relative_diagnostics["status"] == "failed"
+    bad.optimize()
+    assert bad.relative_diagnostics["status"] == "no_progress"
     assert bad.log_scale("s") == 0.
 
 
@@ -343,7 +342,8 @@ def test_roundoff_requires_small_undamped_correction(
         monkeypatch, curvature, correction, lambda_init, converged):
     # An irreducible residual sets the cost resolution. The second row has an
     # exact known minimizer, including weak curvature and huge LM damping cases.
-    w = RelativeJointWindowOptimizer(regularization="none", lambda_init=lambda_init)
+    w = RelativeJointWindowOptimizer(regularization="none",
+                                    lambda_init=lambda_init)
     w.add_scalar("s")
     w.add_joint_prior(JointPrior((("scale", "s"),), (0.,),
                                 np.array([[0.], [curvature]]),
@@ -355,9 +355,8 @@ def test_roundoff_requires_small_undamped_correction(
         assert w.relative_diagnostics["status"] == "roundoff"
         assert w.last_steps == 0
     else:
-        with pytest.raises(RuntimeError):
-            w.optimize()
-        assert w.relative_diagnostics["status"] == "failed"
+        w.optimize()
+        assert w.relative_diagnostics["status"] == "no_progress"
     assert w.log_scale("s") == 0.
 
 
@@ -373,7 +372,22 @@ def test_roundoff_does_not_certify_rank_truncated_model(monkeypatch, strong):
     # Exact nullspace: decline the certificate conservatively. Mixed singular
     # values: never discard a large improvable weak-direction residual as noise.
     monkeypatch.setattr(w, "_true_cost", lambda: 50. + .5*residual**2)
-    with pytest.raises(RuntimeError):
-        w.optimize()
-    assert w.relative_diagnostics["status"] == "failed"
+    w.optimize()
+    assert w.relative_diagnostics["status"] == "no_progress"
     assert w.log_scale("strong") == w.log_scale("weak") == 0.
+
+
+def test_stall_returns_last_accepted(monkeypatch):
+    # An exhausted LM schedule returns a finite best-effort state with status
+    # "no_progress" instead of raising (matching the legacy sliding-window
+    # solver's no-progress semantics).
+    w = RelativeJointWindowOptimizer(regularization="none")
+    w.add_scalar("s")
+    w.add_joint_prior(JointPrior((("scale", "s"),), (0.,), np.ones((1, 1)),
+                                np.array([-1.]), frozenset()))
+    monkeypatch.setattr(w, "_true_cost", lambda: 1.)
+    w.optimize()
+    assert w.relative_diagnostics["status"] == "no_progress"
+    assert w.last_steps == 0
+    assert w.relative_diagnostics["final_lambda"] > w.lambda_init
+    assert w.log_scale("s") == 0.
