@@ -109,17 +109,13 @@ CONDITIONAL = {
 }
 
 SOURCE_FILES = (
+    "scripts/tune_bearing_cap.py",
     "eval/rustuna_tune_loop.py",
     "eval/eval_tum_vo.py",
-    "vo/online_graph.py",
-    "vo/canonical_graph.py",
-    "vo/relative_joint.py",
-    "vo/bearing_joint.py",
-    "vo/bearing_observation.py",
-    "vo/se3.py",
-    "vo/se3_window.py",
-    "vo/joint_prior.py",
-    "vo/pose_estimation.py",
+    "eval/torch_sinkhorn.py",
+) + tuple(
+    path.relative_to(REPO).as_posix()
+    for path in sorted((REPO / "vo").rglob("*.py"))
 )
 
 
@@ -146,11 +142,20 @@ def order_space(space):
 
 
 def base_raw(space):
-    """Baseline level of every searched parameter (from DEFAULT_PARAMS)."""
+    """Baseline level of every searched parameter.
+
+    Conditional parameters whose shipped default is not itself a search level
+    (e.g. ``bearing_sigma_radial=None`` while the levels are positive floats) are
+    skipped, so the OFAT enqueue never fixes them to an out-of-grid value that
+    would clash with ``suggest_categorical`` when their gate is enabled.
+    """
     raw = {}
-    for name in space:
-        if name in DEFAULT_PARAMS:
+    for name, levels in space.items():
+        if name in DEFAULT_PARAMS and DEFAULT_PARAMS[name] in levels:
             raw[name] = DEFAULT_PARAMS[name]
+    for dep, (gate_param, gate_values) in CONDITIONAL.items():
+        if dep in raw and raw.get(gate_param) not in gate_values:
+            del raw[dep]
     return raw
 
 
@@ -175,6 +180,33 @@ def suggest_raw(trial, space):
     return raw
 
 
+def ofat_signature(values, space):
+    """Effective full-key signature of an OFAT trial.
+
+    ``values`` may be partial. Inactive conditional parameters are normalized to
+    ``None`` so an explicitly fixed but unused value does not create a duplicate.
+    """
+    normalized = {}
+    for name in sorted(space):
+        gate = CONDITIONAL.get(name)
+        if gate is not None:
+            gate_param, gate_values = gate
+            if values.get(gate_param) not in gate_values:
+                normalized[name] = None
+                continue
+        normalized[name] = values.get(name)
+    return json.dumps(normalized, sort_keys=True, default=str)
+
+
+def _fill_active_dependents(trial, space):
+    """Pin active conditional params to a deterministic level for OFAT clarity."""
+    for dep, (gate_param, gate_values) in CONDITIONAL.items():
+        if dep in trial or dep not in space:
+            continue
+        if trial.get(gate_param) in gate_values:
+            trial[dep] = sorted(space[dep], key=str)[0]
+
+
 def ofat_trials(space):
     base = base_raw(space)
     yield dict(base)
@@ -190,6 +222,7 @@ def ofat_trials(space):
                 if trial.get(gate_param) not in gate_values:
                     # deterministic representative level for the gate
                     trial[gate_param] = sorted(gate_values, key=str)[0]
+            _fill_active_dependents(trial, space)
             yield trial
 
 
@@ -325,14 +358,12 @@ def main():
         if trial.state not in (TrialState.COMPLETE, TrialState.WAITING):
             continue
         values = trial.system_attrs.get("fixed_params", trial.params)
-        if all(name in values for name in space):
-            existing.add(json.dumps(
-                {name: values[name] for name in space}, sort_keys=True,
-                default=str))
+        existing.add(ofat_signature(values, space))
     for raw in ofat_trials(space):
-        sig = json.dumps(raw, sort_keys=True, default=str)
+        sig = ofat_signature(raw, space)
         if sig not in existing:
             study.enqueue_trial(raw)
+            existing.add(sig)
 
     def objective(trial):
         raw = suggest_raw(trial, space)
