@@ -150,17 +150,32 @@ def se3_left_jacobian_inv(e):
     """J_l(e)^{-1} for right-increment updates T' = T @ Exp(delta).
 
     Analytic via the Bernoulli series Sigma B_k/k! ad(e)^k, valid for
-    ||omega|| < 2*pi (convergence verified against finite differences;
-    using 40 terms beyond the constant to retain accuracy near pi).
+    ||omega|| < 2*pi. Odd k >= 3 vanish, so only the constant, linear and even
+    powers are summed; the even powers are advanced by ad(e)^2 (one 6x6 matmul
+    per two orders). The series truncates as soon as the next term is negligible
+    relative to the running magnitude, so small residuals (the common case) cost
+    a handful of terms while large rotations still reach the full 41st order.
+    Edge residual rotations are principal-branch (<= pi), where the truncated
+    series is accurate to ~1e-11.
     """
     e = np.asarray(e, dtype=np.float64).reshape(6)
     A = se3_ad_e(e)
-    S = np.zeros((6, 6))
-    Ak = np.eye(6)
-    for k, coefficient in enumerate(_BERNOULLI_COEFFICIENTS):
-        if k > 0:
-            Ak = Ak @ A
-        S += coefficient * Ak
+    S = np.eye(6) - 0.5 * A  # k=0 (B_0/0! = 1) and k=1 (B_1/1! = -1/2)
+    A2 = A @ A
+    power = A2  # ad(e)^2
+    last = len(_BERNOULLI_COEFFICIENTS) - 1
+    scale = max(1.0, float(np.abs(S).max()))
+    for k in range(2, last + 1, 2):
+        term = _BERNOULLI_COEFFICIENTS[k] * power
+        S += term
+        magnitude = float(np.abs(term).max())
+        if magnitude > scale:
+            scale = magnitude
+        # Always sum the first few terms; stop once the tail is negligible.
+        if k >= 6 and magnitude <= 1e-15 * scale:
+            break
+        if k + 2 <= last:
+            power = power @ A2
     return S
 
 
