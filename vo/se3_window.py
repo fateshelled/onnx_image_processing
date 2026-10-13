@@ -11,8 +11,8 @@ active set and marginalizes exited keyframes into multi-node priors.
   recoverPose [R|t] point-transform convention used by the VO pipeline
   (see PR #33).
 - Residual per edge: e = Log(M_ij^{-1} T_j^{-1} T_i)  (rotation part first).
-- Solver: Gauss-Newton with LM damping; analytic SE(3) Jacobians with a
-  central-difference fallback where the analytic form is unavailable.
+- Solver: Gauss-Newton with LM damping; analytic SE(3) Jacobians (no
+  numerical differentiation).
 - Robustness: per-edge Huber reweighting (plus optional loop kernels).
 
 Optional per-edge scale (monocular scale drift):
@@ -536,10 +536,11 @@ class SlidingWindowOptimizer:
         endpoint node blocks (12 columns) plus its own log-scale column,
         so the matrix is extremely sparse for large pose graphs.
 
-        Node columns are analytic (verified against finite differences);
-        edges whose residual rotation norm exceeds the Bernoulli series
-        comfort range (||omega|| > 1.8) fall back to central differences on
-        that row only. Scale columns use :meth:`_scale_jacobian`.
+        Every row is analytic: node columns use the SE(3) right/left Jacobian
+        inverses (the Bernoulli series converges for ||rot|| < 2*pi, and edge
+        residual rotations are principal-branch, i.e. <= pi) and scale columns
+        use :meth:`_scale_jacobian`. ``eps`` is kept for API compatibility and
+        is unused (no numerical differentiation).
         """
         free = [nd for nd in self.pose_ids if nd not in self.fixed_ids]
         n = len(free)
@@ -554,27 +555,24 @@ class SlidingWindowOptimizer:
             sc = self._edge_scale(st, sr)
             Ms = self._scaled_M(k)
             e = _edge_residual(self.T[i], self.T[j], Ms)
-            if float(np.linalg.norm(e[:3])) > 1.8:
-                self._jacobian_row_numeric(k, col, rows, cols, vals, eps)
-            else:
-                Ji = se3_right_jacobian_inv(e)
-                Jj = -se3_left_jacobian_inv(e) @ se3_ad(np.linalg.inv(Ms))
-                Bi = self._apply_weight_jac(k, Ji)
-                Bj = self._apply_weight_jac(k, Jj)
-                base_i = 6 * col[i] if i in col else None
-                base_j = 6 * col[j] if j in col else None
-                for a in range(6):
-                    for d in range(6):
-                        v = Bi[a, d]
-                        if v != 0.0 and base_i is not None:
-                            rows.append(r0 + a)
-                            cols.append(base_i + d)
-                            vals.append(v)
-                        v = Bj[a, d]
-                        if v != 0.0 and base_j is not None:
-                            rows.append(r0 + a)
-                            cols.append(base_j + d)
-                            vals.append(v)
+            Ji = se3_right_jacobian_inv(e)
+            Jj = -se3_left_jacobian_inv(e) @ se3_ad(np.linalg.inv(Ms))
+            Bi = self._apply_weight_jac(k, Ji)
+            Bj = self._apply_weight_jac(k, Jj)
+            base_i = 6 * col[i] if i in col else None
+            base_j = 6 * col[j] if j in col else None
+            for a in range(6):
+                for d in range(6):
+                    v = Bi[a, d]
+                    if v != 0.0 and base_i is not None:
+                        rows.append(r0 + a)
+                        cols.append(base_i + d)
+                        vals.append(v)
+                    v = Bj[a, d]
+                    if v != 0.0 and base_j is not None:
+                        rows.append(r0 + a)
+                        cols.append(base_j + d)
+                        vals.append(v)
             c = self.scale_col[k]
             if c is not None:
                 sj = self._scale_jacobian(k)
@@ -621,29 +619,6 @@ class SlidingWindowOptimizer:
         if rows.size:
             J[rows, cols] = vals
         return J
-
-    def _jacobian_row_numeric(self, k, col, rows, cols, vals, eps=1e-6):
-        """Central differences for one edge row, appended to COO lists."""
-        i, j, M, st, sr = self.edges[k]
-        for node in (i, j):
-            if node not in col:
-                continue  # fixed endpoint: no columns
-            base = 6 * col[node]
-            T0 = self.T[node].copy()
-            for d in range(6):
-                delta = np.zeros(6)
-                delta[d] = eps
-                self.T[node] = T0 @ se3_exp(delta)
-                rp = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
-                self.T[node] = T0 @ se3_exp(-delta)
-                rm = _edge_residual(self.T[i], self.T[j], self._scaled_M(k))
-                self.T[node] = T0
-                g = self._apply_weight(k, (rp - rm) / (2.0 * eps))
-                for a in range(6):
-                    if g[a] != 0.0:
-                        rows.append(6 * k + a)
-                        cols.append(base + d)
-                        vals.append(g[a])
 
     def _sparse_normal(self, r, w):
         """Sparse normal equations without materialising a dense graph."""
