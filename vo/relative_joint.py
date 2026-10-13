@@ -167,11 +167,13 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
         try:
             return self._optimize_relative(verbose)
         except Exception as exc:
-            # Never leave the delta memoization armed after a failed solve.
-            self._delta_cache_active = False
-            self._delta_cache.clear()
             self.relative_diagnostics.update(status="failed", error=f"{type(exc).__name__}: {exc}")
             raise
+        finally:
+            # Never leave the delta memoization armed after a solve (including
+            # cancellation): the next direct residual/Jacobian read must be live.
+            self._delta_cache_active = False
+            self._delta_cache.clear()
 
     def _optimize_relative(self, verbose=False):
         self._validate_relative()
