@@ -7,7 +7,7 @@ import numpy as np
 import scipy.linalg as sla
 
 from .joint_prior import JointWindowOptimizer
-from .se3 import se3_ad, se3_exp, se3_log, se3_right_jacobian_inv
+from .se3 import se3_ad, se3_exp, se3_inv, se3_log, se3_right_jacobian_inv
 from .se3_window import SlidingWindowOptimizer
 
 
@@ -26,6 +26,13 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
         self.alpha, self.tau = float(alpha), float(tau)
         self.sigmas = (float(sigma_r), float(sigma_t), float(sigma_l))
         self.relative_diagnostics = {}
+        # Memoize each joint-prior delta for the current linearization point.
+        # ``_delta_rev`` is bumped whenever the poses or scales change, so a
+        # delta is computed once per (factor, linearization point) and reused by
+        # the residual, Jacobian and cost evaluations that share that point.
+        self._delta_rev = 0
+        self._delta_cache = {}
+        self._delta_cache_active = False
 
     @staticmethod
     def _prior_anchors(fac):
@@ -55,17 +62,27 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
         super().add_joint_prior(prior)
 
     def _joint_delta(self, fac):
+        if not fac.keys:
+            return np.zeros(0)
+        active = self._delta_cache_active
+        if active:
+            cached = self._delta_cache.get(id(fac))
+            if cached is not None and cached[0] == self._delta_rev:
+                return cached[1]
         anchors = self._prior_anchors(fac)
         refs = {k: x0 for (kind, k), x0 in zip(fac.keys, fac.x0) if kind == "pose"}
         pieces = []
         for (kind, key), x0 in zip(fac.keys, fac.x0):
             if kind == "pose":
                 a = anchors[key]
-                aligned = refs[a] @ np.linalg.solve(self.T[a], self.T[key])
-                pieces.append(se3_log(np.linalg.solve(x0, aligned)))
+                aligned = refs[a] @ se3_inv(self.T[a]) @ self.T[key]
+                pieces.append(se3_log(se3_inv(x0) @ aligned))
             else:
                 pieces.append(np.array([self.log_scale(key) - x0]))
-        return np.concatenate(pieces) if pieces else np.zeros(0)
+        out = np.concatenate(pieces) if pieces else np.zeros(0)
+        if active:
+            self._delta_cache[id(fac)] = (self._delta_rev, out)
+        return out
 
     def _jacobian_coo(self, eps=1e-6):
         rows, cols, vals, shape = SlidingWindowOptimizer._jacobian_coo(self, eps)
@@ -83,7 +100,7 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
                 if key[0] == "pose":
                     block = block @ se3_right_jacobian_inv(delta[offset:offset+6])
                     a = anchors[key[1]]
-                    anchor_block = -block @ se3_ad(np.linalg.solve(self.T[key[1]], self.T[a]))
+                    anchor_block = -block @ se3_ad(se3_inv(self.T[key[1]]) @ self.T[a])
                     contributions = [(key, block), (("pose", a), anchor_block)]
                 offset += width
                 for target, jac in contributions:
@@ -150,6 +167,9 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
         try:
             return self._optimize_relative(verbose)
         except Exception as exc:
+            # Never leave the delta memoization armed after a failed solve.
+            self._delta_cache_active = False
+            self._delta_cache.clear()
             self.relative_diagnostics.update(status="failed", error=f"{type(exc).__name__}: {exc}")
             raise
 
@@ -172,6 +192,11 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
             self.last_cost = self._true_cost()
             self.relative_diagnostics = {"status": "empty", "regularization_cost": 0.}
             return self.last_cost
+        # Memoize each prior delta within this solve: the poses/scales only
+        # change inside the trial loop below, which bumps the revision.
+        self._delta_cache.clear()
+        self._delta_rev += 1
+        self._delta_cache_active = True
         J = self._jacobian()[:, cols] * D
         H0 = J.T @ (self._huber_weights()[:, None] * J)
         if self.regularization == "soft":
@@ -208,7 +233,7 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
             eta, blocks = [], []
             for key in keys:
                 if key[0] == "pose":
-                    d = se3_log(np.linalg.solve(reference[key], self.T[key[1]]))
+                    d = se3_log(se3_inv(reference[key]) @ self.T[key[1]])
                     eta.extend(d)
                     if jacobian:
                         blocks.append(se3_right_jacobian_inv(d))
@@ -258,6 +283,7 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
                     for i, p in enumerate(self.pose_ids):
                         self.T[p] = poses[p] @ se3_exp(dx[6*i:6*i+6])
                     self._apply_scale_step(dx[6*len(self.pose_ids):])
+                    self._delta_rev += 1  # trial linearization point changed
                     trial_reg = regularizer()
                     trial = self._true_cost() + .5*(trial_reg @ trial_reg)
                     if np.isfinite(trial) and trial < cost:
@@ -284,6 +310,7 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
                 self.T.update({p: T.copy() for p, T in poses.items()})
                 # _restore_scales assigns mutable state; give each trial a fresh copy.
                 self._restore_scales((list(scales[0]), dict(scales[1])))
+                self._delta_rev += 1  # rejected trial restored the linearization point
                 if roundoff:
                     status = "roundoff"
                     break
@@ -307,4 +334,5 @@ class RelativeJointWindowOptimizer(JointWindowOptimizer):
                                      "initial_eigenvalues": sla.eigvalsh(H0).tolist(),
                                      "roots": sorted(roots), "steps": self.last_steps,
                                      "final_lambda": float(lam)})
+        self._delta_cache_active = False
         return self.last_cost

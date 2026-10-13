@@ -114,6 +114,21 @@ def se3_log(T):
     return out
 
 
+def se3_inv(T):
+    """Analytic inverse of a 4x4 SE(3) transform (valid rotation block).
+
+    Avoids the generic ``np.linalg.inv`` / ``solve`` overhead in hot loops:
+    ``T^{-1} = [[R^T, -R^T t], [0, 1]]``.
+    """
+    T = np.asarray(T, dtype=np.float64)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    out = np.eye(4)
+    out[:3, :3] = R.T
+    out[:3, 3] = -R.T @ t
+    return out
+
+
 def se3_ad(T):
     """Adjoint of T Exp(δ) T^{-1} == Exp(se3_ad(T) δ).
 

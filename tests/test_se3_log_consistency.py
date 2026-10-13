@@ -2,7 +2,8 @@ import numpy as np
 import pytest
 from scipy.special import bernoulli, factorial
 
-from vo.se3 import se3_ad_e, se3_exp, se3_left_jacobian_inv, se3_log, se3_right_jacobian_inv
+from vo.se3 import (se3_ad_e, se3_exp, se3_inv, se3_left_jacobian_inv,
+                    se3_log, se3_right_jacobian_inv)
 from vo.se3_window import SlidingWindowOptimizer
 
 
@@ -16,6 +17,15 @@ def _full_bernoulli(e):
             power = power @ a
         out += c * power
     return out
+
+
+def test_se3_inv_matches_numpy_inverse_on_valid_poses():
+    """The analytic SE(3) inverse must equal np.linalg.inv for valid poses."""
+    rng = np.random.default_rng(11)
+    for _ in range(200):
+        T = se3_exp(rng.normal(size=6) * rng.uniform(0.01, 1.0))
+        np.testing.assert_allclose(se3_inv(T), np.linalg.inv(T),
+                                   rtol=0, atol=1e-11)
 
 
 def test_se3_left_jacobian_inv_matches_full_bernoulli_series():

@@ -37,6 +37,7 @@ from .loop_closure import edge_key
 from .se3 import (
     se3_ad,
     se3_exp,
+    se3_inv,
     se3_log,
     se3_left_jacobian_inv,
     se3_right_jacobian_inv,
@@ -45,8 +46,8 @@ from .se3 import (
 
 def _edge_residual(T_i, T_j, M):
     """Residual e = Log(M^{-1} T_j^{-1} T_i); zero when M == T_j^{-1} T_i."""
-    P = np.linalg.inv(T_j) @ T_i
-    Q = np.linalg.inv(M) @ P
+    P = se3_inv(T_j) @ T_i
+    Q = se3_inv(M) @ P
     return se3_log(Q)
 
 
@@ -519,11 +520,11 @@ class SlidingWindowOptimizer:
         i, j, M, st, sr = self.edges[k]
         Ms = self._scaled_M(k)
         e = _edge_residual(self.T[i], self.T[j], Ms)
-        P = np.linalg.inv(self.T[j]) @ self.T[i]
-        A = np.linalg.inv(Ms) @ P
+        P = se3_inv(self.T[j]) @ self.T[i]
+        A = se3_inv(Ms) @ P
         dM = np.zeros((4, 4))
         dM[:3, 3] = Ms[:3, 3]
-        G = -np.linalg.inv(P) @ dM @ A
+        G = -se3_inv(P) @ dM @ A
         w = 0.5 * np.array([G[2, 1] - G[1, 2], G[0, 2] - G[2, 0], G[1, 0] - G[0, 1]])
         v = G[:3, 3]
         twist = np.concatenate([w, v])
@@ -556,23 +557,19 @@ class SlidingWindowOptimizer:
             Ms = self._scaled_M(k)
             e = _edge_residual(self.T[i], self.T[j], Ms)
             Ji = se3_right_jacobian_inv(e)
-            Jj = -se3_left_jacobian_inv(e) @ se3_ad(np.linalg.inv(Ms))
+            Jj = -se3_left_jacobian_inv(e) @ se3_ad(se3_inv(Ms))
             Bi = self._apply_weight_jac(k, Ji)
             Bj = self._apply_weight_jac(k, Jj)
-            base_i = 6 * col[i] if i in col else None
-            base_j = 6 * col[j] if j in col else None
-            for a in range(6):
-                for d in range(6):
-                    v = Bi[a, d]
-                    if v != 0.0 and base_i is not None:
-                        rows.append(r0 + a)
-                        cols.append(base_i + d)
-                        vals.append(v)
-                    v = Bj[a, d]
-                    if v != 0.0 and base_j is not None:
-                        rows.append(r0 + a)
-                        cols.append(base_j + d)
-                        vals.append(v)
+            if i in col:
+                ri, ci = np.nonzero(Bi)
+                rows.extend((r0 + ri).tolist())
+                cols.extend((6 * col[i] + ci).tolist())
+                vals.extend(Bi[ri, ci].tolist())
+            if j in col:
+                rj, cj = np.nonzero(Bj)
+                rows.extend((r0 + rj).tolist())
+                cols.extend((6 * col[j] + cj).tolist())
+                vals.extend(Bj[rj, cj].tolist())
             c = self.scale_col[k]
             if c is not None:
                 sj = self._scale_jacobian(k)
@@ -596,16 +593,13 @@ class SlidingWindowOptimizer:
                 if nd not in col:
                     continue  # fixed in the factor: delta is pinned
                 cb = 6 * col[nd]
-                delta = se3_log(np.linalg.inv(x0[kk]) @ self.T[nd])
+                delta = se3_log(se3_inv(x0[kk]) @ self.T[nd])
                 blk = (L[:, 6 * kk:6 * kk + 6]
                        @ se3_right_jacobian_inv(delta))
-                for a in range(m6):
-                    for d in range(6):
-                        v = blk[a, d]
-                        if v != 0.0:
-                            rows.append(base + a)
-                            cols.append(cb + d)
-                            vals.append(v)
+                ra, ca = np.nonzero(blk)
+                rows.extend((base + ra).tolist())
+                cols.extend((cb + ca).tolist())
+                vals.extend(blk[ra, ca].tolist())
             base += m6
         return (np.asarray(rows, dtype=np.int64),
                 np.asarray(cols, dtype=np.int64),

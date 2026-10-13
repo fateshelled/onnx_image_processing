@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import scipy.linalg as sla
 
-from .se3 import se3_log, se3_right_jacobian_inv
+from .se3 import se3_inv, se3_log, se3_right_jacobian_inv
 from .se3_window import SlidingWindowOptimizer
 
 
@@ -142,7 +142,7 @@ class JointWindowOptimizer(SlidingWindowOptimizer):
         if not fac.keys:
             return np.zeros(0)  # fully eliminated component: constant cost only
         return np.concatenate([
-            se3_log(np.linalg.inv(x0) @ self.T[key]) if kind == "pose"
+            se3_log(se3_inv(x0) @ self.T[key]) if kind == "pose"
             else np.array([self.log_scale(key) - x0])
             for (kind, key), x0 in zip(fac.keys, fac.x0)])
 
@@ -169,7 +169,7 @@ class JointWindowOptimizer(SlidingWindowOptimizer):
                 if key not in columns:  # explicit fixed pose
                     continue
                 if key[0] == "pose":
-                    delta = se3_log(np.linalg.inv(x0) @ self.T[key[1]])
+                    delta = se3_log(se3_inv(x0) @ self.T[key[1]])
                     block = block @ se3_right_jacobian_inv(delta)
                 rr, cc = np.nonzero(block)
                 rows.extend(base + rr)
