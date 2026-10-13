@@ -153,8 +153,8 @@ def load_cache(cache_dir, seq):
             "stride": int(z["stride"]), "n_frames": int(z["n_frames"])}
 
 
-# Default parameters for the sequential graph (canonical marginal + joint ridge),
-# shared with the online graph module. Callers that need the batch graph must
+# Default parameters for the sequential graph (canonical marginal + joint soft
+# regularization), shared with the online graph module. Callers that need the batch graph must
 # pass graph_mode="stride" explicitly.
 from vo.online_graph import DEFAULT_PARAMS as _SEQ_DEFAULTS  # noqa: E402
 from vo.online_graph import OnlinePoseGraph  # noqa: E402

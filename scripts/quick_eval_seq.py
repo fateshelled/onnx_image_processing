@@ -18,7 +18,9 @@ from vo.pose_estimation import CameraIntrinsics  # noqa: E402
 ap = argparse.ArgumentParser()
 ap.add_argument("--seq", default="desk")
 ap.add_argument("--max-kf", default=None,
-                help="override max_keyframes (int, or 'all'/None for unbounded)")
+                help="override max_keyframes (int, or 'all'/None). Note the "
+                     "canonical active set is still bounded by "
+                     "canonical_cap/W=max(canonical_max_keyframes, loop_window)")
 args = ap.parse_args()
 params = dict(rtl.SEQ_OPT1_DEFAULTS)
 if args.max_kf is not None:

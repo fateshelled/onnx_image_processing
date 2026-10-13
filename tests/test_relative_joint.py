@@ -169,14 +169,14 @@ def test_online_wiring():
         g._new_window()
 
 
-def test_shipped_ridge_defaults_run_canonical_marginalization():
+def test_shipped_soft_bearing_defaults_run_canonical_marginalization():
     from vo.online_graph import DEFAULT_PARAMS, OnlinePoseGraph
     params = dict(DEFAULT_PARAMS)
     g = OnlinePoseGraph(params, None, lambda a, b: {"ok": False})
     window = g._new_window()
     assert isinstance(window, RelativeJointWindowOptimizer)
-    assert window.regularization == "ridge"
-    assert window.alpha == 10.
+    assert window.regularization == "soft"
+    assert window.alpha == 10. and window.tau == 1.
     assert window.sigmas == (1., 1., 1.)
     assert window.max_iterations == 20
     assert g._canonical.mode == "canonical_marginal"
@@ -195,7 +195,8 @@ def test_shipped_defaults_allow_explicit_legacy_nl_reg():
     from vo.online_graph import DEFAULT_PARAMS, OnlinePoseGraph
     from vo.se3_window import SlidingWindowOptimizer
     params = {**DEFAULT_PARAMS, "marginalization_backend": "legacy",
-              "canonical_regularization": "legacy", "nl_reg": True, "loop_iterations": 10}
+              "canonical_regularization": "legacy", "nl_reg": True,
+              "loop_iterations": 10, "loop_observation_model": "se3"}
     g = OnlinePoseGraph(params, None, lambda a, b: {"ok": False})
     assert type(g._new_window()) is SlidingWindowOptimizer
     assert g._canonical is None

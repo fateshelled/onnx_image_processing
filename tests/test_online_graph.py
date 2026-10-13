@@ -132,7 +132,9 @@ def test_scale_kf_path_runs_and_zero_sigma_is_safe():
         params = dict(DEFAULT_PARAMS)
         params.update(scale_kf=True, scale_kf_sigma=sigma, kf_max_gap=5,
                       kf_min_gap=4, nl_reg=True, max_keyframes=3,
-                      marginalization_backend="legacy", canonical_regularization="legacy")
+                      marginalization_backend="legacy",
+                      canonical_regularization="legacy",
+                      loop_observation_model="se3")
         graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
         for k in range(N):
             T = graph.add_frame(k)

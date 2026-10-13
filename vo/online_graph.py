@@ -1,4 +1,4 @@
-"""Online keyframe pose graph with canonical marginalization and joint ridge.
+"""Online keyframe pose graph with canonical marginalization and joint regularization.
 
 This module owns **all** the pose-graph logic so the offline evaluator
 (``eval/rustuna_tune_loop.py``) and the streaming sample
@@ -10,7 +10,8 @@ This module owns **all** the pose-graph logic so the offline evaluator
 * deferred (option 1) marginalization of exited keyframes into multi-node
   priors;
 * loop closure with the temporal-consistency gate and cycle handling;
-* joint relative-pose/log-scale ridge regularization (legacy NL-Reg is optional).
+* joint relative-pose/log-scale regularization (soft/Wiener by default; ridge
+  and legacy NL-Reg are optional).
 
 The graph is matcher-agnostic and **index-based**: the caller passes
 ``match_fn(i, j) -> dict`` where the dict has keys ``ok`` (bool), ``R``
@@ -36,12 +37,15 @@ from .scale_kf import ScaleKF
 from .se3_window import SlidingWindowOptimizer
 
 # Observation/keyframe parameters for the online sequential graph come from the
-# 200-trial optuna study "online_bounded_kf" (best trial 174, mean+worst
-# ATE 0.5245 on desk/desk2/room; a near-tie with trials 119/121/122 at
-# 0.5247). Some values sit on the search-grid boundary (kf_max_gap=8,
-# max_keyframes=12) and may improve further with a wider grid. The solver now
-# uses canonical marginalization and relative joint ridge (alpha=10, sigma=1),
-# selected by three-sequence short/long comparisons. Loop iterations are 20:
+# 200-trial optuna study "online_bounded_kf" (legacy backend; best trial 174,
+# mean+worst ATE 0.5245 on desk/desk2/room; a near-tie with trials 119/121/122
+# at 0.5247). Some values sit on the search-grid boundary (kf_max_gap=8,
+# max_keyframes=12) and may improve further with a wider grid. The adopted
+# solver uses canonical marginalization, the bounded canonical graph
+# (cap=60 via canonical_max_keyframes=12/loop_window=60), the bearing loop
+# model (sd0.2, quadratic direction kernel) and relative joint soft (Wiener)
+# regularization (alpha=10, tau=1, sigma=1), selected on the desk/desk2/room
+# comparison. Loop iterations are 20:
 # raising them to 40 made the LM solver enter a degenerate linearization region
 # (numerically indefinite Hessian, rejected-step churn) and crashed the room
 # bearing sequence, while 20 completes it with equal desk/desk2 accuracy and
@@ -69,38 +73,42 @@ DEFAULT_PARAMS = {
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
     "graph_mode": "kf_prior", "max_keyframes": 12, "seq_tsvd_ratio": 0.0,
     "nl_reg": False, "nl_reg_c": 10.0, "nl_reg_tau": 30.0, "nl_reg_length": 0.5,
-    # Bounding for the canonical backend (opt-in). When canonical_cap is True
-    # only the active reduced-graph keyframes are solved every segment; exited
-    # keyframes are Schur-absorbed into their neighbours (see
+    # Bounding for the canonical backend. When canonical_cap is True only the
+    # active reduced-graph keyframes are solved every segment; exited keyframes
+    # are Schur-absorbed into their neighbours and bearing-loop endpoints are
+    # freed by retiring the oldest loops (see
     # notes/20261011-canonical-cap-design.md). The active bound is
     # max(canonical_max_keyframes, loop_window) and canonical_max_keyframes
-    # falls back to max_keyframes when None. Defaults preserve the unbounded
-    # canonical behaviour.
-    "canonical_cap": False,
-    "canonical_max_keyframes": None,
-    # Reserved for loop retirement (bearing held bound); unused until that
-    # stage lands. Kept so the parameter contract is stable.
+    # falls back to max_keyframes when None. Enabled by default (W=60, bounded
+    # per-segment cost).
+    "canonical_cap": True,
+    "canonical_max_keyframes": 12,
+    # Reserved for the bearing held bound. Loop retirement is implemented
+    # (canonical_graph._retire_oldest_bearing_loop, counted in n_retired_loops),
+    # but this explicit held cap is still unused; kept for a stable contract.
     "canonical_held_cap": None,
     "marginalization_backend": "canonical_marginal",
-    "canonical_regularization": "relative_joint_ridge",
+    "canonical_regularization": "relative_joint_soft",
     "relative_reg_alpha": 10.0, "relative_reg_tau": 1.0,
     "relative_sigma_r": 1.0, "relative_sigma_t": 1.0, "relative_sigma_l": 1.0,
-    # Loop observation model. "se3" is the canonical SE(3) relative-pose
-    # residual; "bearing" replaces loop edges with the SO3/direction separated
-    # factor (no distance variable) via BearingJointWindowOptimizer. Bearing
-    # loops require the relative canonical solver (nl_reg=false, TSVD off).
-    "loop_observation_model": "se3",
+    # Loop observation model. "bearing" replaces loop edges with the
+    # SO(3)/direction-separated factor (no distance variable) via
+    # BearingJointWindowOptimizer (the adopted default); "se3" is the canonical
+    # SE(3) relative-pose residual. Bearing loops require the relative canonical
+    # solver (nl_reg=false, TSVD off).
+    "loop_observation_model": "bearing",
     # Bearing loop variant. When bearing_radial is on, each bearing loop gains a
     # per-loop log-scale variable weakly constrained by a zero-mean log prior, so
     # the otherwise unobserved baseline length is softly pinned (see
-    # notes/20261010-bearing-radial-constraint-design.md). None uses the
+    # notes/20261010-bearing-radial-constraint-design.md). The adopted default
+    # tightens the direction sigma below loop_dir_sigma (sd0.2). None uses the
     # optimizer defaults (loop_dir_sigma, step_scale_t, scale_prior_sigma).
     "bearing_radial": False,
-    "bearing_sigma_d": None, "bearing_sigma_radial": None,
+    "bearing_sigma_d": 0.2, "bearing_sigma_radial": None,
     "bearing_scale_prior_sigma": None, "bearing_scale_prior_mean": 0.0,
-    # Per-block robust kernel: rotation stays GM; the direction block can use a
-    # non-saturating kernel ("gm" default, or "huber"/"quadratic").
-    "bearing_dir_kernel": "gm", "bearing_dir_delta": 1.0,
+    # Per-block robust kernel: rotation stays GM; the direction block uses a
+    # non-saturating kernel (adopted default "quadratic", or "gm"/"huber").
+    "bearing_dir_kernel": "quadratic", "bearing_dir_delta": 1.0,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
@@ -144,11 +152,14 @@ class OnlinePoseGraph:
     """Online sequential pose graph.
 
     Parameters are read from a plain dict (defaults come from
-    ``DEFAULT_PARAMS``). The canonical default keeps all historical keyframes
-    in its dense solves; ``max_keyframes``/``held_cap`` only bound the legacy
-    backend. Transient frames are marginalized into relative priors when a
-    new keyframe is promoted. The legacy backend defers exited keyframes
-    (option 1) until their Markov blanket is active.
+    ``DEFAULT_PARAMS``). The canonical default bounds the active reduced graph
+    (``canonical_cap``, W=max(canonical_max_keyframes, loop_window)): only
+    active keyframes are solved and exited ones are Schur-absorbed. With
+    ``canonical_cap=False`` the canonical backend keeps all historical
+    keyframes in its dense solves; ``max_keyframes``/``held_cap`` then only
+    bound the legacy backend. Transient frames are marginalized into relative
+    priors when a new keyframe is promoted. The legacy backend defers exited
+    keyframes (option 1) until their Markov blanket is active.
     """
 
     def __init__(self, params, cam, match_fn):

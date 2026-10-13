@@ -2,19 +2,29 @@
 
 ## Adopted default
 
-The online VO sample and callers using `vo.online_graph.DEFAULT_PARAMS` use
-`canonical_marginal` with `relative_joint_ridge`: alpha=10, all three sigma
-parameters=1, NL-Reg disabled, TSVD disabled, `loop_robust=none`, and 20 iterations.
-Ridge adds constant information alpha in the dimensionless relative pose/scale
-coordinates. Its prediction center stays fixed during each solve.
+The online VO sample and callers using `vo.online_graph.DEFAULT_PARAMS` use the
+bounded canonical graph (`canonical_marginal`, `canonical_cap=True`,
+`canonical_max_keyframes=12`, `loop_window=60`, so the active bound is W=60), the
+bearing loop observation model (`bearing_sigma_d=0.2`, quadratic direction
+kernel) and relative joint soft (Wiener) regularization: alpha=10, tau=1, all
+three sigma parameters=1, NL-Reg disabled, TSVD disabled, `loop_robust=none`, and
+20 iterations. Each segment solves only the active reduced-graph keyframes;
+exited keyframes are Schur-absorbed and bearing-loop endpoints are freed by
+retiring the oldest loops (`n_retired_loops`). Per-segment cost is bounded and no
+longer grows with sequence length. Regularization is solver-only and is never
+marginalized as observations.
 
-This setting prioritizes typical trajectory and relative-motion accuracy over
-requiring every maximum error to improve. On three 240-sample comparisons, ATE
-medians improved by 27.2%, 2.8%, and 9.0%; short-prefix results and some worst
-relative-motion errors regressed. These are overlapping prefixes, not independent
-held-out sequences. Canonical solves are dense and retain all historical
-keyframes: `max_keyframes` and `held_cap` bound only the legacy backend. Runtime
-and memory therefore grow with sequence length.
+To restore the previous ridge + SE(3) + unbounded configuration, override the
+shared defaults together:
+
+```python
+params = {
+    **DEFAULT_PARAMS,
+    "canonical_regularization": "relative_joint_ridge",
+    "loop_observation_model": "se3",
+    "canonical_cap": False,
+}
+```
 
 To restore the previous legacy/NL-Reg configuration, override the shared defaults
 with all of the following together:
@@ -24,6 +34,7 @@ params = {
     **DEFAULT_PARAMS,
     "marginalization_backend": "legacy",
     "canonical_regularization": "legacy",
+    "loop_observation_model": "se3",
     "nl_reg": True,
     "loop_iterations": 10,
 }
@@ -35,10 +46,10 @@ dicts are not automatically merged with `DEFAULT_PARAMS`.
 The loop tuner includes inherited evaluation defaults in its study identity and
 saves full effective parameters with every new trial. Reusing an SQLite file
 therefore starts a separate study after this default change instead of mixing
-legacy and ridge scores. Older trials saved only partial parameters; replaying
-those requires explicitly supplying their original legacy settings.
+different configurations. Older trials saved only partial parameters; replaying
+those requires explicitly supplying their original settings.
 
-## Experimental spectral alternative
+## Spectral (soft/Wiener) regularization
 
 The canonical backend supports a smooth prior on the total change from each
 solve's initial relative poses and persistent log-scales. It uses the complete
@@ -63,9 +74,9 @@ Example parameter overrides for `scripts/ab_segment_boundary.py --params-json`:
 }
 ```
 
-Select a canonical backend through `--modes canonical_marginal`. These soft
-parameters are experimental overrides, not the adopted ridge defaults.
-`relative_joint_none` (LM only) is a diagnostic alternative.
+Select a canonical backend through `--modes canonical_marginal`. This is the
+adopted default regularizer (the example above lowers `alpha`/`tau` for a
+weaker prior); `relative_joint_none` (LM only) is a diagnostic alternative.
 
 The sigma parameters describe tolerated prediction changes in radians,
 internal distance units, and log-scale units. LM and step stopping use the

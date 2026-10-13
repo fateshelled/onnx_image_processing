@@ -1,9 +1,11 @@
 """Accuracy-first canonical graph used to validate segment marginalization.
 
-Every closed segment has disjoint measurement ownership. All historical KFs
-remain free and every accepted loop is present in every solve: the first
-implementation deliberately has no local/global information handoff or cap.
-The raw backend additionally keeps every transient pose for a reference solve.
+Every closed segment has disjoint measurement ownership. By default the
+canonical backend is bounded (``canonical_cap``): active keyframes are limited
+to W=max(canonical_max_keyframes, loop_window) and exited keyframes are
+Schur-absorbed; with the cap off all historical KFs remain free and every
+accepted loop is present in every solve. The raw backend additionally keeps
+every transient pose for a reference solve.
 """
 from dataclasses import dataclass
 
