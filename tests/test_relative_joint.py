@@ -178,7 +178,7 @@ def test_shipped_soft_bearing_defaults_run_canonical_marginalization():
     assert window.regularization == "soft"
     assert window.alpha == 10. and window.tau == 1.
     assert window.sigmas == (1., 1., 1.)
-    assert window.scale_prior_sigma == 1.0
+    assert window.scale_prior_sigma == 0.6
     assert window.max_iterations == 20
     assert g._canonical.mode == "canonical_marginal"
     # Pass the real default graph through several promotions, transient

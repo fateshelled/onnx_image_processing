@@ -68,7 +68,7 @@ DEFAULT_PARAMS = {
     # values reject loop measurements whose rotation disagrees with the
     # independently accumulated odometry chain by more than this many degrees.
     "cycle_threshold_deg": 0.0,
-    "scale_prior_sigma": 1.0, "step_scale_t": 0.1, "loop_iterations": 20,
+    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 20,
     "tsvd_ratio": 0.0, "scale_kf": False,
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
     "graph_mode": "kf_prior", "max_keyframes": 12, "seq_tsvd_ratio": 0.0,
