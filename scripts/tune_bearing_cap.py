@@ -56,7 +56,6 @@ from eval.torch_sinkhorn import TorchSinkhornMatcher  # noqa: E402
 from vo.online_graph import DEFAULT_PARAMS  # noqa: E402
 from vo.pose_estimation import CameraIntrinsics  # noqa: E402
 
-DATASET_ROOT = "/home/ubuntu/datasets/tum_rgbd"
 CACHE = REPO / "eval/results/tune_cache_loop"
 MATCHER_CONFIG = {"iterations": 20, "epsilon": 0.05,
                   "unused_score": 1.0, "distance_type": "l2"}
@@ -229,6 +228,7 @@ def ofat_trials(space):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq", default="desk,desk2,room")
+    parser.add_argument("--dataset-root", default=os.getenv("TUM_RGBD_ROOT"))
     parser.add_argument("--groups", default="A,B,C,E",
                         help="comma list of groups among A,B,C,E")
     parser.add_argument("--n-trials", type=int, default=120)
@@ -241,6 +241,9 @@ def main():
     parser.add_argument("--out", default=str(
         REPO / "eval/results/tune_bearing_cap.json"))
     args = parser.parse_args()
+    if not args.dataset_root or not args.dataset_root.strip():
+        parser.error("--dataset-root or TUM_RGBD_ROOT is required")
+    args.dataset_root = args.dataset_root.strip()
     if args.n_trials < 1:
         parser.error("--n-trials must be >= 1")
 
@@ -252,7 +255,7 @@ def main():
     caches, cams, match_caches = {}, {}, {}
     for seq in sequences:
         cache = rtl.load_cache(CACHE, seq)
-        frames = rtl.load_frames(DATASET_ROOT, seq)
+        frames = rtl.load_frames(args.dataset_root, seq)
         stride = int(cache["stride"])
         cache["gt_pose"] = np.asarray(
             [frames[i][1] for i in range(0, len(frames), stride)], dtype=np.float64)
@@ -263,7 +266,7 @@ def main():
             cache["gt_pose"] = np.asarray(cache["gt_pose"])[:args.limit + 1]
         caches[seq] = cache
         fx, fy, cx, cy = rtl.intrinsics_for(
-            DATASET_ROOT, seq, (525.0, 525.0, 320.0, 240.0))
+            args.dataset_root, seq, (525.0, 525.0, 320.0, 240.0))
         cams[seq] = CameraIntrinsics(fx, fy, cx, cy, 640, 480)
         mc_path = CACHE / f"match_cache_{seq}_torch.pkl"
         if mc_path.exists():
@@ -331,7 +334,7 @@ def main():
         "conditional": {k: [v[0], sorted(v[1])] for k, v in CONDITIONAL.items()},
         "fixed_defaults": {k: DEFAULT_PARAMS[k] for k in sorted(DEFAULT_PARAMS)
                            if k not in space},
-        "dataset_root": DATASET_ROOT,
+        "dataset_root": args.dataset_root,
         "cache": str(CACHE.relative_to(REPO)),
         "matcher": MATCHER_CONFIG,
         "limit": args.limit,

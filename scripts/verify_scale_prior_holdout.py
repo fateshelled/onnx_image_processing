@@ -162,8 +162,9 @@ def main():
     parser.add_argument("--overwrite-existing", action="store_true",
                         help="allow replacing a record whose hash changed")
     args = parser.parse_args()
-    if args.dataset_root is None:
+    if not args.dataset_root or not args.dataset_root.strip():
         parser.error("--dataset-root or TUM_RGBD_ROOT is required")
+    args.dataset_root = args.dataset_root.strip()
 
     seqs = [value for value in args.seqs.split(",") if value]
     configs = [value for value in args.configs.split(",") if value]
