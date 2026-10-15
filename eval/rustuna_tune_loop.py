@@ -494,7 +494,7 @@ def evaluation_settings_key(arguments, defaults=None):
 
 
 def eval_seq(c, params, cam, desc_matcher, match_cache=None, diag=None,
-             on_frame=None):
+             on_frame=None, match_seed_context=None):
     params = effective_eval_params(params)
     stride = c["stride"]
     pa = SimpleNamespace(**vars(DEFAULT_ARGS))
@@ -511,6 +511,10 @@ def eval_seq(c, params, cam, desc_matcher, match_cache=None, diag=None,
         P = desc_matcher.match_probs(desc_a[0], desc_b[0])
         mk1, mk2, _ = extract_matches(kp_a, kp_b, P[None], pa.match_threshold,
                                       pa.max_matches, pa.dbin)
+        if match_seed_context is not None:
+            seed_blob = f"{match_seed_context}:{a}:{b}".encode()
+            seed = int.from_bytes(hashlib.sha256(seed_blob).digest()[:4], "big")
+            cv2.setRNGSeed(seed & 0x7fffffff)
         return estimate_pose_from_matches(mk1, mk2, cam, pa)
 
     def match_frames(a, b):
