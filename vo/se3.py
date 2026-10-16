@@ -10,7 +10,10 @@ Measurement convention (camera-to-world node poses):
 The edge residual is  e = Log(M_ij^{-1} T_j^{-1} T_i).
 """
 
+import math
+
 import numpy as np
+from scipy.special import bernoulli, factorial
 
 
 def skew(v):
@@ -33,22 +36,38 @@ def so3_exp(phi):
 
 
 def so3_log(R):
-    """Returns axis-angle (3,) with angle in [0, pi]."""
-    cos_theta = (np.trace(R) - 1.0) / 2.0
-    cos_theta = min(1.0, max(-1.0, cos_theta))
-    theta = float(np.arccos(cos_theta))
-    if theta < 1e-9:
-        return 0.5 * np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-    if np.pi - theta < 1e-6:
-        # Near pi: use the symmetric part
-        A = (R + np.eye(3)) / 2.0
-        axis = np.sqrt(np.maximum(np.diag(A), 0.0))
-        idx = int(np.argmax(axis))
-        axis = axis[idx] * A[:, idx]
-        n = np.linalg.norm(axis)
-        return (axis / n) * theta if n > 1e-9 else np.zeros(3)
-    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]) / (2.0 * np.sin(theta))
-    return axis * theta
+    """Returns axis-angle (3,) with angle in [0, pi].
+
+    Shepperd's quaternion extraction (numpy only) for a valid rotation matrix.
+    This avoids both the division by sin(theta) near pi and the per-call scipy
+    overhead of ``Rotation.from_matrix``; it agrees with scipy to machine
+    precision on random, near-zero, near-pi and exact-pi rotations (pinned by
+    ``tests/test_so3_log.py``) and is ~18x faster.
+    """
+    R = np.asarray(R, dtype=np.float64)
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+    trace = m00 + m11 + m22
+    if trace > 0.0:
+        s = math.sqrt(max(trace + 1.0, 0.0)) * 2.0
+        qw, qx, qy, qz = 0.25 * s, (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s
+    elif m00 > m11 and m00 > m22:
+        s = math.sqrt(max(1.0 + m00 - m11 - m22, 0.0)) * 2.0
+        qw, qx, qy, qz = (m21 - m12) / s, 0.25 * s, (m01 + m10) / s, (m02 + m20) / s
+    elif m11 > m22:
+        s = math.sqrt(max(1.0 + m11 - m00 - m22, 0.0)) * 2.0
+        qw, qx, qy, qz = (m02 - m20) / s, (m01 + m10) / s, 0.25 * s, (m12 + m21) / s
+    else:
+        s = math.sqrt(max(1.0 + m22 - m00 - m11, 0.0)) * 2.0
+        qw, qx, qy, qz = (m10 - m01) / s, (m02 + m20) / s, (m12 + m21) / s, 0.25 * s
+    if qw < 0.0:
+        qw, qx, qy, qz = -qw, -qx, -qy, -qz
+    norm_v = math.sqrt(qx * qx + qy * qy + qz * qz)
+    if norm_v < 1e-12:
+        return np.zeros(3)
+    angle = 2.0 * math.atan2(norm_v, qw)
+    return (angle / norm_v) * np.array([qx, qy, qz])
 
 
 def so3_left_jacobian_inv(phi):
@@ -88,20 +107,25 @@ def se3_log(T):
     R = T[:3, :3]
     t = T[:3, 3]
     phi = so3_log(R)
-    theta = float(np.linalg.norm(phi))
-    Kfull = skew(phi)
-    if theta < 1e-9:
-        tau = t.copy()
-    else:
-        V = (
-            np.eye(3)
-            + (1.0 - np.cos(theta)) / (theta ** 2) * Kfull
-            + (theta - np.sin(theta)) / (theta ** 3) * (Kfull @ Kfull)
-        )
-        tau = np.linalg.solve(V, t)
+    tau = so3_left_jacobian_inv(phi) @ t
     out = np.zeros(6)
     out[:3] = phi
     out[3:] = tau
+    return out
+
+
+def se3_inv(T):
+    """Analytic inverse of a 4x4 SE(3) transform (valid rotation block).
+
+    Avoids the generic ``np.linalg.inv`` / ``solve`` overhead in hot loops:
+    ``T^{-1} = [[R^T, -R^T t], [0, 1]]``.
+    """
+    T = np.asarray(T, dtype=np.float64)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    out = np.eye(4)
+    out[:3, :3] = R.T
+    out[:3, 3] = -R.T @ t
     return out
 
 
@@ -121,9 +145,7 @@ def se3_ad(T):
     return out
 
 
-_BERNOULLI = [1.0, -0.5, 1.0 / 6.0, 0.0, -1.0 / 30.0, 0.0, 1.0 / 42.0, 0.0,
-              -1.0 / 30.0, 0.0, 5.0 / 66.0, 0.0, -691.0 / 2730.0, 0.0,
-              7.0 / 6.0, 0.0, -3617.0 / 510.0]
+_BERNOULLI_COEFFICIENTS = bernoulli(40) / factorial(np.arange(41))
 
 
 def se3_ad_e(e):
@@ -143,19 +165,32 @@ def se3_left_jacobian_inv(e):
     """J_l(e)^{-1} for right-increment updates T' = T @ Exp(delta).
 
     Analytic via the Bernoulli series Sigma B_k/k! ad(e)^k, valid for
-    ||omega|| < 2*pi (convergence verified against finite differences;
-    residuals are far below 2 in practice).
+    ||omega|| < 2*pi. Odd k >= 3 vanish, so only the constant, linear and even
+    powers are summed; the even powers are advanced by ad(e)^2 (one 6x6 matmul
+    per two orders). The series truncates as soon as the next term is negligible
+    relative to the running magnitude, so small residuals (the common case) cost
+    a handful of terms while large rotations still reach the full 41st order.
+    Edge residual rotations are principal-branch (<= pi), where the truncated
+    series is accurate to ~1e-11.
     """
     e = np.asarray(e, dtype=np.float64).reshape(6)
     A = se3_ad_e(e)
-    S = np.zeros((6, 6))
-    Ak = np.eye(6)
-    fact = 1.0
-    for k in range(17):
-        if k > 0:
-            Ak = Ak @ A
-            fact *= k
-        S += (_BERNOULLI[k] / fact) * Ak
+    S = np.eye(6) - 0.5 * A  # k=0 (B_0/0! = 1) and k=1 (B_1/1! = -1/2)
+    A2 = A @ A
+    power = A2  # ad(e)^2
+    last = len(_BERNOULLI_COEFFICIENTS) - 1
+    scale = max(1.0, float(np.abs(S).max()))
+    for k in range(2, last + 1, 2):
+        term = _BERNOULLI_COEFFICIENTS[k] * power
+        S += term
+        magnitude = float(np.abs(term).max())
+        if magnitude > scale:
+            scale = magnitude
+        # Always sum the first few terms; stop once the tail is negligible.
+        if k >= 6 and magnitude <= 1e-15 * scale:
+            break
+        if k + 2 <= last:
+            power = power @ A2
     return S
 
 

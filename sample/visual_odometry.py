@@ -190,7 +190,12 @@ def run_visual_odometry(session, reader, camera_intrinsics, model_height,
 
     graph = OnlinePoseGraph(dict(DEFAULT_PARAMS if params is None else params),
                             camera_intrinsics, match_fn)
-    trajectory = Trajectory()
+    trajectory = Trajectory(initialize_identity=False)
+    frame_ids = []
+
+    def sync_trajectory():
+        """Refresh snapshots after graph optimization changes past poses."""
+        trajectory.replace_poses(graph.pose(frame_id) for frame_id in frame_ids)
 
     if reader.is_camera:
         for _ in range(10):  # warm up auto-exposure / auto-focus
@@ -214,8 +219,12 @@ def run_visual_odometry(session, reader, camera_intrinsics, model_height,
             break
 
         images[idx] = load_image(frame, model_height, model_width)
+        previous_n_kf = graph.n_kf
         T = graph.add_frame(idx)
+        frame_ids.append(idx)
         trajectory.add_pose(T)
+        if display and graph.n_kf != previous_n_kf:
+            sync_trajectory()
 
         # Keep only the keyframes the matcher may still query + recent frames.
         keep = set(graph.match_keyframes) | {idx - 1, idx}
@@ -246,12 +255,14 @@ def run_visual_odometry(session, reader, camera_intrinsics, model_height,
             if key == ord("q"):
                 break
             if key == ord("s"):
+                sync_trajectory()
                 path = f"trajectory_{int(time.time())}.npz"
                 trajectory.save_to_file(path)
                 print(f"Trajectory saved to: {path}")
 
         idx += 1
 
+    sync_trajectory()
     elapsed = time.time() - start
     if verbose:
         print(f"\nProcessing complete: {processed} frames, "

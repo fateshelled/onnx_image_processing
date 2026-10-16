@@ -42,7 +42,7 @@ def test_jacobian_matches_finite_difference():
     n = len(opt.pose_ids)
     ncol = J.shape[1]
     assert ncol == 6 * n + opt.n_scale
-    assert opt.n_scale == 1  # 2 free edges, first is the gauge
+    assert opt.n_scale == 2
 
     eps = 1e-6
     Jn = np.zeros_like(J)

@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from vo.online_graph import OnlinePoseGraph
+from vo.se3_window import SlidingWindowOptimizer
 from vo.se3 import se3_exp
 
 
@@ -130,7 +131,10 @@ def test_scale_kf_path_runs_and_zero_sigma_is_safe():
 
         params = dict(DEFAULT_PARAMS)
         params.update(scale_kf=True, scale_kf_sigma=sigma, kf_max_gap=5,
-                      kf_min_gap=4, nl_reg=True, max_keyframes=3)
+                      kf_min_gap=4, nl_reg=True, max_keyframes=3,
+                      marginalization_backend="legacy",
+                      canonical_regularization="legacy",
+                      loop_observation_model="se3")
         graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
         for k in range(N):
             T = graph.add_frame(k)
@@ -138,6 +142,34 @@ def test_scale_kf_path_runs_and_zero_sigma_is_safe():
         assert graph._scale_kf is not None
         assert graph._scale_kf.k is not None and np.isfinite(graph._scale_kf.k)
         assert graph._scale_kf.k > 0.0
+
+
+def test_local_map_adds_all_successful_spokes_to_optimizer(monkeypatch):
+    calls = []
+    added_edges = []
+    original_add_edge = SlidingWindowOptimizer.add_edge
+
+    def recording_add_edge(self, i, j, *args, **kwargs):
+        added_edges.append((i, j))
+        return original_add_edge(self, i, j, *args, **kwargs)
+
+    monkeypatch.setattr(SlidingWindowOptimizer, "add_edge", recording_add_edge)
+
+    def match_fn(a, b):
+        calls.append((a, b))
+        return {"ok": True, "R": np.eye(3), "t": np.array([1.0, 0.0, 0.0]),
+                "inlier_ratio": 1.0, "n_matches": 100}
+
+    params = {"kf_max_gap": 4, "kf_local_map_k": 2, "max_keyframes": 12,
+              "loop_enable": False, "global_opt_on_loop": False,
+              "nl_reg": False}
+    graph = OnlinePoseGraph(params, cam=None, match_fn=match_fn)
+    for frame in range(13):
+        graph.add_frame(frame)
+
+    assert graph.keyframes == [0, 4, 8, 12]
+    assert (4, 10) in calls and (8, 10) in calls
+    assert (4, 10) in added_edges and (8, 10) in added_edges
 
 
 def test_rotation_cycle_gate_rejects_inconsistent_loop():
@@ -213,6 +245,42 @@ def test_loop_mad_history_is_bounded_and_unique():
     assert list(graph._hist_rot) == [(1, 3), (2, 4), (3, 5)]
     assert graph._hist_rot[(3, 5)] == pytest.approx(0.4)
     assert len(graph._hist_rot) == len(graph._hist_dir) == 3
+
+
+def test_loop_observation_model_selects_window_class():
+    from vo.bearing_joint import BearingJointWindowOptimizer
+    from vo.relative_joint import RelativeJointWindowOptimizer
+    base = {"marginalization_backend": "canonical_marginal",
+            "canonical_regularization": "relative_joint_ridge",
+            "nl_reg": False, "seq_tsvd_ratio": 0.0, "loop_robust": "none"}
+    default = OnlinePoseGraph(dict(base), cam=None, match_fn=None)._new_window()
+    assert type(default) is RelativeJointWindowOptimizer
+    bearing = OnlinePoseGraph(
+        {**base, "loop_observation_model": "bearing"},
+        cam=None, match_fn=None)._new_window()
+    assert type(bearing) is BearingJointWindowOptimizer
+    assert bearing.bearing_radial is False
+    radial = OnlinePoseGraph(
+        {**base, "loop_observation_model": "bearing", "bearing_radial": True,
+         "bearing_sigma_radial": 0.3, "bearing_scale_prior_sigma": 0.6},
+        cam=None, match_fn=None)._new_window()
+    assert radial.bearing_radial is True
+    assert radial.bearing_sigma_radial == 0.3
+    assert radial.bearing_scale_prior_sigma == 0.6
+    assert bearing.bearing_dir_kernel == "gm"
+    huber = OnlinePoseGraph(
+        {**base, "loop_observation_model": "bearing",
+         "bearing_dir_kernel": "huber", "bearing_dir_delta": 0.5},
+        cam=None, match_fn=None)._new_window()
+    assert huber.bearing_dir_kernel == "huber" and huber.bearing_dir_delta == 0.5
+    with pytest.raises(ValueError):
+        OnlinePoseGraph({**base, "loop_observation_model": "nope"},
+                        cam=None, match_fn=None)._new_window()
+    with pytest.raises(ValueError):
+        OnlinePoseGraph({"marginalization_backend": "legacy",
+                         "canonical_regularization": "legacy",
+                         "loop_observation_model": "bearing"},
+                        cam=None, match_fn=None)._new_window()
 
 
 def test_loop_verifier_hook_counts_rejects_and_abstains():

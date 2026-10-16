@@ -251,11 +251,23 @@ def relative_pose_errors(est_poses, gt_poses,
             metrics[f"RPE_trans_{tag}_drift_pct"] = float(
                 100.0 * np.median(trans) / length)
             metrics[f"RPE_rot_{tag}_median_deg"] = float(np.median(rot))
+            metrics[f"RPE_trans_{tag}_p90"] = float(np.percentile(trans, 90.))
+            metrics[f"RPE_trans_{tag}_max"] = float(np.max(trans))
+            metrics[f"RPE_rot_{tag}_p90_deg"] = float(np.percentile(rot, 90.))
+            metrics[f"RPE_rot_{tag}_max_deg"] = float(np.max(rot))
+            metrics[f"RPE_rot_{tag}_rmse_deg"] = float(np.sqrt(np.mean(np.square(rot))))
+            metrics[f"RPE_{tag}_count"] = len(trans)
         else:
             metrics[f"RPE_trans_{tag}_median"] = float("nan")
             metrics[f"RPE_trans_{tag}_rmse"] = float("nan")
             metrics[f"RPE_trans_{tag}_drift_pct"] = float("nan")
             metrics[f"RPE_rot_{tag}_median_deg"] = float("nan")
+            metrics[f"RPE_trans_{tag}_p90"] = float("nan")
+            metrics[f"RPE_trans_{tag}_max"] = float("nan")
+            metrics[f"RPE_rot_{tag}_p90_deg"] = float("nan")
+            metrics[f"RPE_rot_{tag}_max_deg"] = float("nan")
+            metrics[f"RPE_rot_{tag}_rmse_deg"] = float("nan")
+            metrics[f"RPE_{tag}_count"] = 0
     return metrics
 
 
@@ -1034,8 +1046,8 @@ def main():
                          "the odometry chain scale).")
     ap.add_argument("--edge-scale", action="store_true", default=False,
                     help="Optimize a per-edge translation scale (similarity "
-                         "pose graph) instead of fixing all translations to "
-                         "unit norm. First free edge is the scale gauge.")
+                          "pose graph) instead of fixing all translations to "
+                          "unit norm. Unreferenced components get a scale gauge.")
     ap.add_argument("--scale-prior-sigma", type=float, default=0.5,
                     help="Std of the log-scale prior pulling edge scales "
                          "toward 1 (only with --edge-scale).")

@@ -27,16 +27,24 @@ class Trajectory:
         positions: List of camera positions (x, y, z)
     """
 
-    def __init__(self):
-        """Initialize empty trajectory with identity pose."""
-        self.poses: List[np.ndarray] = [np.eye(4, dtype=np.float64)]
-        self.positions: List[np.ndarray] = [np.zeros(3, dtype=np.float64)]
+    def __init__(self, initialize_identity: bool = True):
+        """Initialize a trajectory, optionally with an identity pose."""
+        self.poses: List[np.ndarray] = []
+        self.positions: List[np.ndarray] = []
+        if initialize_identity:
+            self.add_pose(np.eye(4, dtype=np.float64))
 
     def add_pose(self, T: np.ndarray) -> None:
         """Append an absolute camera-to-world pose (4x4)."""
         T = np.asarray(T, dtype=np.float64).copy()
         self.poses.append(T)
         self.positions.append(T[:3, 3].copy())
+
+    def replace_poses(self, poses) -> None:
+        """Replace the trajectory with absolute camera-to-world poses."""
+        copied = [np.asarray(T, dtype=np.float64).copy() for T in poses]
+        self.poses = copied
+        self.positions = [T[:3, 3].copy() for T in copied]
 
     def add_relative_pose(self, R: np.ndarray, t: np.ndarray) -> None:
         """
@@ -137,6 +145,13 @@ class Trajectory:
         if ax is None:
             fig, ax = plt.subplots(figsize=(10, 10))
 
+        if not self.poses:
+            ax.set_xlabel('X (meters)')
+            ax.set_ylabel('Z (meters)')
+            ax.set_title(title)
+            ax.grid(True)
+            return ax
+
         positions = self.get_positions_array()
 
         # Plot trajectory path
@@ -188,6 +203,13 @@ class Trajectory:
         if ax is None:
             fig = plt.figure(figsize=(12, 10))
             ax = fig.add_subplot(111, projection='3d')
+
+        if not self.poses:
+            ax.set_xlabel('X (meters)')
+            ax.set_ylabel('Y (meters)')
+            ax.set_zlabel('Z (meters)')
+            ax.set_title(title)
+            return ax
 
         positions = self.get_positions_array()
 
