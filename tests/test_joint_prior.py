@@ -312,7 +312,7 @@ def test_canonical_cap_absorb_bridge_multineighbor():
 
 def test_canonical_cap_measurement_free_keyframes_do_not_fail_stop():
     # A run of failed odometry leaves keyframes without incident factors; they
-    # must not be absorbed (or crash the graph) -- they are counted as over-cap.
+    # carry no information, so freezing them must preserve the hard bound.
     g = OnlinePoseGraph(dict(
         marginalization_backend="canonical_marginal", kf_max_gap=1,
         loop_enable=False, nl_reg=False, canonical_cap=True,
@@ -325,8 +325,32 @@ def test_canonical_cap_measurement_free_keyframes_do_not_fail_stop():
         g.add_frame(i, odom=odom)
     state = g._canonical
     state.assert_ownership()
-    assert state.n_over_cap > 0
+    assert state.n_over_cap == 0
+    assert len(state.active) <= 1
+    assert g.last_n_nodes <= 2
     assert all(np.isfinite(g.pose(i)).all() for i in range(20))
+
+
+def test_canonical_spokes_only_reference_active_keyframes():
+    def match(_a, _b):
+        return dict(ok=True, R=np.eye(3), t=np.array([-1., 0, 0]),
+                    inlier_ratio=1., n_matches=100)
+
+    g = OnlinePoseGraph(dict(
+        marginalization_backend="canonical_marginal",
+        canonical_regularization="relative_joint_ridge",
+        loop_observation_model="se3", kf_max_gap=1, kf_local_map_k=2,
+        loop_enable=False, nl_reg=False, canonical_cap=True,
+        canonical_max_keyframes=1, loop_window=1, scale_prior_sigma=.6),
+        None, match)
+    g.add_frame(0)
+    for i in range(1, 10):
+        g.add_frame(i, odom=(np.eye(3), np.array([-1., 0, 0])))
+    state = g._canonical
+    state.assert_ownership()
+    assert not g._canonical_failed
+    assert len(state.active) <= 1
+    assert state.n_over_cap == 0
 
 
 def test_canonical_cap_retires_bearing_loops_to_bound():

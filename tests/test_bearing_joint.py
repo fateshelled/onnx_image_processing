@@ -85,6 +85,16 @@ def test_loop_radial_registers_scale_and_matches_numeric_jacobian():
     np.testing.assert_allclose(j.T@(obj._huber_weights()*r),cost_gradient,rtol=1e-6,atol=1e-7)
 
 
+def test_loop_radial_uses_bounded_geman_mcclure():
+    obj=radial_optimizer();obj.add_node(0,np.eye(4));b=np.eye(4);b[0,3]=1.2;obj.add_node(2,b)
+    m=np.eye(4);m[0,3]=-1;obj.add_named_edge(('loop',0,2),0,2,m)
+    radial=(1.2-1.)/.3
+    assert obj._huber_weights()[-2]==pytest.approx(1./(1.+radial**2)**2)
+    assert obj._true_cost()==pytest.approx(.5*radial**2/(1.+radial**2))
+    obj.T[2][0,3]=100.
+    assert obj._true_cost()<.5
+
+
 def test_excluded_loop_scale_is_not_regularized():
     def make(exclude):
         obj=radial_optimizer();obj.add_node(0,np.eye(4));b=np.eye(4);b[0,3]=1.2;obj.add_node(2,b)

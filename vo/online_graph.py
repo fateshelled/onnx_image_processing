@@ -106,8 +106,8 @@ DEFAULT_PARAMS = {
     "bearing_radial": False,
     "bearing_sigma_d": 0.2, "bearing_sigma_radial": None,
     "bearing_scale_prior_sigma": None, "bearing_scale_prior_mean": 0.0,
-    # Per-block robust kernel: rotation stays GM; the direction block uses a
-    # non-saturating kernel (adopted default "quadratic", or "gm"/"huber").
+    # Per-block robust kernel: rotation uses the calibrated pseudo-Huber loss;
+    # direction uses the adopted "quadratic" default, or true "gm"/"huber".
     "bearing_dir_kernel": "quadratic", "bearing_dir_delta": 1.0,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
@@ -291,7 +291,9 @@ class OnlinePoseGraph:
         # (K=1 keeps the previous single-hub behaviour).
         gate_deg = float(self.p.get("trans_gate_deg", 0.0))
         min_inl = float(self.p.get("kf_edge_min_inlier", 0.0))
-        spoke_refs = [ref for ref in self._kf if ref != prev]
+        active = None if self._canonical is None else self._canonical.active
+        spoke_refs = [ref for ref in self._kf
+                      if ref != prev and (active is None or ref in active)]
         for ref in spoke_refs[-max(1, int(self.p.get("kf_local_map_k", 1))):]:
             sres = self.match(ref, idx)
             if not (sres and sres.get("ok")):

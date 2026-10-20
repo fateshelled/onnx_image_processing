@@ -133,7 +133,7 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
             for key in self.bearing_loops:
                 i,j,f,scale_key=self.bearing_loops[key]
                 rr=f.linearize_radial(self.T[i],self.T[j],self.log_scale(scale_key))[0]
-                rows.append(np.array([1./np.sqrt(1.+rr[0]**2)]))
+                rows.append(np.array([1./(1.+rr[0]**2)**2]))
                 rows.append(np.ones(1))
         return np.concatenate(rows)
 
@@ -147,7 +147,7 @@ class BearingJointWindowOptimizer(RelativeJointWindowOptimizer):
             for key in self.bearing_loops:
                 i,j,f,scale_key=self.bearing_loops[key]
                 radial=float(f.linearize_radial(self.T[i],self.T[j],self.log_scale(scale_key))[0][0])
-                cost+=radial*radial/(np.sqrt(1.+radial*radial)+1.)
+                cost+=.5*radial*radial/(1.+radial*radial)
                 prior=(self.log_scale(scale_key)-self.bearing_scale_prior_mean)/self.bearing_scale_prior_sigma
                 cost+=.5*float(prior*prior)
         return float(cost)

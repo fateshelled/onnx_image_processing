@@ -72,8 +72,11 @@ class BearingObservation:
         return r,a,b,d_scale
 
     def _block_cost_weight(self,norm2,kernel,q):
-        if kernel=="gm":
+        if kernel=="pseudo_huber":
             return q*norm2/(np.sqrt(1.+norm2)+1.), q/np.sqrt(1.+norm2)
+        if kernel=="gm":
+            denom=1.+norm2
+            return .5*q*norm2/denom, q/(denom*denom)
         if kernel=="quadratic":
             return .5*q*norm2, q
         if kernel=="huber":
@@ -86,7 +89,9 @@ class BearingObservation:
     def cost_weights(self,r):
         norms2=np.sum(np.asarray(r).reshape(2,3)**2,axis=1)
         q=(1.,self.q_direction)
-        kernels=("gm",self.direction_kernel)
+        # Keep the calibrated rotation loss while exposing mathematically
+        # correct GM semantics for the configurable direction kernel.
+        kernels=("pseudo_huber",self.direction_kernel)
         cost=0.;weights=np.empty(6)
         for b,(n2,kernel) in enumerate(zip(norms2,kernels)):
             c,w=self._block_cost_weight(float(n2),kernel,q[b])

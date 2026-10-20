@@ -94,5 +94,13 @@ def test_direction_kernel_cost_gradient_and_blocks():
                               direction_delta=.3).cost_weights(r)
     assert w[3]==pytest.approx(.3/5.);np.testing.assert_allclose(w[:3],1.);assert w[4]==w[5]==w[3]
     cost,w=BearingObservation(np.eye(3),[1,0,0]).cost_weights(r)  # default gm
-    assert w[3]==pytest.approx(1./np.sqrt(26.))
+    assert cost==pytest.approx(.5*25./26.)
+    assert w[3]==pytest.approx(1./26.**2)
+    large_cost,_=BearingObservation(np.eye(3),[1,0,0]).cost_weights(
+        np.array([0.,0.,0.,300.,400.,0.]))
+    assert large_cost<.5
+    rotation=np.array([3.,4.,0.,0.,0.,0.])
+    cost,w=BearingObservation(np.eye(3),[1,0,0]).cost_weights(rotation)
+    assert cost==pytest.approx(np.sqrt(26.)-1.)
+    np.testing.assert_allclose(w[:3],1./np.sqrt(26.))
     with pytest.raises(ValueError):BearingObservation(np.eye(3),[1,0,0],direction_kernel="nope")

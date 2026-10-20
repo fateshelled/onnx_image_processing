@@ -140,6 +140,15 @@ class CanonicalGraph:
                     return False
         return found
 
+    def _drop_unconstrained(self, E):
+        """Freeze and remove an active keyframe that owns no information."""
+        if E not in self.poses:
+            raise KeyError(f"drop target {E} is not an active pose")
+        self.graph._est[E] = self.poses.pop(E).copy()
+        self.active.discard(E)
+        self.absorbed.add(E)
+        self.n_absorbed += 1
+
     def absorb(self, E):
         """Schur-absorb active keyframe E into its active neighbours.
 
@@ -239,6 +248,7 @@ class CanonicalGraph:
         bearing = g.p.get("loop_observation_model", "se3") == "bearing"
         while len(self.active) > w:
             chosen = None
+            unconstrained = None
             for E in sorted(self.active):
                 age = len(g._kf) - 1 - idx.get(E, len(g._kf) - 1)
                 if age < loop_window:
@@ -246,9 +256,16 @@ class CanonicalGraph:
                 if bearing and self._has_incident_loop(E):
                     continue
                 if not self._blanket_active(E):
+                    has_prior = any(("pose", E) in pr.keys for pr in self.priors)
+                    if not has_prior and not self._has_incident_loop(E):
+                        unconstrained = E
+                        break
                     continue
                 chosen = E
                 break
+            if unconstrained is not None:
+                self._drop_unconstrained(unconstrained)
+                continue
             if chosen is not None:
                 self.absorb(chosen)
                 continue
@@ -257,8 +274,7 @@ class CanonicalGraph:
             # endpoint can be absorbed next iteration.
             if bearing and self._retire_oldest_bearing_loop():
                 continue
-            # Nothing left to free (e.g. measurement-free keyframes): the
-            # bound cannot be met for this step; count it and stop.
+            # Nothing left to free: surface the unsupported factor topology.
             self.n_over_cap += 1
             break
 

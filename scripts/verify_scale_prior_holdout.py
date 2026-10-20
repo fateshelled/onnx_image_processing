@@ -41,14 +41,15 @@ HOLDOUT = [
     "360",
     "xyz",
 ]
+PRODUCTION_PARAMS = {**DEFAULT_PARAMS, "loop_verifier": "none"}
 CONFIGS = {
-    "old_0.6": {**DEFAULT_PARAMS, "scale_prior_sigma": 0.6},
-    "candidate_0.5": {**DEFAULT_PARAMS, "scale_prior_sigma": 0.5},
-    "candidate_0.7": {**DEFAULT_PARAMS, "scale_prior_sigma": 0.7},
-    "candidate_0.8": {**DEFAULT_PARAMS, "scale_prior_sigma": 0.8},
-    "tuned_1.0": {**DEFAULT_PARAMS, "scale_prior_sigma": 1.0},
+    "old_0.6": {**PRODUCTION_PARAMS, "scale_prior_sigma": 0.6},
+    "candidate_0.5": {**PRODUCTION_PARAMS, "scale_prior_sigma": 0.5},
+    "candidate_0.7": {**PRODUCTION_PARAMS, "scale_prior_sigma": 0.7},
+    "candidate_0.8": {**PRODUCTION_PARAMS, "scale_prior_sigma": 0.8},
+    "tuned_1.0": {**PRODUCTION_PARAMS, "scale_prior_sigma": 1.0},
 }
-DEFAULT_CONFIGS = ("candidate_0.5", "candidate_0.7", "candidate_0.8")
+DEFAULT_CONFIGS = ("old_0.6", "candidate_0.5", "candidate_0.7", "candidate_0.8")
 SOURCE_FILES = (
     Path(__file__),
     REPO / "eval/rustuna_tune_loop.py",
@@ -113,7 +114,8 @@ def _evaluation_hash(source_hash, input_hash, match_context, seq, config,
         payload, sort_keys=True, allow_nan=False).encode()).hexdigest()[:12]
 
 
-def _load_match_cache(seq, input_hash, source_hash, frozen_context=None):
+def _load_match_cache(seq, input_hash, source_hash, camera_context,
+                      frozen_context=None):
     dedicated = CACHE / f"match_cache_{seq}_scale_prior_ab.pkl"
     seeds = [CACHE / f"match_cache_{seq}_torch.pkl",
              CACHE / f"match_cache_{seq}_numpy.pkl"]
@@ -122,6 +124,7 @@ def _load_match_cache(seq, input_hash, source_hash, frozen_context=None):
     current_context = {
         "input_hash": input_hash,
         "generation_source_hash": source_hash,
+        "camera": camera_context,
         "matcher": MATCHER_CONFIG,
         # Existing cached measurements are a frozen evaluation input. Hashing
         # the snapshot makes that dependency explicit while isolating A/B from
@@ -131,7 +134,8 @@ def _load_match_cache(seq, input_hash, source_hash, frozen_context=None):
     }
     context = frozen_context if frozen_context is not None else current_context
     if frozen_context is not None:
-        for field in ("input_hash", "matcher", "seed_name", "seed_hash"):
+        for field in ("input_hash", "generation_source_hash", "camera",
+                      "matcher", "seed_name", "seed_hash"):
             if frozen_context.get(field) != current_context[field]:
                 raise ValueError(
                     f"{seq}: frozen match context {field} mismatch: "
@@ -189,6 +193,7 @@ def main():
         *(record["source_hash"] for record in result["records"].values()
           if record.get("source_hash") is not None),
     })
+    result.pop("source_hash", None)
     matcher = TorchSinkhornMatcher(**MATCHER_CONFIG)
 
     for seq in seqs:
@@ -208,25 +213,38 @@ def main():
         if not np.allclose(cache["gt_pos"], cache["gt_pose"][:, :3, 3],
                            rtol=0.0, atol=1e-9):
             raise ValueError(f"{seq}: cached and current GT positions differ")
-        input_hash = hashlib.sha256((
-            _file_hash(CACHE / f"{seq}.npz") + _value_hash(cache["gt_pose"])
-        ).encode()).hexdigest()
+        fx, fy, cx, cy = rtl.intrinsics_for(
+            args.dataset_root, seq, (525.0, 525.0, 320.0, 240.0))
+        camera_context = {
+            "fx": float(fx), "fy": float(fy), "cx": float(cx), "cy": float(cy),
+            "width": 640, "height": 480,
+        }
+        input_hash = hashlib.sha256(json.dumps({
+            "cache_hash": _file_hash(CACHE / f"{seq}.npz"),
+            "gt_hash": _value_hash(cache["gt_pose"]),
+            "camera": camera_context,
+        }, sort_keys=True, allow_nan=False).encode()).hexdigest()
         if args.limit is not None and args.limit < len(cache["odom"]):
             cache = dict(cache)
             cache["odom"] = cache["odom"][:args.limit]
             cache["gt_pos"] = cache["gt_pos"][:args.limit + 1]
             cache["gt_pose"] = cache["gt_pose"][:args.limit + 1]
 
-        fx, fy, cx, cy = rtl.intrinsics_for(
-            args.dataset_root, seq, (525.0, 525.0, 320.0, 240.0))
         cam = CameraIntrinsics(fx, fy, cx, cy, 640, 480)
         baseline = result["records"].get(f"old_0.6:{seq}")
-        if baseline is None:
-            raise ValueError(f"{seq}: missing old_0.6 baseline record")
-        if baseline.get("input_hash") != input_hash:
-            raise ValueError(f"{seq}: baseline input hash mismatch")
-        match_path, match_cache, match_context = _load_match_cache(
-            seq, input_hash, source_hash, baseline.get("match_context"))
+        frozen_context = None if baseline is None else baseline.get("match_context")
+        if baseline is not None and baseline.get("input_hash") != input_hash:
+            if not args.overwrite_existing:
+                raise ValueError(f"{seq}: baseline input hash mismatch")
+            frozen_context = None
+        try:
+            match_path, match_cache, match_context = _load_match_cache(
+                seq, input_hash, source_hash, camera_context, frozen_context)
+        except ValueError:
+            if not args.overwrite_existing:
+                raise
+            match_path, match_cache, match_context = _load_match_cache(
+                seq, input_hash, source_hash, camera_context)
 
         for config in configs:
             params = CONFIGS[config]
@@ -262,6 +280,7 @@ def main():
                 "config": config,
                 "seq": seq,
                 "scale_prior_sigma": params["scale_prior_sigma"],
+                "loop_verifier": params["loop_verifier"],
                 "source_hash": source_hash,
                 "evaluation_hash": evaluation_hash,
                 "ATE_median": values.get("ATE_median"),
