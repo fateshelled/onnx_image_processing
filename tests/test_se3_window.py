@@ -77,6 +77,22 @@ class TestLoopRobustWeights:
         opt._loop_block_norms = lambda _k, _e: (0.0, 2.0)
         assert opt._loop_block_weights(0, e)[1] == pytest.approx(0.25)
 
+    def test_gm_trial_cost_uses_fixed_irls_weights(self):
+        opt = self._optimizer_with_edge(
+            loop_robust="gm", loop_gm_mu=1.0, loop_rot_sigma=0.1,
+            step_scale_r=0.1)
+        opt.T[1] = se3_exp(np.array([0.0, 0.0, 0.1, 0.0, 0.0, 0.0]))
+        weights = opt._huber_weights()
+        small = opt._weighted_cost(weights)
+        opt.T[1] = se3_exp(np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0]))
+        large = opt._weighted_cost(weights)
+
+        assert large > small
+        opt.add_node(2, np.eye(4))
+        opt.add_edge(1, 2, np.eye(4))
+        returned = opt.optimize()
+        assert returned == pytest.approx(opt._cost())
+
     def test_block_mode_is_per_block_huber_only(self):
         opt = self._optimizer_with_edge(loop_robust="block", huber=1.0)
         opt._loop_block_norms = lambda _k, _e: (0.5, 2.0)
@@ -159,16 +175,15 @@ class TestPerEdgeScalePriorSigma:
                                      optimize_scale=True, scale_prior_sigma=2.0)
         for i, Ti in enumerate(T):
             opt.add_node(i, Ti)
-        # edge 0-1 becomes the gauge; edge 1-2 has sigma 0 (no prior row);
-        # edge 2-3 uses a tight per-edge sigma.
+        # edge 1-2 has sigma 0 (no prior row); edge 2-3 uses a tight per-edge
+        # sigma. The default prior on edge 0-1 is itself a scale reference.
         opt.add_edge(0, 1, rand_T(rng), scale_free=True)
         opt.add_edge(1, 2, rand_T(rng), scale_free=True,
                      scale_prior_mean=float(np.log(3.0)), scale_prior_sigma=0.0)
         opt.add_edge(2, 3, rand_T(rng), scale_free=True,
                      scale_prior_mean=float(np.log(3.0)), scale_prior_sigma=0.1)
         assert opt.edge_scale_sigma == [2.0, 0.0, 0.1]
-        # Only the sigma>0 non-gauge edge contributes a scale-prior row.
-        assert opt._n_prior() == 1
+        assert opt._n_prior() == 2
         opt.optimize()  # must not raise ZeroDivisionError
         assert all(np.isfinite(s) for s in opt.edge_scale)
 
@@ -324,6 +339,114 @@ class TestSparseSolver:
         if tsvd_ratio > 0.0:
             assert kept_s > 0
 
+    @pytest.mark.parametrize("dense_max_cols", [10 ** 9, 0])
+    def test_explicit_fixed_node_does_not_anchor_first_free_node(
+            self, dense_max_cols):
+        def translated(x):
+            T = np.eye(4)
+            T[0, 3] = x
+            return T
+
+        opt = SlidingWindowOptimizer(max_iterations=30,
+                                     dense_max_cols=dense_max_cols)
+        opt.add_node(0, translated(0.0), fixed=True)
+        opt.add_node(1, translated(0.0))
+        opt.add_node(2, translated(0.0))
+        opt.add_edge(0, 1, np.linalg.inv(translated(1.0)) @ translated(0.0))
+        opt.add_edge(1, 2, np.linalg.inv(translated(2.0)) @ translated(1.0))
+
+        assert opt.optimize() < 1e-12
+        assert opt.get_pose(1)[0, 3] == pytest.approx(1.0, abs=1e-6)
+        assert opt.get_pose(2)[0, 3] == pytest.approx(2.0, abs=1e-6)
+
+    @pytest.mark.parametrize("dense_max_cols", [10 ** 9, 0])
+    def test_disconnected_component_gets_its_own_gauge_anchor(
+            self, dense_max_cols):
+        def translated(x):
+            T = np.eye(4)
+            T[0, 3] = x
+            return T
+
+        opt = SlidingWindowOptimizer(max_iterations=30,
+                                     dense_max_cols=dense_max_cols)
+        opt.add_node(0, translated(0.0), fixed=True)
+        opt.add_node(1, translated(0.0))
+        opt.add_node(2, translated(10.0))
+        opt.add_node(3, translated(10.0))
+        opt.add_edge(0, 1, np.linalg.inv(translated(1.0)) @ translated(0.0))
+        opt.add_edge(2, 3, np.linalg.inv(translated(11.0)) @ translated(10.0))
+
+        assert opt.optimize() < 1e-12
+        assert opt.get_pose(1)[0, 3] == pytest.approx(1.0, abs=1e-6)
+        assert opt.get_pose(2)[0, 3] == pytest.approx(10.0, abs=1e-6)
+        assert opt.get_pose(3)[0, 3] == pytest.approx(11.0, abs=1e-6)
+
+    @pytest.mark.parametrize("dense_max_cols", [10 ** 9, 0])
+    @pytest.mark.parametrize("tsvd_ratio", [0.0, 1e-3])
+    def test_disconnected_component_gets_its_own_scale_gauge(
+            self, dense_max_cols, tsvd_ratio):
+        def translated(x):
+            T = np.eye(4)
+            T[0, 3] = x
+            return T
+
+        opt = SlidingWindowOptimizer(
+            max_iterations=30, dense_max_cols=dense_max_cols,
+            optimize_scale=True, scale_prior_sigma=0.0,
+            tsvd_ratio=tsvd_ratio)
+        for node, x in enumerate((0.0, 1.0, 10.0, 10.0)):
+            opt.add_node(node, translated(x))
+        opt.add_edge(0, 1, np.linalg.inv(translated(1.0)) @ translated(0.0),
+                     scale_free=True)
+        opt.add_edge(2, 3, np.linalg.inv(translated(11.0)) @ translated(10.0),
+                     scale_free=True, scale=2.0)
+
+        opt.optimize()
+
+        assert opt.get_scale(1) == pytest.approx(2.0, abs=1e-12)
+        assert np.isfinite(opt.get_pose(3)).all()
+
+    @pytest.mark.parametrize("dense_max_cols", [10 ** 9, 0])
+    def test_known_translation_does_not_pin_scale_free_edge(
+            self, dense_max_cols):
+        def translated(x):
+            T = np.eye(4)
+            T[0, 3] = x
+            return T
+
+        opt = SlidingWindowOptimizer(
+            max_iterations=50, dense_max_cols=dense_max_cols,
+            optimize_scale=True, scale_prior_sigma=0.0, huber=1e9)
+        for node, x in enumerate((0.0, 2.0, 4.0)):
+            opt.add_node(node, translated(x))
+        opt.add_edge(0, 1, translated(-2.0))
+        opt.add_edge(1, 2, translated(-2.0))
+        opt.add_edge(0, 2, translated(-1.0), scale_free=True)
+
+        assert opt.optimize() < 1e-10
+        assert opt.get_scale(2) == pytest.approx(4.0, abs=1e-6)
+
+    @pytest.mark.parametrize("dense_max_cols", [10 ** 9, 0])
+    def test_rotation_only_pairwise_prior_does_not_define_scale(
+            self, dense_max_cols):
+        def translated(x):
+            T = np.eye(4)
+            T[0, 3] = x
+            return T
+
+        opt = SlidingWindowOptimizer(
+            dense_max_cols=dense_max_cols, optimize_scale=True,
+            scale_prior_sigma=0.0)
+        for node in range(3):
+            opt.add_node(node, translated(float(node)))
+        omega = np.zeros((6, 6))
+        omega[:3, :3] = np.eye(3)
+        opt.add_edge(0, 1, translated(-1.0), omega=omega)
+        opt.add_edge(1, 2, translated(-1.0), scale_free=True)
+
+        free = list(opt.pose_ids)
+        anchors = opt._gauge_anchor_columns(free, len(free))
+        assert 6 * len(free) + opt.scale_col[1] in anchors
 
 class TestMarginalization:
     def test_relative_prior_reproduces_full_solution(self):
@@ -365,6 +488,36 @@ class TestMarginalization:
         assert cost_full < 1e-1
 
 class TestMultiNodePrior:
+    def test_prior_jacobian_matches_finite_difference_away_from_x0(self):
+        opt = SlidingWindowOptimizer(max_iterations=1)
+        for i in range(3):
+            opt.add_node(i, np.eye(4))
+        opt.add_edge(0, 1, np.eye(4))
+        opt.add_edge(1, 2, np.eye(4))
+        opt.add_prior_factor([1, 2], np.eye(12), np.zeros(12),
+                             [np.eye(4), np.eye(4)])
+        opt.T[1] = se3_exp(np.array([0.35, -0.2, 0.1, 0.4, -0.3, 0.2]))
+        opt.T[2] = se3_exp(np.array([-0.25, 0.15, 0.2, -0.2, 0.25, 0.3]))
+
+        analytic = opt._jacobian()[12:24, 6:18]
+        numeric = np.zeros_like(analytic)
+        eps = 1e-7
+        factor = opt.prior_factors[0]
+        for col in range(12):
+            node = 1 + col // 6
+            direction = col % 6
+            original = opt.T[node].copy()
+            delta = np.zeros(6)
+            delta[direction] = eps
+            opt.T[node] = original @ se3_exp(delta)
+            plus = opt._prior_factor_residual(factor)
+            opt.T[node] = original @ se3_exp(-delta)
+            minus = opt._prior_factor_residual(factor)
+            opt.T[node] = original
+            numeric[:, col] = (plus - minus) / (2.0 * eps)
+
+        assert np.allclose(analytic, numeric, atol=1e-7)
+
     def test_general_marginalization_with_loop(self):
         rng = np.random.default_rng(21)
         meas = []

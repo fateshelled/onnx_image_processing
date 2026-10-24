@@ -27,7 +27,8 @@ def ate(est, gt):
 # legacy (diag provides ate_kf and native)
 os.environ["LEGACY_KF_PRIOR"] = "1"; os.environ.pop("CAUSAL_KF_PRIOR", None)
 diag = {}
-res = rtl.eval_seq(c, {**rtl.SEQ_OPT1_DEFAULTS, "max_keyframes": None}, cam, dm, match_cache=mc, diag=diag)
+res = rtl.eval_seq(c, {**rtl.SEQ_OPT1_DEFAULTS, "max_keyframes": None,
+                       "canonical_cap": False}, cam, dm, match_cache=mc, diag=diag)
 print(f"LEGACY kf=all: native={res['ATE_median']:.5f} kf_only={diag.get('ate_kf')}")
 os.environ.pop("LEGACY_KF_PRIOR", None)
 
@@ -35,7 +36,8 @@ os.environ.pop("LEGACY_KF_PRIOR", None)
 def match_fn(a, b):
     r = mc.get((a, b))
     return r if r is not None else {"ok": False, "n_matches": 0, "inlier_ratio": 0.0}
-g = OnlinePoseGraph({**rtl.SEQ_OPT1_DEFAULTS, "max_keyframes": None}, cam, match_fn)
+g = OnlinePoseGraph({**rtl.SEQ_OPT1_DEFAULTS, "max_keyframes": None,
+                     "canonical_cap": False}, cam, match_fn)
 g.add_frame(0); keys = [0]
 for n, o in enumerate(c["odom"]):
     idx = (n + 1) * stride

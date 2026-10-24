@@ -1,4 +1,4 @@
-"""Online keyframe pose graph with a fixed-lag window and NL-Reg.
+"""Online keyframe pose graph with canonical marginalization and joint regularization.
 
 This module owns **all** the pose-graph logic so the offline evaluator
 (``eval/rustuna_tune_loop.py``) and the streaming sample
@@ -10,7 +10,8 @@ This module owns **all** the pose-graph logic so the offline evaluator
 * deferred (option 1) marginalization of exited keyframes into multi-node
   priors;
 * loop closure with the temporal-consistency gate and cycle handling;
-* direction-dependent Tikhonov regularization (NL-Reg).
+* joint relative-pose/log-scale regularization (soft/Wiener by default; ridge
+  and legacy NL-Reg are optional).
 
 The graph is matcher-agnostic and **index-based**: the caller passes
 ``match_fn(i, j) -> dict`` where the dict has keys ``ok`` (bool), ``R``
@@ -35,15 +36,24 @@ from .loop_closure import confirmed_loop_hits, edge_key
 from .scale_kf import ScaleKF
 from .se3_window import SlidingWindowOptimizer
 
-# Default parameters for the online sequential graph. Adopted from the
-# 200-trial optuna study "online_bounded_kf" (best trial 174, mean+worst
-# ATE 0.5245 on desk/desk2/room; a near-tie with trials 119/121/122 at
-# 0.5247). Some values sit on the search-grid boundary (kf_max_gap=8,
-# max_keyframes=12) and may improve further with a wider grid.
+# Observation/keyframe parameters for the online sequential graph come from the
+# 200-trial optuna study "online_bounded_kf" (legacy backend; best trial 174,
+# mean+worst ATE 0.5245 on desk/desk2/room; a near-tie with trials 119/121/122
+# at 0.5247). Some values sit on the search-grid boundary (kf_max_gap=8,
+# max_keyframes=12) and may improve further with a wider grid. The adopted
+# solver uses canonical marginalization, the bounded canonical graph
+# (cap=60 via canonical_max_keyframes=12/loop_window=60), the bearing loop
+# model (sd0.2, quadratic direction kernel) and relative joint soft (Wiener)
+# regularization (alpha=10, tau=1, sigma=1), selected on the desk/desk2/room
+# comparison. Loop iterations are 20:
+# raising them to 40 made the LM solver enter a degenerate linearization region
+# (numerically indefinite Hessian, rejected-step churn) and crashed the room
+# bearing sequence, while 20 completes it with equal desk/desk2 accuracy and
+# lower cost. Regularization is solver-only, never marginalized as observations.
 DEFAULT_PARAMS = {
     "odom_ref": "kf", "kf_mode": "motion", "keyframe_decim": 15,
     "kf_trans_thresh": 4.0, "kf_rot_thresh": 30.0, "kf_max_gap": 8,
-    "kf_local_map_k": 2, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
+    "kf_local_map_k": 1, "kf_edge_min_inlier": 0.0, "trans_gate_deg": 0.0,
     "loop_window": 60, "loop_min_gap": 20, "loop_min_inlier": 0.5,
     "loop_temporal_k": 2, "loop_sigma_scale": 1.0,
     "loop_robust": "none", "loop_robust_phi": 1.0,
@@ -58,11 +68,47 @@ DEFAULT_PARAMS = {
     # values reject loop measurements whose rotation disagrees with the
     # independently accumulated odometry chain by more than this many degrees.
     "cycle_threshold_deg": 0.0,
-    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 10,
+    "scale_prior_sigma": 0.6, "step_scale_t": 0.1, "loop_iterations": 20,
     "tsvd_ratio": 0.0, "scale_kf": False,
     "scale_kf_q": 1e-3, "scale_kf_r": 0.1, "scale_kf_sigma": 0.5,
     "graph_mode": "kf_prior", "max_keyframes": 12, "seq_tsvd_ratio": 0.0,
-    "nl_reg": True, "nl_reg_c": 10.0, "nl_reg_tau": 30.0, "nl_reg_length": 0.5,
+    "nl_reg": False, "nl_reg_c": 10.0, "nl_reg_tau": 30.0, "nl_reg_length": 0.5,
+    # Bounding for the canonical backend. When canonical_cap is True only the
+    # active reduced-graph keyframes are solved every segment; exited keyframes
+    # are Schur-absorbed into their neighbours and bearing-loop endpoints are
+    # freed by retiring the oldest loops (see
+    # notes/20261011-canonical-cap-design.md). The active bound is
+    # max(canonical_max_keyframes, loop_window) and canonical_max_keyframes
+    # falls back to max_keyframes when None. Enabled by default (W=60, bounded
+    # per-segment cost).
+    "canonical_cap": True,
+    "canonical_max_keyframes": 12,
+    # Reserved for the bearing held bound. Loop retirement is implemented
+    # (canonical_graph._retire_oldest_bearing_loop, counted in n_retired_loops),
+    # but this explicit held cap is still unused; kept for a stable contract.
+    "canonical_held_cap": None,
+    "marginalization_backend": "canonical_marginal",
+    "canonical_regularization": "relative_joint_soft",
+    "relative_reg_alpha": 10.0, "relative_reg_tau": 1.0,
+    "relative_sigma_r": 1.0, "relative_sigma_t": 1.0, "relative_sigma_l": 1.0,
+    # Loop observation model. "bearing" replaces loop edges with the
+    # SO(3)/direction-separated factor (no distance variable) via
+    # BearingJointWindowOptimizer (the adopted default); "se3" is the canonical
+    # SE(3) relative-pose residual. Bearing loops require the relative canonical
+    # solver (nl_reg=false, TSVD off).
+    "loop_observation_model": "bearing",
+    # Bearing loop variant. When bearing_radial is on, each bearing loop gains a
+    # per-loop log-scale variable weakly constrained by a zero-mean log prior, so
+    # the otherwise unobserved baseline length is softly pinned (see
+    # notes/20261010-bearing-radial-constraint-design.md). The adopted default
+    # tightens the direction sigma below loop_dir_sigma (sd0.2). None uses the
+    # optimizer defaults (loop_dir_sigma, step_scale_t, scale_prior_sigma).
+    "bearing_radial": False,
+    "bearing_sigma_d": 0.2, "bearing_sigma_radial": None,
+    "bearing_scale_prior_sigma": None, "bearing_scale_prior_mean": 0.0,
+    # Per-block robust kernel: rotation uses the calibrated pseudo-Huber loss;
+    # direction uses the adopted "quadratic" default, or true "gm"/"huber".
+    "bearing_dir_kernel": "quadratic", "bearing_dir_delta": 1.0,
     # Bounding: hard cap on held (exited-but-referenced) keyframes; None uses
     # 2 * max_keyframes. Loop closures additionally trigger one global reduced
     # pass over all keyframes (Tier 2) when global_opt_on_loop is set.
@@ -106,17 +152,30 @@ class OnlinePoseGraph:
     """Online sequential pose graph.
 
     Parameters are read from a plain dict (defaults come from
-    ``DEFAULT_PARAMS``). The graph keeps at most ``max_keyframes`` active
-    keyframes; transient frames are marginalized into relative priors when a
-    new keyframe is promoted, and exited keyframes are deferred (option 1)
-    until their Markov blanket is active, then marginalized into multi-node
-    priors.
+    ``DEFAULT_PARAMS``). The canonical default bounds the active reduced graph
+    (``canonical_cap``, W=max(canonical_max_keyframes, loop_window)): only
+    active keyframes are solved and exited ones are Schur-absorbed. With
+    ``canonical_cap=False`` the canonical backend keeps all historical
+    keyframes in its dense solves; ``max_keyframes``/``held_cap`` then only
+    bound the legacy backend. Transient frames are marginalized into relative
+    priors when a new keyframe is promoted. The legacy backend defers exited
+    keyframes (option 1) until their Markov blanket is active.
     """
 
     def __init__(self, params, cam, match_fn):
         self.p = params
         self.cam = cam
         self.match = match_fn
+        self._canonical = None
+        self._canonical_failed = False
+        backend = params.get("marginalization_backend", "legacy")
+        if backend != "legacy":
+            from .canonical_graph import CanonicalGraph, MODES
+            if backend not in MODES:
+                raise ValueError(f"unknown marginalization_backend: {backend}")
+            if params.get("scale_kf", False):
+                raise ValueError("canonical backend does not reuse ScaleKF feedback")
+            self._canonical = CanonicalGraph(self, backend)
         self.kf_min_gap = 4
         self.kf_max_gap = int(params.get("kf_max_gap", 16))
         self.max_kf = params.get("max_keyframes")
@@ -128,7 +187,7 @@ class OnlinePoseGraph:
         self._step = 1          # index step between consecutive frames
         self._seg = []          # transient ids since the last keyframe
         self._odom = {}         # frame id -> (R, t) relative to the previous frame
-        self._spoke = {}        # frame id -> (ref_kf, R, t, inlier, n_matches)
+        self._spoke = {}        # frame id -> [(ref_kf, R, t, inlier, n_matches)]
         self._priors = []       # pairwise transient priors (a, b, G, Omega)
         self._node_priors = []  # multi-node priors (ids, H, b, x0)
         self._hits = []         # per-keyframe loop hits (temporal confirmation)
@@ -193,6 +252,8 @@ class OnlinePoseGraph:
         previous frame; when omitted it is obtained from ``match_fn``. The
         evaluator injects its precomputed odometry this way.
         """
+        if self._canonical_failed:
+            raise RuntimeError("canonical solve failed; recreate graph before continuing")
         idx = int(idx)
         if self._last is None:
             self._T[idx] = np.eye(4)
@@ -230,9 +291,10 @@ class OnlinePoseGraph:
         # (K=1 keeps the previous single-hub behaviour).
         gate_deg = float(self.p.get("trans_gate_deg", 0.0))
         min_inl = float(self.p.get("kf_edge_min_inlier", 0.0))
-        for ref in self._kf[-max(1, int(self.p.get("kf_local_map_k", 1))):]:
-            if ref == prev:
-                continue
+        active = None if self._canonical is None else self._canonical.active
+        spoke_refs = [ref for ref in self._kf
+                      if ref != prev and (active is None or ref in active)]
+        for ref in spoke_refs[-max(1, int(self.p.get("kf_local_map_k", 1))):]:
             sres = self.match(ref, idx)
             if not (sres and sres.get("ok")):
                 continue
@@ -241,10 +303,11 @@ class OnlinePoseGraph:
             dT = np.linalg.inv(self._T[idx]) @ self._T[ref]
             if not _trans_consistent(dT, sres.get("t"), gate_deg):
                 continue
-            self._spoke[idx] = (int(ref), np.asarray(sres["R"], float),
-                                np.asarray(sres["t"], float).reshape(3),
-                                float(sres.get("inlier_ratio", 0.0)),
-                                int(sres.get("n_matches", -1)))
+            self._spoke.setdefault(idx, []).append(
+                (int(ref), np.asarray(sres["R"], float),
+                 np.asarray(sres["t"], float).reshape(3),
+                 float(sres.get("inlier_ratio", 0.0)),
+                 int(sres.get("n_matches", -1))))
 
         self._last = idx
         self._seg.append(idx)
@@ -253,6 +316,8 @@ class OnlinePoseGraph:
         return self._pose_of(idx)
 
     def pose(self, frame_id=None):
+        if self._canonical_failed:
+            raise RuntimeError("canonical solve failed; no valid output snapshot")
         return self._pose_of(self._last if frame_id is None else frame_id)
 
     # -- internals ----------------------------------------------------------
@@ -276,6 +341,15 @@ class OnlinePoseGraph:
         by a prior are kept (as free nodes) until their Markov blanket is fully
         active, then Schur-marginalized into a multi-node prior and dropped.
         """
+        if self._canonical is not None:
+            try:
+                return self._canonical.close_segment(new_kf)
+            except Exception:
+                # Loop gating also changes counters/history before solving.
+                # This reference backend is fail-stop rather than pretending
+                # that a partially completed segment can safely be retried.
+                self._canonical_failed = True
+                raise
         a = self._kf[-1]
         b = new_kf
         trans = [i for i in self._seg if i != b and i != a]
@@ -339,8 +413,7 @@ class OnlinePoseGraph:
                 self._added.add(edge_key(p, v))
         kf_spoke = None  # (act edge index, odometry baseline) for the new KF
         for v in trans + [b]:
-            if v in self._spoke:
-                ref, R, t, _inl, _n = self._spoke[v]
+            for ref, R, t, _inl, _n in self._spoke.get(v, []):
                 if ref in node_set and ref != self._prev.get(v):
                     kwargs, m = {}, None
                     if v == b and self._scale_kf is not None:
@@ -367,8 +440,8 @@ class OnlinePoseGraph:
         for v in trans + [b]:
             if v in self._odom:
                 present.add(edge_key(self._prev[v], v))
-            if v in self._spoke:
-                present.add(edge_key(self._spoke[v][0], v))
+            for ref, *_rest in self._spoke.get(v, []):
+                present.add(edge_key(ref, v))
         loop_act_ei = {}  # edge_key -> index in act.edges (for the local naive)
         for (la, lb, lR, lt, lsig) in self._loops:
             k = edge_key(la, lb)
@@ -590,7 +663,47 @@ class OnlinePoseGraph:
         return verified
 
     def _new_window(self):
-        return SlidingWindowOptimizer(
+        cls = SlidingWindowOptimizer
+        options = {}
+        regularization = self.p.get("canonical_regularization", "legacy")
+        if regularization not in ("legacy", "relative_joint_soft", "relative_joint_ridge", "relative_joint_none"):
+            raise ValueError("unknown canonical_regularization")
+        loop_model = self.p.get("loop_observation_model", "se3")
+        if loop_model not in ("se3", "bearing"):
+            raise ValueError("unknown loop_observation_model")
+        if regularization != "legacy":
+            if self._canonical is None or self.p.get("nl_reg", True):
+                raise ValueError("relative regularization requires canonical backend and nl_reg=false")
+            if self.p.get("seq_tsvd_ratio", 0.) or self.p.get("tsvd_ratio", 0.):
+                raise ValueError("relative regularization requires TSVD off")
+        elif loop_model == "bearing":
+            raise ValueError("bearing loop observations require relative canonical regularization")
+        if self._canonical is not None:
+            from .joint_prior import JointWindowOptimizer
+            cls = JointWindowOptimizer
+            options["pose_gauge_policy"] = self.p.get("canonical_pose_gauge", "rank")
+            if regularization != "legacy":
+                from .relative_joint import RelativeJointWindowOptimizer
+                cls = RelativeJointWindowOptimizer
+                options.update(regularization=regularization.removeprefix("relative_joint_"),
+                               alpha=self.p.get("relative_reg_alpha", 1.),
+                               tau=self.p.get("relative_reg_tau", 1.),
+                               sigma_r=self.p.get("relative_sigma_r", 1.),
+                               sigma_t=self.p.get("relative_sigma_t", 1.),
+                               sigma_l=self.p.get("relative_sigma_l", 1.))
+                if loop_model == "bearing":
+                    from .bearing_joint import BearingJointWindowOptimizer
+                    cls = BearingJointWindowOptimizer
+                    options.update(
+                        bearing_radial=self.p.get("bearing_radial", False),
+                        bearing_sigma_d=self.p.get("bearing_sigma_d"),
+                        bearing_sigma_radial=self.p.get("bearing_sigma_radial"),
+                        bearing_scale_prior_sigma=self.p.get("bearing_scale_prior_sigma"),
+                        bearing_scale_prior_mean=self.p.get("bearing_scale_prior_mean", 0.0),
+                        bearing_dir_kernel=self.p.get("bearing_dir_kernel", "gm"),
+                        bearing_dir_delta=self.p.get("bearing_dir_delta", 1.0))
+        return cls(
+            **options,
             max_iterations=self.p.get("loop_iterations", 10),
             huber=1.0,
             step_scale_t=self.p.get("step_scale_t", 0.1),
